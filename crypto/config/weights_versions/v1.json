@@ -1,0 +1,38 @@
+{
+  "version": "v1",
+  "created_at_ms": 1789305791941,
+  "parent": null,
+  "kind": "baseline",
+  "source_proposal": "",
+  "model": "",
+  "valid_sample_count": 0,
+  "changes": [],
+  "params": {
+    "DIMENSION_WEIGHTS.short_term.news": 0.15,
+    "DIMENSION_WEIGHTS.short_term.data": 0.45,
+    "DIMENSION_WEIGHTS.short_term.tech": 0.25,
+    "DIMENSION_WEIGHTS.short_term.prediction": 0.15,
+    "DIMENSION_WEIGHTS.long_term.news": 0.35,
+    "DIMENSION_WEIGHTS.long_term.data": 0.3,
+    "DIMENSION_WEIGHTS.long_term.tech": 0.15,
+    "DIMENSION_WEIGHTS.long_term.prediction": 0.2,
+    "DECISION_THRESHOLDS.strong_long": 60,
+    "DECISION_THRESHOLDS.standard_long": 35,
+    "DECISION_THRESHOLDS.watch_long": 10,
+    "DECISION_THRESHOLDS.standard_short": -40,
+    "DECISION_THRESHOLDS.strong_short": -65,
+    "SAFETY_VALVE_THRESHOLD": 50,
+    "ADX_BOOST": 1.2,
+    "ADX_DAMPEN": 0.6,
+    "BOLL_SQUEEZE_BOOST": 1.15
+  },
+  "applied_groups": [
+    "dim_weight",
+    "safety_valve",
+    "threshold"
+  ],
+  "advisory_groups": [
+    "tech_mult"
+  ],
+  "note": "首次留档: 出厂默认 (config/weights.py)"
+}

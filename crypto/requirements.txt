@@ -1,0 +1,8 @@
+websockets>=12.0
+aiohttp>=3.9.0
+python-socks[asyncio]>=2.4.0
+
+Predict：pred_sk_e8fd22c2717bb8e7d0ba18e99f4ff2a2735af50ed23df402
+Bianance：8RIXAfFIChHwE34sh9YhpBPDgFEDSV5tIvmSypeSD2wHW5rxsaMBGSiqwX3255ZW,Key is :4aGNvzzWiHOdDgOLr2vFB1qwOWWv1AqxpOZPgfvtZfT3ub7QVJTUcIRMymNo9Ptj, 你帮我配置好测试好保存好
+
+Deepseek的API我弄好了，sk-a29d7e68ae80451c85b40f3941cc3d0a
