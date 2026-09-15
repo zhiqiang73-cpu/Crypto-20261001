@@ -210,6 +210,7 @@ class PolymarketCollector:
         self._session: Optional[Any] = None
         self.snapshot = PolymarketSnapshot()
         self._prob_hist: Deque[Tuple[float, float]] = deque(maxlen=120)
+        self._prob_market_id: Optional[str] = None
         self._running = False
 
     @property
@@ -282,8 +283,14 @@ class PolymarketCollector:
         return []
 
     def _update_prob_change(self, prob: float, now: float, market: Optional[dict] = None) -> Optional[float]:
-        # 优先用 Gamma 自带的 1h 价格变化
+        # 禁止跨 market_id 计算增速
+        mid = None
         if market:
+            mid = str(market.get("conditionId") or market.get("id") or "") or None
+            if mid and self._prob_market_id and mid != self._prob_market_id:
+                self._prob_hist.clear()
+            if mid:
+                self._prob_market_id = mid
             oh = market.get("oneHourPriceChange")
             if oh is not None:
                 try:
@@ -325,6 +332,22 @@ class PolymarketCollector:
                     btc_m.get("question") or ""
                 )
                 snap.btc_market_question = (btc_m.get("question") or "")[:160] or None
+                snap.market_id = str(btc_m.get("conditionId") or btc_m.get("id") or "") or None
+                snap.event_type = "above_at_expiry"
+                end_raw = btc_m.get("endDate") or btc_m.get("end_date_iso")
+                if end_raw:
+                    try:
+                        from datetime import datetime, timezone
+                        if isinstance(end_raw, (int, float)):
+                            snap.expiry_ms = int(end_raw) if end_raw > 1e12 else int(end_raw * 1000)
+                        else:
+                            dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+                            snap.expiry_ms = int(dt.timestamp() * 1000)
+                        snap.remaining_hours = max(
+                            0.0, (snap.expiry_ms - time.time() * 1000) / 3_600_000
+                        )
+                    except Exception:
+                        pass
                 if prob is not None:
                     snap.btc_prob_change_1h = self._update_prob_change(
                         prob, time.time(), btc_m

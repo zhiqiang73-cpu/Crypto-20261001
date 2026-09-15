@@ -88,7 +88,8 @@ class TestOIMapping(unittest.TestCase):
             session=SessionZone.US,
         )
         r = self.m.map(snap, StrategyHorizon.SHORT_TERM)
-        self.assertAlmostEqual(r.indicator_scores["open_interest"], 0.0, delta=0.1)
+        # 0.01 落在 0→0 与 0.02→-10 之间 → -5
+        self.assertAlmostEqual(r.indicator_scores["open_interest"], -5.0, delta=0.1)
 
     def test_oi_flush_with_negative_funding(self):
         # 5min OI 骤降 4% + 极端负费率 → +60
@@ -101,7 +102,8 @@ class TestOIMapping(unittest.TestCase):
             session=SessionZone.US,
         )
         r = self.m.map(snap, StrategyHorizon.SHORT_TERM)
-        self.assertAlmostEqual(r.indicator_scores["open_interest"], 60.0, delta=0.1)
+        # -0.04 落在 -0.08→80 与 -0.03→60 之间 → 64; 骤降 × 负费率方向 → +64
+        self.assertAlmostEqual(r.indicator_scores["open_interest"], 64.0, delta=0.1)
 
 
 class TestMissingFields(unittest.TestCase):
@@ -156,8 +158,9 @@ class TestHeatmapAndLiq(unittest.TestCase):
             session=SessionZone.US,
         )
         r = self.m.map(snap, StrategyHorizon.SHORT_TERM)
+        # 80M 落在 50M→70 与 150M→90 之间 → 76
         self.assertAlmostEqual(
-            r.indicator_scores["liquidations_realtime"], 70.0, delta=0.1
+            r.indicator_scores["liquidations_realtime"], 76.0, delta=0.1
         )
         self.assertFalse(r.black_swan_liq)
 
@@ -278,7 +281,8 @@ class TestDeribitAndOnchain(unittest.TestCase):
         )
         r = self.m.map(snap, StrategyHorizon.SHORT_TERM)
         self.assertAlmostEqual(r.indicator_scores["hashrate"], 30.0, delta=1)
-        self.assertEqual(r.indicator_scores["whale_transfers"], 70.0)
+        # -2000 BTC: 连续锚点 (-1000→70, -5000→90) → 75
+        self.assertAlmostEqual(r.indicator_scores["whale_transfers"], 75.0, delta=0.1)
 
 
 if __name__ == "__main__":

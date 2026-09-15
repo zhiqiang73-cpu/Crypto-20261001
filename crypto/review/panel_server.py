@@ -407,6 +407,10 @@ def create_app(
         status = await review.executor.status()
         return web.json_response(status)
 
+    async def api_trading_flatten_orphan(_request):
+        out = await review.executor.flatten_orphan()
+        return web.json_response(out)
+
     async def api_trading_close(request):
         body = await request.json()
         horizon = body.get("horizon") or "short_term"
@@ -541,6 +545,7 @@ def create_app(
     app.router.add_get("/api/versions", api_versions)
     app.router.add_post("/api/versions/rollback", api_versions_rollback)
     app.router.add_get("/api/trading/status", api_trading_status)
+    app.router.add_post("/api/trading/flatten_orphan", api_trading_flatten_orphan)
     app.router.add_post("/api/trading/close", api_trading_close)
     app.router.add_post("/api/trading/toggle", api_trading_toggle)
     app.router.add_get("/api/trading/history", api_trading_history)

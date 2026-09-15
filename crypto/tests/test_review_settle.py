@@ -7,12 +7,12 @@ from indicators.ohlcv import Candle
 from models.review import SettleStatus, TradeRecord
 from review.settle import interval_hours, plan_levels, settle_record
 
-BAR = 300_000              # 5m (与 short_term kline_interval 对齐)
+BAR = 300_000              # 结算用 5m 粒度 K 线 (窗口仍为 1h)
 WINDOW = 3_600_000         # 1h (short_term)
 
 
 def candle(idx: int, high: float, low: float, close: float = None) -> Candle:
-    """第 idx 根 5m K 线."""
+    """第 idx 根 5m K 线 (结算回放粒度)."""
     o = idx * BAR
     return Candle(
         open_time_ms=o,
@@ -67,6 +67,7 @@ class TestLevels(unittest.TestCase):
     def test_interval_hours(self):
         self.assertAlmostEqual(interval_hours("5m"), 5.0 / 60.0)
         self.assertAlmostEqual(interval_hours("15m"), 0.25)
+        self.assertAlmostEqual(interval_hours("1h"), 1.0)
         self.assertAlmostEqual(interval_hours("4h"), 4.0)
         self.assertAlmostEqual(interval_hours("1d"), 24.0)
 

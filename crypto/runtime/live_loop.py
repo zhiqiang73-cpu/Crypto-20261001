@@ -11,7 +11,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from collectors.binance_klines import BinanceKlinesCollector
 from collectors.binance_ws import BinanceFuturesCollector
@@ -26,7 +26,14 @@ from collectors.fred import FredCollector
 from collectors.polymarket import PolymarketCollector
 from collectors.predict_fun import PredictFunCollector
 from config.mapping import BLACK_SWAN_LIQ_5M_USD, SPREAD_BLACK_SWAN_MULT
-from config.weights import DIMENSION_WEIGHTS
+from config.review import STALENESS_LIMITS
+from config.weights import DIMENSION_WEIGHTS, ENABLE_AGREEMENT_BOOST, SAFETY_VALVE_THRESHOLD
+try:
+    from config.weights import ENABLE_CONSISTENCY_DAMPING
+except ImportError:
+    ENABLE_CONSISTENCY_DAMPING = False
+from config.strategy_contract import get_contract
+from models.data_record import make_record
 from engine.scorer import FactorScoringEngine
 from indicators.engine import extract_tech_features
 from mappers.data_mapper import DataFactorMapper
@@ -42,9 +49,40 @@ from models.snapshots import (
     PredictionScoreResult,
     TechScoreResult,
 )
-from utils.scoring import apply_consistency_damping, detect_session_zone, confidence_weighted_cs
+from utils.scoring import (
+    detect_collinear_whale,
+    apply_collinear_caps,
+    agreement_boost,
+    apply_consistency_damping,
+    available_weight_ratio,
+    clamp,
+    confidence_weighted_cs,
+    detect_session_zone,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ScoringOutput:
+    """方向与质量分离 — tradable 由 coverage+quality 门控, 不仅靠 CS."""
+
+    directional_score: float
+    data_quality: float = 1.0
+    coverage: float = 1.0
+    disagreement: float = 0.0
+    tradable: bool = True
+    reject_reason: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "directional_score": self.directional_score,
+            "data_quality": self.data_quality,
+            "coverage": self.coverage,
+            "disagreement": self.disagreement,
+            "tradable": self.tradable,
+            "reject_reason": self.reject_reason,
+        }
 
 
 @dataclass
@@ -72,6 +110,9 @@ class LiveScoreSnapshot:
     is_full_cs: bool = False
     # 面板监控条
     liq_5m_usd: Optional[float] = None
+    atr: Optional[float] = None
+    atr_mean: Optional[float] = None
+    atr_pct: Optional[float] = None
     spread_vs_mean: Optional[float] = None
     black_swan_liq_threshold: float = BLACK_SWAN_LIQ_5M_USD
     spread_black_swan_mult: float = SPREAD_BLACK_SWAN_MULT
@@ -81,10 +122,12 @@ class LiveScoreSnapshot:
     predict_fun_feed: Optional[str] = None
     predict_fun_1d: Optional[float] = None
     fear_greed_value: Optional[float] = None
-    # V8.1 交易定仓: ATR 透出到 executor
-    atr: Optional[float] = None
-    atr_pct: Optional[float] = None
-    atr_mean: Optional[float] = None
+    # 方向/质量分离
+    scoring: Optional[ScoringOutput] = None
+    tradable: bool = False  # 缺省不可交易，必须显式准入
+    reject_reason: Optional[str] = None
+    config_snapshot: Optional[Dict[str, Any]] = None
+    data_records: Optional[Dict[str, Any]] = None
 
 
 def _staleness(ts_ms: Optional[int], now_ms: int) -> Optional[float]:
@@ -121,7 +164,7 @@ class LiveScoringLoop:
         self.tech_mapper = TechFactorMapper()
         self.news_mapper = NewsFactorMapper()
         self.prediction_mapper = PredictionFactorMapper()
-        self.engine = FactorScoringEngine()
+        self.engine = FactorScoringEngine(use_active_overrides=True)
         self._latest: Optional[LiveScoreSnapshot] = None
         self._running = False
         # 跨 short/long/API 共用一把锁, 避免并发 score_once 把共享采集器打挂
@@ -139,12 +182,19 @@ class LiveScoringLoop:
         scores: Dict[str, Optional[float]],
         confidences: Optional[Dict[str, float]] = None,
     ) -> tuple:
-        """仅对非 None 维度按 DIMENSION_WEIGHTS × confidence 重归一化."""
+        """仅对非 None 维度按 DIMENSION_WEIGHTS × confidence 重归一化.
+
+        V8.2: 与全量路径对齐 — 应用 agreement_boost + safety_valve.
+        返回 (partial, decision, missing, reasoning, breakdown, safety).
+        """
         w_all = DIMENSION_WEIGHTS[self.horizon.value]
         missing = [k for k, v in scores.items() if v is None]
         available = {k: v for k, v in scores.items() if v is not None}
         if not available:
-            return 0.0, ActionDecision.NEUTRAL, missing, "no dimensions available", {}
+            return (
+                0.0, ActionDecision.NEUTRAL, missing,
+                "no dimensions available", {}, False,
+            )
 
         conf = confidences or {}
         partial, eff = confidence_weighted_cs(available, w_all, conf)
@@ -152,12 +202,33 @@ class LiveScoringLoop:
             # 全部 confidence=0 时退回等权可用面
             w_sum = sum(w_all[k] for k in available)
             if w_sum <= 0:
-                return 0.0, ActionDecision.NEUTRAL, missing, "zero weight", {}
+                return (
+                    0.0, ActionDecision.NEUTRAL, missing,
+                    "zero weight", {}, False,
+                )
             partial = sum((w_all[k] / w_sum) * available[k] for k in available)
             eff = {k: w_all[k] / w_sum for k in available}
 
-        partial = round(partial, 2)
+        # agreement_boost: 默认关闭 (ENABLE_AGREEMENT_BOOST)
+        if ENABLE_AGREEMENT_BOOST:
+            boost = agreement_boost(available, {k: w_all[k] for k in available})
+            partial = round(clamp(partial * boost), 2)
+        else:
+            boost = 1.0
+            partial = round(clamp(partial), 2)
         decision = self.engine._decide(partial)
+
+        # safety valve on available faces
+        safety = False
+        thr = float(getattr(self.engine, "safety_valve_threshold", SAFETY_VALVE_THRESHOLD))
+        for s in available.values():
+            if partial > 0 and s < 0 and abs(s - partial) > thr:
+                safety = True
+            elif partial < 0 and s > 0 and abs(s - partial) > thr:
+                safety = True
+        if safety:
+            decision = self.engine._downgrade(decision)
+
         tot = sum(eff.values()) or 1.0
         breakdown = {
             k: round((eff[k] / tot) * available[k], 2) for k in available
@@ -166,10 +237,11 @@ class LiveScoringLoop:
             f"{k}={available[k]:.1f}×{eff[k]/tot:.2f}" for k in available
         )
         reasoning = (
-            f"partial_CS={partial:.1f} [{parts}] "
+            f"partial_CS={partial:.1f} boost={boost:.2f} "
+            f"safety_valve={safety} [{parts}] "
             f"missing={missing} (confidence-weighted)"
         )
-        return partial, decision, missing, reasoning, breakdown
+        return partial, decision, missing, reasoning, breakdown, safety
 
     async def score_once(self) -> LiveScoreSnapshot:
         if self._score_lock is None:
@@ -186,6 +258,20 @@ class LiveScoringLoop:
     async def _score_once_unlocked(self) -> LiveScoreSnapshot:
         now_ms = int(time.time() * 1000)
         t0 = time.time()
+        # 决策开始前钉死不可变配置 — 禁止评分后重新盖章
+        try:
+            from review.overrides import active_version_name, content_hash, effective_params
+            _params = effective_params()
+            decision_config_snapshot = {
+                "version": active_version_name() or "v1",
+                "content_hash": content_hash(_params),
+                "params": dict(_params) if isinstance(_params, dict) else _params,
+                "fixed_at_ms": now_ms,
+            }
+        except Exception:
+            decision_config_snapshot = {
+                "version": "v1", "content_hash": None, "params": {}, "fixed_at_ms": now_ms,
+            }
         # REST 兜底补齐订单簿 / CVD / spread, 避免 WS 暖机期数据面大面积缺项
         try:
             bsnap = await self.binance.ensure_microstructure()
@@ -354,11 +440,12 @@ class LiveScoringLoop:
             "tech": float(getattr(tech_result, "confidence", 1.0) or 0.0),
             "prediction": float(getattr(pred_result, "confidence", 1.0) or 0.0),
         }
-        # 跨面一致性阻尼: 离群面拉向中位数 (高置信保留更多原值)
-        present = {k: v for k, v in scores.items() if v is not None}
-        damped = apply_consistency_damping(present, face_conf)
-        for k, v in damped.items():
-            scores[k] = round(v, 2)
+        # 跨面一致性阻尼: 无独立验证时默认关闭，避免先压少数派再交易
+        if ENABLE_CONSISTENCY_DAMPING:
+            present = {k: v for k, v in scores.items() if v is not None}
+            damped = apply_consistency_damping(present, face_conf)
+            for k, v in damped.items():
+                scores[k] = round(v, 2)
 
         overridden = bool(
             fsnap.liq_total_5m_usd is not None
@@ -369,6 +456,25 @@ class LiveScoringLoop:
         safety = False
         breakdown: Dict[str, float] = {}
         composite: Optional[float] = None
+
+        # 巨鲸共线检测（生产路径，用 mapper 子分）
+        _ind_news = getattr(news_result, "indicator_scores", None) or {}
+        _ind_data = getattr(data_result, "indicator_scores", None) or {}
+        whale_parts = {
+            "news_whale": float(_ind_news.get("whale_institutional") or 0),
+            "data_whale": float(_ind_data.get("whale_transfers") or 0),
+        }
+        _cs_faces = detect_collinear_whale(
+            {
+                "news": float(scores.get("news") or 0),
+                "data": float(scores.get("data") or 0),
+                "tech": float(scores.get("tech") or 0),
+                "prediction": float(scores.get("prediction") or 0),
+            },
+            whale_parts,
+        )
+        if _cs_faces.get("_collinear_whale"):
+            face_conf["_collinear_whale"] = True
 
         if is_full:
             dim = DimensionScores(
@@ -392,10 +498,11 @@ class LiveScoringLoop:
             composite = cs
             partial = cs
         else:
-            partial, decision, missing, reasoning, breakdown = self.compute_partial_cs(
+            partial, decision, missing, reasoning, breakdown, safety = self.compute_partial_cs(
                 scores, confidences=face_conf
             )
             cs = partial
+            composite = cs
 
         suppressed = None
         if overridden:
@@ -459,8 +566,74 @@ class LiveScoringLoop:
             fear_greed_value=fg.value,
             atr=getattr(tech_result, "atr", None) or getattr(tech_snap, "atr", None),
             atr_pct=getattr(tech_result, "atr_pct", None) or getattr(tech_snap, "atr_pct", None),
-            atr_mean=None,  # 由 executor 侧滚动维护可选
+            atr_mean=getattr(tech_result, "atr_mean", None) or getattr(tech_snap, "atr_mean", None),
         )
+        # 方向与质量分离
+        w_all = DIMENSION_WEIGHTS[self.horizon.value]
+        coverage = available_weight_ratio(w_all, missing)
+        conf_vals = [v for v in face_conf.values() if v is not None]
+        quality = sum(conf_vals) / len(conf_vals) if conf_vals else 0.0
+        faces = [scores[k] for k in ("news", "data", "tech", "prediction") if scores.get(k) is not None]
+        if len(faces) >= 2:
+            mean = sum(faces) / len(faces)
+            disagreement = (sum((x - mean) ** 2 for x in faces) / len(faces)) ** 0.5 / 100.0
+        else:
+            disagreement = 1.0
+        contract = get_contract(self.horizon.value)
+        tradable = True
+        reject = None
+        if coverage < contract.min_coverage:
+            tradable = False
+            reject = f"coverage={coverage:.2f}<{contract.min_coverage}"
+        elif quality < contract.min_quality:
+            tradable = False
+            reject = f"quality={quality:.2f}<{contract.min_quality}"
+        elif overridden:
+            tradable = False
+            reject = "black_swan"
+        scoring = ScoringOutput(
+            directional_score=float(composite if composite is not None else partial),
+            data_quality=round(quality, 3),
+            coverage=round(coverage, 3),
+            disagreement=round(disagreement, 3),
+            tradable=tradable,
+            reject_reason=reject,
+        )
+        out.scoring = scoring
+        out.tradable = tradable
+        # 关键 DataRecord：mark 无事件时间或无效 → 不可新开
+        _evt = getattr(bsnap, "event_time_ms", None)
+        mark_rec = make_record(
+            "mark_price",
+            bsnap.mark_price,
+            unit="USDT",
+            source="binance",
+            event_time_ms=_evt,  # 禁止用评分 now 冒充事件时间
+            fetch_time_ms=out.timestamp_ms or 0,
+            max_age_sec=float(STALENESS_LIMITS.get("mark_price", 60)),
+        )
+        if _evt is None and mark_rec.value is not None:
+            from trading.models import DataValidity
+            mark_rec.validity = DataValidity.INVALID
+            mark_rec.quality_reason = "missing_event_time"
+        liq_status = getattr(getattr(fsnap, "coinglass", None) or fsnap, "liq_window_status", None)
+        # fsnap may be FactorInput-like
+        liq_rec = make_record(
+            "liq_5m_usd",
+            getattr(fsnap, "liq_total_5m_usd", None),
+            unit="USD",
+            source="coinglass",
+            event_time_ms=out.timestamp_ms,
+            fetch_time_ms=out.timestamp_ms or 0,
+            max_age_sec=300,
+        )
+        if liq_status in ("warmup", "stale", "error", "partial", "missing"):
+            from trading.models import DataValidity
+            liq_rec.validity = DataValidity.MISSING
+            liq_rec.quality_reason = f"liq_window={liq_status}"
+        out.data_records = {"mark_price": mark_rec, "liq_5m_usd": liq_rec}
+        out.reject_reason = reject
+        out.config_snapshot = decision_config_snapshot
         self._latest = out
         return out
 

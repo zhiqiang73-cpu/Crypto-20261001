@@ -339,8 +339,16 @@ def build_coinglass_snapshot(
         snap.liq_long_5m_usd = long_v
         snap.liq_short_5m_usd = short_v
         snap.liq_total_5m_usd = total
+        if long_v is None and short_v is None:
+            snap.liq_window_status = "error"
+        elif long_v is None or short_v is None:
+            snap.liq_window_status = "partial"
+        else:
+            snap.liq_window_status = "complete"
         if total is not None:
             got_any = True
+    else:
+        snap.liq_window_status = "missing"
 
     if lsr_payload is not None:
         snap.long_short_ratio = parse_long_short_ratio(lsr_payload)
@@ -409,6 +417,7 @@ class CoinGlassCollector:
             liq_long_5m_usd=s.liq_long_5m_usd,
             liq_short_5m_usd=s.liq_short_5m_usd,
             liq_total_5m_usd=s.liq_total_5m_usd,
+            liq_window_status=getattr(s, "liq_window_status", None),
             long_short_ratio=s.long_short_ratio,
             liquidation_speed_long_cleared=s.liquidation_speed_long_cleared,
             liquidation_speed_short_cleared=s.liquidation_speed_short_cleared,

@@ -110,14 +110,40 @@ def settle_record(
 
     direction, target, stop, atr_used = plan_levels(record, horizon_cfg)
 
-    # 只看入场之后的 K 线 (入场那根可能只走了一半, 从下一根开始更干净)
-    window = [c for c in candles
-              if record.opened_at_ms <= c.open_time_ms < window_end]
+    # 严格时间截断: 只使用 close_time <= window_end 的完整 bar
+    # 跨越 window_end 的 bar 不得用于确定性 CORRECT/WRONG（会引入窗外价格）
+    bar_ms = int(interval_hours(horizon_cfg.get("interval", "1h")) * HOUR_MS)
+    truncated = False
+    cleaned = []
+    for c in candles:
+        if c.open_time_ms < record.opened_at_ms:
+            # 入场落在 bar 中间 — 整根 bar 的 high/low 含入场前，标不确定
+            close_t = c.close_time_ms or (c.open_time_ms + bar_ms - 1)
+            if c.open_time_ms <= record.opened_at_ms < close_t:
+                truncated = True  # 入场 bar 不可可靠使用
+            continue
+        close_t = c.close_time_ms or (c.open_time_ms + bar_ms - 1)
+        if c.open_time_ms >= window_end:
+            continue
+        if close_t > window_end:
+            # bar 延伸到窗外 — 丢弃，不得用其 high/low 下确定性结论
+            truncated = True
+            continue
+        cleaned.append(c)
+    window = cleaned
 
     if not window:
-        # 窗口内的 K 线还没产生, 或者已经老到超出可取范围
         oldest = min((c.open_time_ms for c in candles), default=None)
-        if oldest is not None and oldest >= window_end:
+        if truncated:
+            record.status = SettleStatus.INVALID.value
+            record.settle_detail = {
+                "reason": "data_insufficient",
+                "uncertain": True,
+                "window_truncated": True,
+                "note": "仅有跨越窗口边界或入场 bar 的 K 线，无法无前视地判定",
+            }
+            record.settled_at_ms = now
+        elif oldest is not None and oldest >= window_end:
             record.status = SettleStatus.INVALID.value
             record.settle_detail = {"reason": "out_of_range",
                                     "note": "观察窗口早于可取 K 线范围, 无法结算"}
@@ -133,7 +159,12 @@ def settle_record(
     hit_candle: Optional[Candle] = None
     ambiguous = False
 
-    for c in window:
+    for idx, c in enumerate(window):
+        # 入场 bar: 未知高/低先后 → 若两边都触则标 AMBIGUOUS
+        is_entry_bar = (
+            c.open_time_ms <= record.opened_at_ms
+            < (c.close_time_ms or (c.open_time_ms + HOUR_MS))
+        )
         favorable = (c.high - record.entry_price) if direction == "LONG" else (record.entry_price - c.low)
         adverse = (record.entry_price - c.low) if direction == "LONG" else (c.high - record.entry_price)
         mfe = max(mfe, favorable / atr_used)
@@ -143,11 +174,21 @@ def settle_record(
         touched_stop = c.low <= stop if direction == "LONG" else c.high >= stop
 
         if touched_target and touched_stop:
-            # 同一根 K 线内两边都摸到, 无法判断先后 → 保守处理
             ambiguous = True
             hit = "wrong" if AMBIGUOUS_COUNTS_AS == "wrong" else "correct"
             hit_candle = c
             break
+        if is_entry_bar and (touched_target or touched_stop):
+            # 入场 bar 未知先后 → 不确定，不给确定性对错
+            record.status = SettleStatus.INVALID.value
+            record.settled_at_ms = now
+            record.settle_detail = {
+                "reason": "ambiguous_entry_bar",
+                "uncertain": True,
+                "ambiguous": True,
+                "window_truncated": truncated,
+            }
+            return record
         if touched_stop:
             hit, hit_candle = "wrong", c
             break
@@ -171,6 +212,7 @@ def settle_record(
             "ambiguous": ambiguous,
             "bars_used": len(window),
             "bars_to_hit": window.index(hit_candle) + 1,
+            "window_truncated": truncated,
         }
         return record
 
@@ -191,6 +233,7 @@ def settle_record(
         "stop": round(stop, 4),
         "atr_used": round(atr_used, 4),
         "bars_used": len(window),
+        "window_truncated": truncated,
     }
     return record
 

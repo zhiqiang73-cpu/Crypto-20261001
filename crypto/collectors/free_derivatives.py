@@ -254,6 +254,7 @@ class FreeDerivativesCollector:
             liq_long_5m_usd=s.liq_long_5m_usd,
             liq_short_5m_usd=s.liq_short_5m_usd,
             liq_total_5m_usd=s.liq_total_5m_usd,
+            liq_window_status=getattr(s, "liq_window_status", None),
             long_short_ratio=s.long_short_ratio,
             liquidation_speed_long_cleared=s.liquidation_speed_long_cleared,
             liquidation_speed_short_cleared=s.liquidation_speed_short_cleared,
@@ -364,8 +365,19 @@ class FreeDerivativesCollector:
             long_c, short_c = self._force.cleared_ratios()
             snap.liquidation_speed_long_cleared = 0.0 if long_c is None else long_c
             snap.liquidation_speed_short_cleared = 0.0 if short_c is None else short_c
-            if total > 0:
-                got = True
+            # 缓冲样本数区分暖机 / 真零 / 有清算
+            n_events = len(getattr(self._force, "_events", None) or getattr(self._force, "events", []) or [])
+            # ForceOrderBuffer API 探测
+            try:
+                n_events = len(self._force.as_heatmap_events() or [])
+            except Exception:
+                n_events = 0
+            if n_events <= 0 and total <= 0:
+                snap.liq_window_status = "warmup"
+            else:
+                snap.liq_window_status = "complete"
+                if total > 0:
+                    got = True
 
         if price and self._force.as_heatmap_events():
             above, below, magnet = heatmap_from_liquidations(
@@ -374,14 +386,15 @@ class FreeDerivativesCollector:
             snap.heatmap_above_intensity = above
             snap.heatmap_below_intensity = below
             snap.heatmap_magnet = magnet
-            if magnet is not None:
+            if magnet is not None and (above or below):
                 got = True
         elif price:
-            # 无爆仓样本时记中性磁铁 0, 避免长期 missing 占权重
+            # 无样本：中性观察值，但不得刷新 available/成功时间冒充有效流
             snap.heatmap_above_intensity = 0.0
             snap.heatmap_below_intensity = 0.0
             snap.heatmap_magnet = 0.0
-            got = True
+            if not getattr(snap, "liq_window_status", None):
+                snap.liq_window_status = "warmup"
 
         snap.available = got
         if got:

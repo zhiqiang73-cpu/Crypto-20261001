@@ -178,6 +178,8 @@ def extract_tech_features(
     snap.adx = last(adx_s)
     snap.atr = last(atr_s)
     snap.atr_pct = (snap.atr / price) if snap.atr and price else None
+    recent_atr = [x for x in atr_s[-20:] if x is not None and x > 0]
+    snap.atr_mean = (sum(recent_atr) / len(recent_atr)) if recent_atr else None
 
     # EMA 连续分 (档位 + ATR 偏移)
     snap.ema_score = ema_stack_score(

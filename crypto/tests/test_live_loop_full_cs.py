@@ -21,7 +21,7 @@ class TestFullCS(unittest.TestCase):
             StrategyHorizon.SHORT_TERM,
             DimensionScores(news=10, data=50, tech=40, prediction=20),
         )
-        # 线性 37; 四面同向 → agreement_boost=1.3 → 48.1
+        # 线性 37; agreement_boost 默认关闭
         from utils.scoring import compute_cs_with_boost
         from config.weights import DIMENSION_WEIGHTS
         expected, _ = compute_cs_with_boost(
@@ -33,15 +33,17 @@ class TestFullCS(unittest.TestCase):
 
     def test_partial_when_news_missing(self):
         loop = LiveScoringLoop()
-        partial, decision, missing, _, bk = loop.compute_partial_cs({
+        partial, decision, missing, _, bk, safety = loop.compute_partial_cs({
             "news": None, "data": 50.0, "tech": 40.0, "prediction": 20.0,
         })
         self.assertIn("news", missing)
         self.assertNotIn("data", missing)
-        # 重归一 V8: w_sum = 0.35+0.25+0.20=0.80
-        expected = (0.35 / 0.80) * 50 + (0.25 / 0.80) * 40 + (0.20 / 0.80) * 20
+        # 重归一 V8: w_sum = 0.35+0.25+0.20=0.80; boost off
+        base = (0.35 / 0.80) * 50 + (0.25 / 0.80) * 40 + (0.20 / 0.80) * 20
+        expected = base
         self.assertAlmostEqual(partial, round(expected, 2), delta=0.05)
         self.assertTrue(bk)
+        self.assertFalse(safety)
 
 
 class TestPanelPayload(unittest.TestCase):

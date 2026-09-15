@@ -90,7 +90,8 @@ class TestExitChecker(unittest.TestCase):
         self.assertEqual(acts[0].reason, "hard_sl")
 
     def test_tp1(self):
-        acts = self.checker.check_exits(self.pos, 100.9, cs=40.0, now_ms=1_100_000)
+        # V8.2: tp1_pct=0.012 → 需涨 1.2%
+        acts = self.checker.check_exits(self.pos, 101.3, cs=40.0, now_ms=1_100_000)
         self.assertEqual(len(acts), 1)
         self.assertEqual(acts[0].reason, "tp1")
         self.assertAlmostEqual(acts[0].close_pct, 0.50)

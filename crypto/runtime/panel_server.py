@@ -89,7 +89,8 @@ DRIVER_LABELS = {
     "session_liquidity": "时区流动性",
     "hashrate": "算力",
     "whale_transfers": "巨鲸异动",
-    "exchange_reserves": "交易所存量~",
+    "exchange_reserves": "24h动量(非储备)~",
+    "price_momentum_24h": "24h价格动量",
     "mvrv": "MVRV~",
     "lth_supply_ratio": "LTH 持仓占比",
     "nupl": "NUPL",
@@ -445,7 +446,7 @@ class PanelApp:
         self.loop_short = LiveScoringLoop(
             horizon=StrategyHorizon.SHORT_TERM,
             refresh_sec=10.0,
-            kline_interval="5m",
+            kline_interval="1h",
         )
         self.loop_long = LiveScoringLoop(
             horizon=StrategyHorizon.LONG_TERM,
@@ -470,21 +471,35 @@ class PanelApp:
         self.executor = executor  # TradeExecutor | None
         self._stop: Optional[asyncio.Event] = None
         self._tasks: List[asyncio.Task] = []
+        self._trade_queue: Optional[asyncio.Queue] = None
+        self._trade_worker: Optional[asyncio.Task] = None
 
     def _schedule_trade(self, snap: LiveScoreSnapshot, horizon: str) -> None:
         if self.executor is None:
             return
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._safe_trade(snap, horizon))
+            # 串行排队, 禁止并发 fire-and-forget 打穿 _trade_lock 外的状态
+            if self._trade_queue is None:
+                self._trade_queue = asyncio.Queue()
+            self._trade_queue.put_nowait((snap, horizon))
+            if self._trade_worker is None or self._trade_worker.done():
+                self._trade_worker = loop.create_task(self._trade_worker_loop())
         except RuntimeError:
             pass
 
-    async def _safe_trade(self, snap: LiveScoreSnapshot, horizon: str) -> None:
-        try:
-            await self.executor.on_snapshot(snap, horizon)
-        except Exception as exc:
-            logger.warning("trade executor: %s", exc)
+    async def _trade_worker_loop(self) -> None:
+        if self._trade_queue is None:
+            return
+        while True:
+            try:
+                snap, horizon = self._trade_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                await self.executor.on_snapshot(snap, horizon)
+            except Exception as exc:
+                logger.warning("trade executor: %s", exc)
 
     async def start_scoring(self) -> None:
         self._stop = asyncio.Event()
@@ -524,8 +539,12 @@ class PanelApp:
                     self._schedule_trade(snap, "long_term")
                 except asyncio.TimeoutError:
                     logger.warning("long score_once timeout (>60s)")
+                    if self.executor and getattr(self.executor, "guardian", None):
+                        self.executor.guardian.note_score_result(False)
                 except Exception as exc:
                     logger.warning("long score: %s", exc)
+                    if self.executor and getattr(self.executor, "guardian", None):
+                        self.executor.guardian.note_score_result(False)
                 elapsed = time.time() - t0
                 wait = max(5.0, 120.0 - elapsed)
                 try:
@@ -534,6 +553,12 @@ class PanelApp:
                     pass
 
         self._tasks.append(asyncio.create_task(_long_poll()))
+
+        # 独立风控看门狗 — 评分失败时仍运行
+        if self.executor is not None and getattr(self.executor, "guardian", None):
+            self._tasks.append(
+                asyncio.create_task(self.executor.run_guardian(self._stop))
+            )
 
     async def stop_scoring(self) -> None:
         if self._stop is not None:

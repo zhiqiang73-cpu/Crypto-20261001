@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Dict, Sequence, Tuple
 
 from models.snapshots import SessionZone
 
@@ -146,24 +146,86 @@ def agreement_boost(
     return boost_lo + (boost_hi - boost_lo) * agree_ratio
 
 
+
+
+def detect_collinear_whale(
+    face_scores: Dict[str, float],
+    whale_parts: Optional[Dict[str, float]] = None,
+    *,
+    min_abs: float = 10.0,
+) -> Dict[str, float]:
+    """从真实巨鲸子贡献识别跨面共线；生产路径调用，禁止仅靠测试塞标志。"""
+    out = dict(face_scores)
+    parts = whale_parts or {}
+    wn = abs(float(parts.get("news_whale") or parts.get("whale_institutional") or 0))
+    wd = abs(float(parts.get("data_whale") or parts.get("whale_transfers") or 0))
+    if wn >= min_abs and wd >= min_abs:
+        # 同向才标记
+        s_news = float(face_scores.get("news") or 0)
+        s_data = float(face_scores.get("data") or 0)
+        if s_news * s_data > 0:
+            out["_collinear_whale"] = True  # type: ignore
+    return out
+
+def apply_collinear_caps(
+    face_scores: dict,
+    weights: dict,
+    confidences: Optional[dict] = None,
+) -> tuple:
+    """限制已知共线组对面贡献；返回 (adjusted_weights, note)."""
+    try:
+        from config.weights import COLLINEAR_GROUPS
+    except Exception:
+        return weights, {}
+    w = {k: float(weights.get(k, 0)) for k in weights}
+    notes = {}
+    whale = COLLINEAR_GROUPS.get("whale") or {}
+    max_c = float(whale.get("max_combined_face_contrib") or 0)
+    # 仅当映射层标记巨鲸两侧同时有贡献时才封顶（禁止把一切 news+data 同向都当巨鲸）
+    whale_active = bool(face_scores.get("_collinear_whale")) or bool(
+        (confidences or {}).get("_collinear_whale")
+    )
+    if max_c > 0 and whale_active:
+        s_news = float(face_scores.get("news") or 0)
+        s_data = float(face_scores.get("data") or 0)
+        if s_news * s_data > 0:
+            wn = w.get("news", 0)
+            wd = w.get("data", 0)
+            if wn + wd > max_c:
+                scale = max_c / (wn + wd)
+                w["news"] = wn * scale
+                w["data"] = wd * scale
+                notes["whale_cap_scale"] = scale
+    return w, notes
+
 def compute_cs_with_boost(
     face_scores: dict,
     weights: dict,
     boost_lo: float = 0.7,
     boost_hi: float = 1.3,
     confidences: Optional[dict] = None,
+    *,
+    enable_boost: Optional[bool] = None,
 ) -> tuple:
     """置信度加权 CS × 一致性放大, 返回 (cs, boost).
 
-    有 confidences 时: base = Σ(Wi×Ci×Si)/Σ(Wi×Ci);
-    否则退化为线性 Σ Wi×Si.
+    enable_boost 默认读 config.weights.ENABLE_AGREEMENT_BOOST (默认 False).
     """
+    weights, _cap_notes = apply_collinear_caps(face_scores, weights, confidences)
     if confidences:
         base, _ = confidence_weighted_cs(face_scores, weights, confidences)
     else:
         base = sum(
             float(weights.get(k, 0)) * float(face_scores.get(k, 0)) for k in weights
         )
+    if enable_boost is None:
+        try:
+            from config.weights import ENABLE_AGREEMENT_BOOST
+            enable_boost = bool(ENABLE_AGREEMENT_BOOST)
+        except Exception:
+            enable_boost = False
+    if not enable_boost:
+        return clamp(base), 1.0
     boost = agreement_boost(face_scores, weights, boost_lo, boost_hi)
     return clamp(base * boost), boost
 
@@ -186,9 +248,11 @@ def available_weight_ratio(
 
 
 def shrink_by_confidence(score: float, confidence: float) -> float:
-    """可用比例低时, 面分向 0 衰减. confidence=1 → 原值; 0.55 → ×√0.55≈0.74."""
-    c = max(0.0, min(1.0, float(confidence)))
-    return float(score) * (c ** 0.5)
+    """V8.2: 不再做 √C 面分收缩 — 置信度仅在 CS 合成层 (Wi×Ci) 生效.
+
+    保留函数签名以兼容调用方; confidence 参数忽略.
+    """
+    return float(score)
 
 
 def confidence_weighted_cs(

@@ -29,7 +29,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SETTLE_CONFIG: Dict[str, Dict[str, Any]] = {
     "short_term": {
         "window_hours": 1.0,        # 成交后观察窗口 = 持仓决策窗口 (1 小时)
-        "kline_interval": "5m",     # 1h 内约 12 根, 结算粒度够用
+        "kline_interval": "1h",     # V8.2: 与 1h 持仓窗口对齐 (原 5m ATR 过小)
         "target_atr_mult": 1.0,     # 先摸到 entry ± target×ATR → 对
         "stop_atr_mult": 1.0,       # 先摸到 entry ∓ stop×ATR   → 错
         "atr_period": 14,
@@ -161,7 +161,7 @@ PERF_GATE_TOLERANCE = 0.02           # 性能门: 允许 2% 统计噪声
 ROLLBACK_SAMPLE_SIZE = 50            # 新版本跑满 N 笔有效样本后评估
 ROLLBACK_WINRATE_DROP = 0.05         # 胜率比父版低 5% → 自动回滚
 MAX_CONSECUTIVE_ROLLBACKS = 3        # 连续回滚此次数 → 进入观察模式
-AUTO_ACCEPT_PROPOSALS = True         # 通过元评审门控后自动采纳
+AUTO_ACCEPT_PROPOSALS = False        # 建议模式: AI 调参不自动写入交易配置
 DAILY_SUMMARY_HOUR_CST = 2           # 每日总结触发小时 (CST/UTC+8)
 DAILY_SUMMARIES_DIR = PROJECT_ROOT / "runtime" / "review" / "daily_summaries"
 META_STATE_PATH = PROJECT_ROOT / "runtime" / "review" / "meta_state.json"
@@ -180,6 +180,25 @@ POSITION_NOTIONAL_PCT = {
 }
 MIN_NOTIONAL_USDT = 100.0
 TRADING_HISTORY_PATH = PROJECT_ROOT / "runtime" / "review" / "trading_history.jsonl"
+TRADE_LEDGER_PATH = PROJECT_ROOT / "runtime" / "review" / "trade_ledger.jsonl"
+SIGNAL_RESEARCH_PATH = PROJECT_ROOT / "runtime" / "review" / "signal_research.jsonl"
+POSITIONS_PATH = PROJECT_ROOT / "runtime" / "review" / "positions.json"
+
+# 独立风控
+RISK_GUARDIAN_INTERVAL_SEC = 5.0
+
+# 各源 staleness 上限 (秒) — 超限阻断新开仓
+STALENESS_LIMITS: Dict[str, float] = {
+    "mark_price": 60.0,
+    "binance": 60.0,
+    "klines": 300.0,
+    "funding": 600.0,
+    "polymarket": 600.0,
+    "predict_fun": 300.0,
+    "news": 900.0,
+    "onchain": 3600.0,
+    "default": 300.0,
+}
 
 # ---------------------------------------------------------------------------
 # 九、V8.1 核心交易参数: 单笔风险预算 → 仓位
@@ -192,30 +211,32 @@ RISK_PER_TRADE_PCT = {
 }
 # 名义敞口硬顶 (防止 ATR 极小时仓位爆炸)
 MAX_NOTIONAL_PCT = {
-    "short_term": 0.20,
-    "long_term": 0.30,
+    "short_term": 0.50,   # V8.2: 0.20→0.50, 避免 1h ATR 下风险预算被架空
+    "long_term": 0.40,    # V8.2: 0.30→0.40
 }
+# 双 horizon 合计名义敞口上限 (相对权益)
+TOTAL_MAX_NOTIONAL_PCT = 0.60
 
 EXIT_STRATEGY: Dict[str, Dict[str, Any]] = {
     "short_term": {
         # ATR 倍数优先; pct 作无 ATR 时回退
-        "tp1_atr": 0.8,
-        "tp1_pct": 0.008,
+        "tp1_atr": 1.2,             # V8.2: 0.8→1.2, RR=1.2:1
+        "tp1_pct": 0.012,
         "tp1_close_pct": 0.50,
-        "tp2_atr": 1.5,
-        "tp2_pct": 0.015,
+        "tp2_atr": 2.5,             # V8.2: 1.5→2.5
+        "tp2_pct": 0.025,
         "tp2_close_pct": 0.30,
-        "trailing_atr": 0.5,
-        "trailing_pct": 0.005,
+        "trailing_atr": 1.0,        # V8.2: 0.5→1.0 (匹配 1h ATR)
+        "trailing_pct": 0.010,
         "hard_sl_atr": 1.0,
         "hard_sl_pct": 0.010,
         "time_stop_min": 75,
-        "time_stop_min_pnl": 0.003,
-        "cs_decay_threshold": 25,
+        "time_stop_min_pnl": 0.001, # V8.2: 0.3%→0.1%, 对齐 TP1 量级
+        "cs_decay_threshold": 15,   # V8.2: 25→15, 适配实测 CS 范围
         "cs_decay_close_pct": 0.50,
         "weekly_review": False,
-        "tighten_trailing_pct": 0.003,
-        "tighten_trailing_atr": 0.3,
+        "tighten_trailing_pct": 0.006,
+        "tighten_trailing_atr": 0.6,  # V8.2: 0.3→0.6
         "liq_force_usd": 100_000_000,
         "spread_force_mult": 3.0,
     },
@@ -232,7 +253,7 @@ EXIT_STRATEGY: Dict[str, Dict[str, Any]] = {
         "hard_sl_pct": 0.04,
         "time_stop_min": None,
         "time_stop_min_pnl": None,
-        "cs_decay_threshold": 25,
+        "cs_decay_threshold": 15,   # V8.2: 25→15
         "cs_decay_close_pct": 0.50,
         "weekly_review": True,
         "tighten_trailing_pct": 0.015,
@@ -244,6 +265,7 @@ EXIT_STRATEGY: Dict[str, Dict[str, Any]] = {
 
 # 仓位调节 (在风险定仓之上再乘)
 POSITION_CS_STRONG_MULT = 1.5
+POSITION_CS_STRONG_THRESHOLD = 35   # V8.2: 原硬编码 60 → 35 (对齐 STRONG≈45)
 POSITION_CONF_LOW_THRESHOLD = 0.6
 POSITION_CONF_LOW_MULT = 0.7
 POSITION_ATR_HIGH_MULT = 0.5

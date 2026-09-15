@@ -25,6 +25,17 @@ from models.review import ParamChange
 
 logger = logging.getLogger(__name__)
 
+import hashlib
+
+
+def canonical_json(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def content_hash(params: Dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(params).encode("utf-8")).hexdigest()
+
+
 # 引擎真的会消费的参数组; 其余属于「已入档但需在调用点接入」的咨询项
 ENGINE_APPLIED_GROUPS = {"dim_weight", "threshold", "safety_valve"}
 ADVISORY_GROUPS = {"tech_mult"}
@@ -138,6 +149,7 @@ def _current_effective_doc(version: str, parent: Optional[str]) -> Dict[str, Any
         "valid_sample_count": 0,
         "changes": [],
         "params": effective_params(),
+        "content_hash": content_hash(effective_params()),
         "applied_groups": sorted(ENGINE_APPLIED_GROUPS),
         "advisory_groups": sorted(ADVISORY_GROUPS),
         "note": "首次留档: 出厂默认 (config/weights.py)",
@@ -186,6 +198,10 @@ def commit_version(
         })
 
     version = _next_version_name()
+    chash = content_hash(params)
+    expected = meta.get("content_hash")
+    if expected and expected != chash:
+        raise ValueError(f"content_hash mismatch: expected={expected} got={chash}")
     doc = {
         "version": version,
         "created_at_ms": int(time.time() * 1000),
@@ -198,6 +214,7 @@ def commit_version(
         "risks": meta.get("risks", ""),
         "changes": applied,
         "params": params,
+        "content_hash": chash,
         "applied_groups": sorted(ENGINE_APPLIED_GROUPS),
         "advisory_groups": sorted(ADVISORY_GROUPS),
         "note": "由复盘建议采纳生成",

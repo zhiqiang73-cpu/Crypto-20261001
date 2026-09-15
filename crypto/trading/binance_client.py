@@ -21,9 +21,15 @@ except ImportError:  # pragma: no cover
 
 from config.review import BINANCE_TESTNET_DEFAULT_BASE, TRADING_SYMBOL
 from config.secrets import get_secret, mask_secret
-from trading.models import AccountBalance, OrderResult, PositionInfo
+from trading.models import AccountBalance, ManagedOrder, OrderResult, OrderState, PositionInfo
 
 logger = logging.getLogger(__name__)
+
+
+def _new_client_order_id(prefix: str = "btc") -> str:
+    """Binance clientOrderId ≤ 36 chars."""
+    import os
+    return f"{prefix}{int(time.time() * 1000) % 10_000_000_000_000}{os.getpid() % 1000:03d}"
 
 
 class BinanceClientError(RuntimeError):
@@ -293,6 +299,244 @@ class BinanceTestnetClient:
             signed=True,
         )
 
+    async def query_order(
+        self,
+        *,
+        client_order_id: Optional[str] = None,
+        order_id: Optional[str] = None,
+        symbol: Optional[str] = None,
+    ) -> ManagedOrder:
+        """按 clientOrderId 或 orderId 查询 — 超时后必须先查再决定重发."""
+        symbol = symbol or self.symbol
+        params: Dict[str, Any] = {"symbol": symbol}
+        if client_order_id:
+            params["origClientOrderId"] = client_order_id
+        elif order_id:
+            params["orderId"] = order_id
+        else:
+            return ManagedOrder(
+                client_order_id="",
+                state=OrderState.REJECTED,
+                error="need client_order_id or order_id",
+                symbol=symbol,
+            )
+        try:
+            raw = await self._request("GET", "/fapi/v1/order", params, signed=True)
+        except BinanceClientError as exc:
+            return ManagedOrder(
+                client_order_id=client_order_id or "",
+                exchange_order_id=str(order_id or ""),
+                state=OrderState.UNKNOWN,
+                error=str(exc),
+                symbol=symbol,
+            )
+        return self._raw_to_managed(raw, client_order_id=client_order_id or "")
+
+    def _map_binance_status(self, status: str, filled: float, qty: float) -> OrderState:
+        s = (status or "").upper()
+        if s == "FILLED":
+            return OrderState.FILLED
+        if s == "PARTIALLY_FILLED":
+            return OrderState.PARTIALLY_FILLED
+        if s in ("CANCELED", "EXPIRED", "EXPIRED_IN_MATCH"):
+            return OrderState.CANCELED
+        if s == "REJECTED":
+            return OrderState.REJECTED
+        if s in ("NEW", "PENDING_NEW"):
+            if filled > 0:
+                return OrderState.PARTIALLY_FILLED
+            return OrderState.ACKNOWLEDGED
+        if filled > 0 and qty > 0 and filled + 1e-12 >= qty:
+            return OrderState.FILLED
+        if filled > 0:
+            return OrderState.PARTIALLY_FILLED
+        return OrderState.UNKNOWN
+
+    def _raw_to_managed(
+        self, raw: Dict[str, Any], *, client_order_id: str = ""
+    ) -> ManagedOrder:
+        qty = float(raw.get("origQty") or raw.get("quantity") or 0)
+        filled = float(raw.get("executedQty") or 0)
+        status = str(raw.get("status") or "")
+        cid = str(raw.get("clientOrderId") or client_order_id or "")
+        return ManagedOrder(
+            client_order_id=cid,
+            state=self._map_binance_status(status, filled, qty),
+            exchange_order_id=str(raw.get("orderId") or raw.get("algoId") or ""),
+            algo_id=str(raw.get("algoId") or ""),
+            symbol=str(raw.get("symbol") or self.symbol),
+            side=str(raw.get("side") or ""),
+            position_side=str(raw.get("positionSide") or ""),
+            requested_qty=qty,
+            submitted_qty=qty,
+            quantity=qty,
+            cum_filled_qty=filled,
+            filled_qty=filled,
+            last_fill_qty=filled,
+            avg_price=float(raw.get("avgPrice") or 0),
+            reduce_only=bool(raw.get("reduceOnly")),
+            is_stop=str(raw.get("type") or "").upper().startswith("STOP"),
+            is_algo=bool(raw.get("algoId") or raw.get("algoType")),
+            stop_price=float(raw.get("stopPrice") or raw.get("triggerPrice") or 0),
+            raw=raw if isinstance(raw, dict) else {},
+        )
+
+    async def cancel_order(
+        self,
+        *,
+        client_order_id: Optional[str] = None,
+        order_id: Optional[str] = None,
+        symbol: Optional[str] = None,
+    ) -> ManagedOrder:
+        symbol = symbol or self.symbol
+        params: Dict[str, Any] = {"symbol": symbol}
+        if client_order_id:
+            params["origClientOrderId"] = client_order_id
+        elif order_id:
+            params["orderId"] = order_id
+        else:
+            return ManagedOrder(
+                client_order_id="", state=OrderState.REJECTED, error="need id", symbol=symbol
+            )
+        try:
+            raw = await self._request("DELETE", "/fapi/v1/order", params, signed=True)
+            mo = self._raw_to_managed(raw, client_order_id=client_order_id or "")
+            if mo.state not in (OrderState.CANCELED, OrderState.FILLED):
+                mo.state = OrderState.CANCELED
+            return mo
+        except BinanceClientError as exc:
+            return ManagedOrder(
+                client_order_id=client_order_id or "",
+                exchange_order_id=str(order_id or ""),
+                state=OrderState.UNKNOWN,
+                error=str(exc),
+                symbol=symbol,
+            )
+
+    async def cancel_all_stops(self, symbol: Optional[str] = None) -> int:
+        """取消该合约所有 STOP/TAKE_PROFIT 类挂单. 返回取消数量."""
+        symbol = symbol or self.symbol
+        opens = await self.get_open_orders(symbol)
+        n = 0
+        for o in opens or []:
+            typ = str(o.get("type") or "").upper()
+            if "STOP" not in typ and "TAKE_PROFIT" not in typ:
+                continue
+            await self.cancel_order(order_id=str(o.get("orderId") or ""), symbol=symbol)
+            n += 1
+        return n
+
+    async def place_stop_market(
+        self,
+        side: str,
+        quantity: float,
+        stop_price: float,
+        symbol: Optional[str] = None,
+        *,
+        client_order_id: Optional[str] = None,
+        close_position: bool = False,
+    ) -> ManagedOrder:
+        """Algo 条件单 STOP_MARKET — POST /fapi/v1/algoOrder (官方已迁出 /order)."""
+        symbol = symbol or self.symbol
+        side_u = side.upper()
+        order_side = "SELL" if side_u == "LONG" else "BUY"
+        cid = client_order_id or _new_client_order_id("sl")
+        params: Dict[str, Any] = {
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": order_side,
+            "type": "STOP_MARKET",
+            "triggerPrice": round(float(stop_price), 2),
+            "workingType": "MARK_PRICE",
+            "clientAlgoId": cid,
+        }
+        if close_position:
+            params["closePosition"] = "true"
+        else:
+            step = await self._lot_step(symbol)
+            qty = self._qty_precision(quantity, step)
+            if qty <= 0:
+                return ManagedOrder(
+                    client_order_id=cid,
+                    state=OrderState.REJECTED,
+                    error=f"quantity too small: {quantity}",
+                    symbol=symbol,
+                    is_stop=True,
+                    is_algo=True,
+                )
+            params["quantity"] = qty
+            params["reduceOnly"] = "true"
+        try:
+            hedge = await self.get_position_mode()
+        except Exception:
+            hedge = bool(self._hedge_mode)
+        if hedge:
+            params["positionSide"] = side_u
+            params.pop("reduceOnly", None)
+        try:
+            raw = await self._request("POST", "/fapi/v1/algoOrder", params, signed=True)
+            mo = self._raw_to_managed(raw, client_order_id=cid)
+            mo.is_stop = True
+            mo.is_algo = True
+            mo.stop_price = float(stop_price)
+            mo.position_side = side_u
+            mo.algo_id = str(raw.get("algoId") or mo.exchange_order_id)
+            mo.raw = dict(raw) if isinstance(raw, dict) else {}
+            mo.raw.setdefault("algoType", "CONDITIONAL")
+            if mo.state == OrderState.UNKNOWN and not mo.error:
+                mo.state = OrderState.ACKNOWLEDGED
+            return mo
+        except BinanceClientError as exc:
+            return ManagedOrder(
+                client_order_id=cid,
+                state=OrderState.REJECTED,
+                error=str(exc),
+                symbol=symbol,
+                is_stop=True,
+                is_algo=True,
+                stop_price=float(stop_price),
+                position_side=side_u,
+            )
+
+    async def get_open_algo_orders(self, symbol: Optional[str] = None) -> list:
+        return await self._request(
+            "GET",
+            "/fapi/v1/openAlgoOrders",
+            {"symbol": symbol or self.symbol},
+            signed=True,
+        )
+
+    async def cancel_algo_order(
+        self,
+        *,
+        client_algo_id: Optional[str] = None,
+        algo_id: Optional[str] = None,
+        symbol: Optional[str] = None,
+    ) -> ManagedOrder:
+        symbol = symbol or self.symbol
+        params: Dict[str, Any] = {"symbol": symbol}
+        if client_algo_id:
+            params["clientAlgoId"] = client_algo_id
+        elif algo_id:
+            params["algoId"] = algo_id
+        else:
+            return ManagedOrder(client_order_id="", state=OrderState.REJECTED, error="need id", is_algo=True)
+        try:
+            raw = await self._request("DELETE", "/fapi/v1/algoOrder", params, signed=True)
+            mo = self._raw_to_managed(raw, client_order_id=client_algo_id or "")
+            mo.is_algo = True
+            mo.is_stop = True
+            mo.state = OrderState.CANCELED
+            return mo
+        except BinanceClientError as exc:
+            return ManagedOrder(
+                client_order_id=client_algo_id or "",
+                state=OrderState.UNKNOWN,
+                error=str(exc),
+                is_algo=True,
+                is_stop=True,
+            )
+
     def _qty_precision(self, qty: float, step: float = 0.001) -> float:
         if step <= 0:
             return round(qty, 3)
@@ -316,6 +560,8 @@ class BinanceTestnetClient:
         quantity: float,
         symbol: Optional[str] = None,
         reduce_only: bool = False,
+        *,
+        client_order_id: Optional[str] = None,
     ) -> OrderResult:
         """side: LONG / SHORT → BUY / SELL. 自动适配单向/双向持仓."""
         symbol = symbol or self.symbol
@@ -325,11 +571,13 @@ class BinanceTestnetClient:
             return OrderResult(ok=False, error=f"quantity too small: {quantity}")
         side_u = side.upper()
         order_side = "BUY" if side_u == "LONG" else "SELL"
+        cid = client_order_id or _new_client_order_id("mkt")
         params: Dict[str, Any] = {
             "symbol": symbol,
             "side": order_side,
             "type": "MARKET",
             "quantity": qty,
+            "newClientOrderId": cid,
         }
         hedge = False
         try:
@@ -337,11 +585,9 @@ class BinanceTestnetClient:
         except Exception:
             hedge = bool(self._hedge_mode)
         if hedge:
-            # 双向模式: 开仓用同向 positionSide; 平仓用持仓方向 + reduce
             params["positionSide"] = side_u if not reduce_only else (
                 "LONG" if side_u == "SHORT" else "SHORT"
             )
-            # 双向模式下 reduceOnly 与 positionSide 组合: 平多 = SELL + LONG
             if reduce_only:
                 params["positionSide"] = "LONG" if order_side == "SELL" else "SHORT"
         else:
@@ -351,32 +597,98 @@ class BinanceTestnetClient:
             raw = await self._request("POST", "/fapi/v1/order", params, signed=True)
             avg = float(raw.get("avgPrice") or 0)
             qty_filled = float(raw.get("executedQty") or 0)
-            # 市价单偶发返回 NEW + avg=0, 用仓位入口价兜底
-            if avg <= 0 or qty_filled <= 0:
-                await asyncio.sleep(0.15)
-                pos = await self.get_position(symbol)
-                if pos.entry_price > 0:
-                    avg = pos.entry_price
-                if qty_filled <= 0 and pos.quantity > 0:
-                    qty_filled = pos.quantity
+            status = str(raw.get("status") or "")
+            # 市价单偶发返回 NEW + avg=0 → 用订单查询确认, 不用总仓位冒充成交量
+            if avg <= 0 or qty_filled <= 0 or status.upper() in ("NEW", "PENDING_NEW"):
+                await asyncio.sleep(0.2)
+                mo = await self.query_order(client_order_id=cid, symbol=symbol)
+                if mo.filled_qty > 0:
+                    qty_filled = mo.filled_qty
+                if mo.avg_price > 0:
+                    avg = mo.avg_price
+                if mo.state == OrderState.FILLED:
+                    status = "FILLED"
+                elif mo.state == OrderState.PARTIALLY_FILLED:
+                    status = "PARTIALLY_FILLED"
+            mapped = self._map_binance_status(status, qty_filled, qty)
+            # NEW/查询后仍无成交 → 未决，不得用请求量冒充，不得 ok=True
+            if mapped in (OrderState.UNKNOWN, OrderState.ACKNOWLEDGED, OrderState.SUBMITTED) and qty_filled <= 0:
+                return OrderResult(
+                    ok=False,
+                    order_id=str(raw.get("orderId") or ""),
+                    symbol=symbol,
+                    side=order_side,
+                    position_side=side_u,
+                    quantity=0.0,
+                    requested_qty=quantity,
+                    submitted_qty=qty,
+                    cum_filled_qty=0.0,
+                    avg_price=0.0,
+                    status=status or mapped.value,
+                    raw=raw if isinstance(raw, dict) else {},
+                    client_order_id=cid,
+                    order_state=OrderState.UNKNOWN.value,
+                    error="acknowledged_unfilled",
+                )
             return OrderResult(
-                ok=True,
+                ok=qty_filled > 0 and mapped in (OrderState.FILLED, OrderState.PARTIALLY_FILLED),
                 order_id=str(raw.get("orderId") or ""),
                 symbol=symbol,
                 side=order_side,
                 position_side=side_u,
-                quantity=qty_filled or qty,
+                quantity=qty_filled,
+                requested_qty=quantity,
+                submitted_qty=qty,
+                cum_filled_qty=qty_filled,
+                last_fill_qty=qty_filled,
                 avg_price=avg,
-                status=str(raw.get("status") or ""),
+                status=status,
                 raw=raw if isinstance(raw, dict) else {},
+                client_order_id=cid,
+                order_state=mapped.value,
             )
-        except BinanceClientError as exc:
-            # 若因持仓模式不匹配, 翻转探测再试一次
+        except (BinanceClientError, asyncio.TimeoutError, OSError) as exc:
+            # 超时/断线: 先查 clientOrderId；查询失败保持 UNKNOWN，不标 REJECTED
+            mo = await self.query_order(client_order_id=cid, symbol=symbol)
+            filled = mo.cum_filled_qty or mo.filled_qty
+            if mo.state in (OrderState.FILLED, OrderState.PARTIALLY_FILLED) or filled > 0:
+                return mo.to_order_result()
+            if mo.state in (OrderState.ACKNOWLEDGED, OrderState.SUBMITTED, OrderState.UNKNOWN) or mo.error:
+                return OrderResult(
+                    ok=False,
+                    error=f"submitted_unknown: {exc}",
+                    side=order_side,
+                    symbol=symbol,
+                    client_order_id=cid,
+                    order_state=OrderState.UNKNOWN.value,
+                    order_id=mo.exchange_order_id,
+                    requested_qty=quantity,
+                    submitted_qty=qty,
+                    cum_filled_qty=0.0,
+                    quantity=0.0,
+                )
             if "-4061" in str(exc) and not getattr(self, "_mode_flipped", False):
                 self._mode_flipped = True  # type: ignore[attr-defined]
                 self._hedge_mode = not bool(self._hedge_mode)
-                return await self.market_open(side, quantity, symbol, reduce_only)
-            return OrderResult(ok=False, error=str(exc), side=order_side, symbol=symbol)
+                return await self.market_open(
+                    side, quantity, symbol, reduce_only, client_order_id=cid
+                )
+            # 仅明确拒单（鉴权/参数）才 REJECTED；网络类保持 UNKNOWN
+            is_reject = isinstance(exc, BinanceClientError) and (
+                "-2015" in str(exc) or "-1111" in str(exc) or "Invalid" in str(exc)
+            )
+            return OrderResult(
+                ok=False,
+                error=str(exc),
+                side=order_side,
+                symbol=symbol,
+                client_order_id=cid,
+                order_state=(OrderState.REJECTED if is_reject else OrderState.UNKNOWN).value,
+                requested_qty=quantity,
+                submitted_qty=qty,
+                cum_filled_qty=0.0,
+                quantity=0.0,
+            )
 
     async def market_close(self, symbol: Optional[str] = None) -> OrderResult:
         """平掉当前全部仓位 (单向净仓或双向两边)."""

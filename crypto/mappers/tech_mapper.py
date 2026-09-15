@@ -98,6 +98,7 @@ class TechFactorMapper:
             boll_multiplier=boll_mult,
             atr=snapshot.atr,
             atr_pct=snapshot.atr_pct,
+            atr_mean=getattr(snapshot, "atr_mean", None),
             missing_fields=missing,
             confidence=round(conf, 3),
             reasoning=reasoning,

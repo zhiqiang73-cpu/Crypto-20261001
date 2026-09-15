@@ -6,16 +6,16 @@ DIMENSION_WEIGHTS = {
     "short_term": {"news": 0.20, "data": 0.35, "tech": 0.25, "prediction": 0.20},
 }
 
-# V7 决策阈值 (多空不对称, 基于 [-100, +100])
+# V8.2 决策阈值 — 对齐实测 CS 分布 (±15~30), 使 STANDARD 可触发
 DECISION_THRESHOLDS = {
-    "strong_long":    60,   # CS >= +60
-    "standard_long":  35,   # +35 <= CS < +60
-    "watch_long":     10,   # +10 <= CS < +35
-    "neutral_upper":  10,   # |CS| < 10 = 中性
-    "neutral_lower": -10,
-    "watch_short":   -10,   # -40 < CS <= -10
-    "standard_short":-40,   # -65 < CS <= -40
-    "strong_short":  -65,   # CS <= -65
+    "strong_long":    45,   # CS >= +45
+    "standard_long":  20,   # +20 <= CS < +45
+    "watch_long":      8,   # +8  <= CS < +20
+    "neutral_upper":   8,   # |CS| < 8 = 中性
+    "neutral_lower":  -8,
+    "watch_short":    -8,   # -20 < CS <= -8
+    "standard_short":-20,   # -45 < CS <= -20
+    "strong_short":  -45,   # CS <= -45
 }
 
 # 安全阀: 任一维度与CS方向矛盾超过此值则降级
@@ -51,12 +51,15 @@ DATA_LAYER_WEIGHTS = {
 }
 
 ONCHAIN_INDICATOR_WEIGHTS = {
-    # 长期: 无免费源的指标权重归零, 重分到可代理项 (reserves~/mvrv~/whale/hashrate)
-    "long_term":  {"exchange_reserves": 0.35, "mvrv": 0.35, "lth_supply_ratio": 0.0,
+    # 长期: exchange_reserves 仅为 24h 动量代理 → 降权; 重分到 mvrv/whale/hashrate
+    # mvrv 权重 0: 无真实 MVRV，年均价代理不得冒充估值因子
+    "long_term":  {"exchange_reserves": 0.0, "mvrv": 0.0, "price_momentum_24h": 0.15,
+                   "lth_supply_ratio": 0.0,
                    "nupl": 0.0, "miner_reserves": 0.0, "usdt_market_cap": 0.0,
-                   "sopr": 0.0, "whale_transfers": 0.18, "hashrate": 0.12},
-    "short_term": {"whale_transfers": 0.90, "exchange_reserves": 0.10,
-                   "mvrv": 0, "lth_supply_ratio": 0, "nupl": 0,
+                   "sopr": 0.0, "whale_transfers": 0.45, "hashrate": 0.40},
+    "short_term": {"whale_transfers": 1.0, "exchange_reserves": 0.0,
+                   "mvrv": 0, "price_momentum_24h": 0.0,
+                   "lth_supply_ratio": 0, "nupl": 0,
                    "miner_reserves": 0, "usdt_market_cap": 0, "sopr": 0, "hashrate": 0}
 }
 
@@ -79,17 +82,18 @@ MICROSTRUCTURE_INDICATOR_WEIGHTS = {
 
 # 技术面子指标权重 (按手册合理性与短期可用性分配, ADX/布林带为调节因子不占权重)
 TECH_INDICATOR_WEIGHTS = {
+    # V8.2: EMA/VWAP 与 structure 共线 → 降权; MACD/RSI_div 提权
     "long_term": {
-        "market_structure": 0.16, "ema_stack": 0.14, "volume_profile": 0.12,
-        "support_resistance": 0.10, "vwap": 0.08, "pdh_pdl": 0.06,
-        "rsi_divergence": 0.08, "macd_hist": 0.06, "volume": 0.08, "obv": 0.04,
+        "market_structure": 0.16, "ema_stack": 0.07, "volume_profile": 0.12,
+        "support_resistance": 0.10, "vwap": 0.04, "pdh_pdl": 0.06,
+        "rsi_divergence": 0.13, "macd_hist": 0.12, "volume": 0.08, "obv": 0.04,
         "pin_bar": 0.04, "engulfing": 0.02, "inside_bar": 0.02,
         "fibonacci": 0.0, "order_blocks": 0.0, "fvg": 0.0,
     },
     "short_term": {
-        "market_structure": 0.18, "ema_stack": 0.12, "volume_profile": 0.10,
-        "support_resistance": 0.08, "vwap": 0.10, "pdh_pdl": 0.08,
-        "rsi_divergence": 0.08, "macd_hist": 0.05, "volume": 0.08, "obv": 0.03,
+        "market_structure": 0.18, "ema_stack": 0.06, "volume_profile": 0.10,
+        "support_resistance": 0.08, "vwap": 0.05, "pdh_pdl": 0.08,
+        "rsi_divergence": 0.12, "macd_hist": 0.10, "volume": 0.10, "obv": 0.03,
         "pin_bar": 0.05, "engulfing": 0.03, "inside_bar": 0.02,
         "fibonacci": 0.0, "order_blocks": 0.0, "fvg": 0.0,
     },
@@ -109,7 +113,7 @@ PREDICTION_SUB_WEIGHTS = {
     "long_term": {
         "predict_fun_btc": 0.25,   # 币安预测市场日/小时方向
         "polymarket_prob": 0.30,   # Polymarket 月度阈值
-        "prob_change_speed": 0.10,
+        "prob_change_speed": 0.0,  # 无可靠 market_id/期限模型 → 停用交易因子，仅观察
         "fedwatch_proxy": 0.15,
         "fear_greed": 0.10,
         "max_pain": 0.10,
@@ -122,3 +126,36 @@ PREDICTION_SUB_WEIGHTS = {
         "max_pain": 0.15,
     },
 }
+
+# ---------------------------------------------------------------------------
+# V8.3 工程重构: 实验开关与共线标注
+# ---------------------------------------------------------------------------
+# agreement_boost 默认关闭 — 先压少数派再奖多数派会放大同质信息
+ENABLE_AGREEMENT_BOOST = False
+AGREEMENT_BOOST_LO = 0.7
+AGREEMENT_BOOST_HI = 1.3
+
+# 已知共线 / 信息重复组 — 合并贡献上限 (相对维度内权重和)
+COLLINEAR_GROUPS = {
+    # 巨鲸: news.whale_institutional ↔ data.whale_transfers
+    "whale": {
+        "faces": ("news", "data"),
+        "news_keys": ("whale_institutional",),
+        "data_keys": ("whale_transfers",),
+        "max_combined_face_contrib": 0.35,  # 两面合计对 CS 的贡献上限 (提示级)
+    },
+    # 结构/EMA/VWAP: V8.2 已降权
+    "structure_ema_vwap": {
+        "tech_keys": ("market_structure", "ema_stack", "vwap"),
+        "note": "V8.2 已降权, 保留观察",
+    },
+}
+
+# 代理指标诚实化映射 (旧名 → 新名); 权重键仍用旧名以兼容版本文件,
+# 但 UI/日志应显示 proxy_label
+PROXY_INDICATOR_LABELS = {
+    "mvrv": "price_to_365d_avg (proxy, not real MVRV)",
+    "exchange_reserves": "price_momentum_24h (proxy, not exchange reserves)",
+}
+
+ENABLE_CONSISTENCY_DAMPING = False  # 无独立验证不默认改反对意见

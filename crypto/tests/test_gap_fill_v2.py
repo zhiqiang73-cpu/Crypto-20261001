@@ -211,8 +211,8 @@ class TestRenormAndBoost(unittest.TestCase):
             StrategyHorizon.SHORT_TERM,
             DimensionScores(news=50, data=50, tech=50, prediction=50),
         )
-        # linear CS=50, boost=1.3 → 65
-        self.assertAlmostEqual(r.composite_score, 65.0, places=1)
+        # linear CS=50; agreement_boost 默认关闭 → 50
+        self.assertAlmostEqual(r.composite_score, 50.0, places=1)
 
 
 class TestPredictionMapperV2(unittest.TestCase):

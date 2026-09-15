@@ -72,8 +72,8 @@ class TestConfidence(unittest.TestCase):
         self.assertAlmostEqual(available_weight_ratio(w, []), 1.0)
 
     def test_shrink(self):
-        # 0.55 → √0.55 ≈ 0.742
-        self.assertAlmostEqual(shrink_by_confidence(-41.5, 0.55), -41.5 * (0.55 ** 0.5), places=2)
+        # V8.2: shrink_by_confidence 不再做 √C 收缩, 原样返回
+        self.assertAlmostEqual(shrink_by_confidence(-41.5, 0.55), -41.5, places=2)
 
     def test_confidence_weighted_cs(self):
         faces = {"news": 14.0, "data": -5.0, "tech": 2.0, "prediction": -41.0}

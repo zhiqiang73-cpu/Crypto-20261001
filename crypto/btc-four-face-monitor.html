@@ -131,6 +131,13 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;}
   font-family:var(--f-serif);font-size:74px;line-height:.92;
   letter-spacing:-.015em;font-variant-numeric:tabular-nums;color:var(--long);
 }
+.verdict__gates{
+  margin-top:10px;font-size:12px;line-height:1.55;color:var(--ink-3);
+  letter-spacing:.02em;max-width:28ch;
+}
+.verdict__gates b{color:var(--ink-2);font-weight:600;font-variant-numeric:tabular-nums;}
+.verdict__gates .gap{color:var(--ink-2);}
+.verdict__gates .gap.is-ready{color:var(--long);}
 .verdict__tier{
   display:inline-block;margin-top:13px;
   font-size:14px;font-weight:600;letter-spacing:.05em;
@@ -730,6 +737,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;}
         <div class="hero__label" id="hLabel"></div>
         <div class="hero__formula">CS = Σ W<sub>i</sub> × S<sub>i</sub></div>
         <div class="verdict__val" id="hVal"></div>
+        <div class="verdict__gates" id="hGates"></div>
         <div class="verdict__tier" id="hTier"></div>
         <div class="verdict__valve" id="hValve">
           <svg class="chk" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -757,13 +765,13 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;}
         <div class="ticks" aria-hidden="true">
           <div class="scale__minor"></div>
           <div class="tick tick--end-l" style="--p:0%"><i></i><b>−100</b></div>
-          <div class="tick tick--key"   style="--p:17.5%"><i></i><b>−65</b></div>
-          <div class="tick tick--sec"   style="--p:30%"><i></i><b>−40</b></div>
-          <div class="tick tick--sec"   style="--p:45%"><i></i><b>−10</b></div>
+          <div class="tick tick--key"   style="--p:27.5%"><i></i><b>−45</b></div>
+          <div class="tick tick--sec"   style="--p:40%"><i></i><b>−20</b></div>
+          <div class="tick tick--sec"   style="--p:46%"><i></i><b>−8</b></div>
           <div class="tick tick--zero"  style="--p:50%"><i></i><b>0</b></div>
-          <div class="tick tick--sec"   style="--p:55%"><i></i><b>+10</b></div>
-          <div class="tick tick--key"   style="--p:67.5%"><i></i><b>+35</b></div>
-          <div class="tick tick--key"   style="--p:80%"><i></i><b>+60</b></div>
+          <div class="tick tick--sec"   style="--p:54%"><i></i><b>+8</b></div>
+          <div class="tick tick--key"   style="--p:60%"><i></i><b>+20</b></div>
+          <div class="tick tick--key"   style="--p:72.5%"><i></i><b>+45</b></div>
           <div class="tick tick--end-r" style="--p:100%"><i></i><b>+100</b></div>
         </div>
 
@@ -1327,6 +1335,30 @@ function renderHero(tf){
   document.getElementById('hVal').style.color     = tf.tone === 'long' ? 'var(--long)'
                                                   : tf.tone === 'short' ? 'var(--short)' : 'var(--flat)';
 
+  const th = tf.thresholds || {
+    standard_long: 20, strong_long: 45,
+    standard_short: -20, strong_short: -45,
+  };
+  const buy = Number(th.standard_long);
+  const buyStrong = Number(th.strong_long);
+  const sell = Number(th.standard_short);
+  const cs = Number(tf.cs);
+  const gapBuy = buy - cs;
+  const gates = document.getElementById('hGates');
+  if (gates) {
+    let gapHtml;
+    if (cs >= buyStrong) {
+      gapHtml = `<span class="gap is-ready">已达强多 ≥ ${fmt(buyStrong)}</span>`;
+    } else if (cs >= buy) {
+      gapHtml = `<span class="gap is-ready">已达标准买入 ≥ ${fmt(buy)}</span>`;
+    } else {
+      gapHtml = `<span class="gap">距标准买入还差 <b>${fmt(gapBuy)}</b></span>`;
+    }
+    gates.innerHTML =
+      `买入门槛 <b>≥ ${fmt(buy)}</b>（强多 ≥ ${fmt(buyStrong)}） · ` +
+      `卖出门槛 <b>≤ ${fmt(sell)}</b><br>${gapHtml}`;
+  }
+
   const tier = document.getElementById('hTier');
   tier.textContent = tf.tier;
   tier.className   = 'verdict__tier' + (tf.tone === 'flat' ? ' is-flat' : '');
@@ -1525,12 +1557,12 @@ const SAMPLE = (() => {
   const FACE = ['news','data','tech','prediction'];
 
   const decide = cs =>
-      cs >= 60 ? 'STRONG_LONG'
-    : cs >= 35 ? 'STANDARD_LONG'
-    : cs >= 10 ? 'WATCH_LONG'
-    : cs > -10 ? 'NEUTRAL'
-    : cs > -40 ? 'WATCH_SHORT'
-    : cs > -65 ? 'STANDARD_SHORT'
+      cs >= 45 ? 'STRONG_LONG'
+    : cs >= 20 ? 'STANDARD_LONG'
+    : cs >= 8 ? 'WATCH_LONG'
+    : cs > -8 ? 'NEUTRAL'
+    : cs > -20 ? 'WATCH_SHORT'
+    : cs > -45 ? 'STANDARD_SHORT'
     :            'STRONG_SHORT';
 
   const now = Date.now();
@@ -1639,7 +1671,7 @@ const SAMPLE = (() => {
       model: 'deepseek-chat',
       valid_sample_target: 100,
       settle: {
-        short_term: { window_hours: 1, kline_interval: '5m', target_atr_mult: 1, stop_atr_mult: 1, atr_period: 14 },
+        short_term: { window_hours: 1, kline_interval: '1h', target_atr_mult: 1, stop_atr_mult: 1, atr_period: 14 },
         long_term:  { window_hours: 720, kline_interval: '4h', target_atr_mult: 2, stop_atr_mult: 2, atr_period: 14 },
       },
       config_version: 'v2',
@@ -2426,6 +2458,7 @@ function applyLivePayload(data, tfKey) {
     contrib: data.contrib || [0, 0, 0, 0],
     valve: data.valve || { ok: true, txt: '' },
     faces: data.faces,
+    thresholds: data.thresholds || null,
     _full: !!data.is_full_cs,
   };
   if (typeof data.mark_price === 'number') {

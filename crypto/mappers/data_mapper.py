@@ -98,7 +98,8 @@ class DataFactorMapper:
         scores["cvd"] = self._map_cvd(bn.cvd_5m_usd, missing)
 
         scores["liquidations_realtime"] = self._map_realtime_liq(
-            cg.liq_long_5m_usd, cg.liq_short_5m_usd, missing
+            cg.liq_long_5m_usd, cg.liq_short_5m_usd, missing,
+            window_status=getattr(cg, "liq_window_status", None),
         )
         scores["long_short_ratio"] = self._map_lsr(cg.long_short_ratio, missing)
 
@@ -152,19 +153,25 @@ class DataFactorMapper:
             oc.whale_transfer_direction if oc else None,
             missing,
         )
-        # V8 代理: mvrv / exchange_reserves
-        if oc and oc.mvrv_approx is not None:
-            scores["mvrv"] = interpolate_anchors(oc.mvrv_approx, MVRV_ANCHORS)
-        else:
-            scores["mvrv"] = 0.0
-            missing.append("mvrv")
-        if oc and oc.exchange_reserves_proxy is not None:
-            scores["exchange_reserves"] = interpolate_anchors(
-                oc.exchange_reserves_proxy, EXCHANGE_RESERVES_PROXY_ANCHORS
+        # 无真实 MVRV：不把年均价送入 MVRV_ANCHORS；mvrv 交易分恒缺失
+        scores["mvrv"] = 0.0
+        missing.append("mvrv")
+        # 24h 动量：独立键 price_momentum_24h，不再冒充 exchange_reserves
+        mom_val = None
+        if oc is not None:
+            mom_val = getattr(oc, "price_momentum_24h", None)
+            if mom_val is None:
+                mom_val = getattr(oc, "exchange_reserves_proxy", None)
+        if mom_val is not None:
+            scores["price_momentum_24h"] = interpolate_anchors(
+                mom_val, EXCHANGE_RESERVES_PROXY_ANCHORS
             )
         else:
-            scores["exchange_reserves"] = 0.0
-            missing.append("exchange_reserves")
+            scores["price_momentum_24h"] = 0.0
+            missing.append("price_momentum_24h")
+        # 旧键置零，避免储备语义泄漏
+        scores["exchange_reserves"] = 0.0
+        missing.append("exchange_reserves")
 
         onchain_keys = list(ONCHAIN_INDICATOR_WEIGHTS[hkey].keys())
         for k in onchain_keys:
@@ -323,16 +330,27 @@ class DataFactorMapper:
         long_usd: Optional[float],
         short_usd: Optional[float],
         missing: List[str],
+        window_status: Optional[str] = None,
     ) -> float:
+        """区分真零 / 暖机 / 断流 / 失败。有价格不等于清算成功。"""
+        status = (window_status or "").lower() or None
         if long_usd is None and short_usd is None:
             missing.append("liquidations_realtime")
             return 0.0
-        long_usd = long_usd or 0.0
-        short_usd = short_usd or 0.0
+        if status in ("warmup", "stale", "error", "partial", "missing"):
+            missing.append(f"liquidations_realtime:{status}")
+            return 0.0
+        if status is None and (long_usd is None or short_usd is None):
+            # 单侧缺失 = 部分样本，不当真零
+            missing.append("liquidations_realtime:partial")
+            return 0.0
+        long_usd = 0.0 if long_usd is None else float(long_usd)
+        short_usd = 0.0 if short_usd is None else float(short_usd)
         if long_usd >= short_usd and long_usd > 0:
             return round(interpolate_anchors(long_usd, LIQ_REALTIME_USD_ANCHORS), 2)
         if short_usd > long_usd and short_usd > 0:
             return round(-interpolate_anchors(short_usd, LIQ_REALTIME_USD_ANCHORS), 2)
+        # 窗口完整真零：分=0 且不记 missing
         return 0.0
 
     def _map_lsr(self, ratio: Optional[float], missing: List[str]) -> float:

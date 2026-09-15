@@ -84,19 +84,30 @@ class PredictionFactorMapper:
                 scores["prob_change_speed"] = 0.0
                 missing.append("prob_change_speed")
 
-        # FedWatch 代理
+        # FedWatch 代理 — 映射为 0 视为无方向信息 → missing (避免虚高 conf)
         if pm.fed_cut_prob is not None and pm.fed_hike_prob is not None:
-            scores["fedwatch_proxy"] = interpolate_anchors(
+            fw = interpolate_anchors(
                 pm.fed_cut_prob - pm.fed_hike_prob, FEDWATCH_PROXY_ANCHORS
             )
+            if abs(fw) < 1e-9:
+                scores["fedwatch_proxy"] = 0.0
+                missing.append("fedwatch_proxy")
+            else:
+                scores["fedwatch_proxy"] = fw
         elif pm.fed_cut_prob is not None:
-            scores["fedwatch_proxy"] = interpolate_anchors(
-                pm.fed_cut_prob, FEDWATCH_CUT_ONLY_ANCHORS
-            )
+            fw = interpolate_anchors(pm.fed_cut_prob, FEDWATCH_CUT_ONLY_ANCHORS)
+            if abs(fw) < 1e-9:
+                scores["fedwatch_proxy"] = 0.0
+                missing.append("fedwatch_proxy")
+            else:
+                scores["fedwatch_proxy"] = fw
         elif pm.fed_hike_prob is not None:
-            scores["fedwatch_proxy"] = interpolate_anchors(
-                pm.fed_hike_prob, FEDWATCH_HIKE_ONLY_ANCHORS
-            )
+            fw = interpolate_anchors(pm.fed_hike_prob, FEDWATCH_HIKE_ONLY_ANCHORS)
+            if abs(fw) < 1e-9:
+                scores["fedwatch_proxy"] = 0.0
+                missing.append("fedwatch_proxy")
+            else:
+                scores["fedwatch_proxy"] = fw
         else:
             scores["fedwatch_proxy"] = 0.0
             missing.append("fedwatch_proxy")

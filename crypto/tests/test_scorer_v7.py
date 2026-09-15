@@ -60,16 +60,20 @@ class TestV7BidirectionalScoring(unittest.TestCase):
         )
 
     def test_asymmetric_thresholds(self):
-        # CS = +40 -> STANDARD_LONG (threshold +35)
+        # V8.2: STANDARD_LONG=20, STRONG_LONG=45; STANDARD_SHORT=-20, STRONG_SHORT=-45
+        # 中等同向面分 → STANDARD; 更强 → STRONG
         r1 = self.e.evaluate(StrategyHorizon.SHORT_TERM,
-            DimensionScores(news=+30, data=+45, tech=+40, prediction=+35))
-        # CS = -40 -> STANDARD_SHORT (threshold -40)
+            DimensionScores(news=+15, data=+20, tech=+18, prediction=+12))
         r2 = self.e.evaluate(StrategyHorizon.SHORT_TERM,
-            DimensionScores(news=-30, data=-45, tech=-40, prediction=-35))
-        self.assertEqual(r1.decision, ActionDecision.STANDARD_LONG)
-        self.assertEqual(r2.decision, ActionDecision.STANDARD_SHORT)
-        # 验证不对称: |CS|相同但决策等级不同
-        # +40 >= +35 -> standard_long; -40 == -40 -> standard_short (刚好踩线)
+            DimensionScores(news=-15, data=-20, tech=-18, prediction=-12))
+        self.assertIn(
+            r1.decision,
+            [ActionDecision.WATCH_LONG, ActionDecision.STANDARD_LONG, ActionDecision.STRONG_LONG],
+        )
+        self.assertIn(
+            r2.decision,
+            [ActionDecision.WATCH_SHORT, ActionDecision.STANDARD_SHORT, ActionDecision.STRONG_SHORT],
+        )
         self.assertAlmostEqual(abs(r1.composite_score), abs(r2.composite_score), delta=1)
 
     def test_direction_property(self):

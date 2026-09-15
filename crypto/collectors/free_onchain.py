@@ -1,8 +1,8 @@
 """免费链上代理采集 — hashrate / 巨鲸 / USDT 铸销 / MVRV~ / 交易所存量~.
 
 V8 新增粗略代理 (面板标 ~):
-  - mvrv_approx: blockchain.info 市值 / (365日均价 × 流通量)
-  - exchange_reserves_proxy: Binance 24h 买卖压力代理 → [-1, +1]
+  - price_to_365d_avg (旧名 mvrv_approx): 现价/365日均价, 非真实 MVRV
+  - price_momentum_24h (旧名 exchange_reserves_proxy): 24h 买卖压力代理, 非交易所储备
 
 仍常驻 None (无可靠免费源):
   NUPL / LTH / SOPR / miner_reserves
@@ -289,17 +289,24 @@ class FreeOnchainCollector:
             logger.warning("usdt: %s", exc)
 
         try:
-            snap.mvrv_approx = await self.fetch_mvrv_approx()
+            # 诚实名: price_to_365d_avg (非真实 MVRV)
+            val = await self.fetch_mvrv_approx()
+            snap.price_to_365d_avg = val
+            snap.mvrv_approx = val
         except Exception as exc:
-            errors.append(f"mvrv:{exc}")
-            logger.warning("mvrv: %s", exc)
+            errors.append(f"price_to_365d_avg:{exc}")
+            logger.warning("price_to_365d_avg: %s", exc)
 
         try:
-            snap.exchange_reserves_proxy = await self.fetch_exchange_reserves_proxy()
+            # 诚实名: price_momentum_24h (非交易所储备)
+            val = await self.fetch_exchange_reserves_proxy()
+            snap.price_momentum_24h = val
+            snap.exchange_reserves_proxy = val
         except Exception as exc:
-            errors.append(f"ex_reserves:{exc}")
-            logger.warning("ex_reserves: %s", exc)
+            errors.append(f"price_momentum_24h:{exc}")
+            logger.warning("price_momentum_24h: %s", exc)
 
+        snap.sync_proxy_aliases()
         snap.available = any(
             v is not None
             for v in (
@@ -307,8 +314,8 @@ class FreeOnchainCollector:
                 snap.whale_net_flow_btc,
                 snap.usdt_mint_24h,
                 snap.usdt_burn_24h,
-                snap.mvrv_approx,
-                snap.exchange_reserves_proxy,
+                snap.price_to_365d_avg,
+                snap.price_momentum_24h,
             )
         )
         if snap.available:
@@ -366,8 +373,7 @@ class FreeOnchainCollector:
     async def fetch_exchange_reserves_proxy(self) -> Optional[float]:
         """Binance 24h ticker 买卖压力代理 → [-1, +1].
 
-        卖压强 (价跌+量大) → 负 (流入交易所近似);
-        买压强 → 正 (流出交易所近似).
+        V8.2: 正值=涨多/买压; mapper 用反向锚点 (涨多偏空).
         """
         session = await self._session_get()
         async with session.get(

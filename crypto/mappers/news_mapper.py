@@ -16,6 +16,7 @@ from config.mapping import (
     INDPRO_YOY_ANCHORS,
     M2_YOY_ANCHORS,
     USDT_NET_MINT_ANCHORS,
+    WHALE_NET_BTC_ANCHORS,
     YIELD_CURVE_ANCHORS,
 )
 from config.weights import NEWS_SUB_WEIGHTS
@@ -54,6 +55,19 @@ def map_halving(
     return 0.0
 
 
+def halving_is_informative(
+    months_since: Optional[float], months_to: Optional[float]
+) -> bool:
+    """距减半过远 (>18月) 或 months_since 缺失 → 无信息, 应记 missing."""
+    if months_since is None:
+        return False
+    if months_since > 18:
+        return False
+    if months_to is not None and months_to > 12 and not (3 <= months_since <= 12):
+        return False
+    return True
+
+
 def map_etf(
     daily: Optional[float],
     weekly: Optional[float],
@@ -73,17 +87,13 @@ def map_etf(
 
 
 def map_institutional_from_whale(net_btc: Optional[float]) -> float:
+    """V8.2: 统一用 WHALE_NET_BTC_ANCHORS 连续插值 (修复阶梯顺序 bug)."""
     if net_btc is None:
         return 0.0
-    if net_btc >= 5000:
-        return -90.0
-    if net_btc >= 1000:
-        return -70.0
-    if net_btc <= -1000:
-        return 70.0
-    if net_btc <= -5000:
-        return 90.0
-    return 0.0
+    return interpolate_anchors(float(net_btc), WHALE_NET_BTC_ANCHORS)
+
+
+WHALE_INFORMATIVE_BTC = 200.0  # |net| 低于此视为无信息 → missing
 
 
 def _uniq(missing: List[str]) -> List[str]:
@@ -118,6 +128,9 @@ class NewsFactorMapper:
             missing.append("breaking_crypto")
 
         if snapshot.institutional_score is None:
+            scores["whale_institutional"] = 0.0
+            missing.append("whale_institutional")
+        elif abs(float(snapshot.institutional_score)) < WHALE_INFORMATIVE_BTC:
             scores["whale_institutional"] = 0.0
             missing.append("whale_institutional")
         else:
@@ -228,6 +241,10 @@ class NewsFactorMapper:
             scores["institutional_gov"] = 0.0
             if "institutional_gov" not in missing:
                 missing.append("institutional_gov")
+        elif abs(float(snapshot.institutional_score)) < WHALE_INFORMATIVE_BTC:
+            scores["institutional_gov"] = 0.0
+            if "institutional_gov" not in missing:
+                missing.append("institutional_gov")
         else:
             scores["institutional_gov"] = map_institutional_from_whale(
                 snapshot.institutional_score
@@ -236,6 +253,11 @@ class NewsFactorMapper:
         scores["halving"] = map_halving(
             snapshot.months_since_halving, snapshot.months_to_halving
         )
+        if not halving_is_informative(
+            snapshot.months_since_halving, snapshot.months_to_halving
+        ):
+            if "halving" not in missing:
+                missing.append("halving")
 
         if snapshot.usdt_net_mint_24h is None:
             scores["usdt_dynamics"] = 0.0

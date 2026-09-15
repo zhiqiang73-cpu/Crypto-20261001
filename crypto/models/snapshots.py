@@ -68,6 +68,8 @@ class CoinGlassSnapshot:
     liq_long_5m_usd: Optional[float] = None          # 5min 多头爆仓额
     liq_short_5m_usd: Optional[float] = None
     liq_total_5m_usd: Optional[float] = None
+    # complete=窗口完整真零可成立; warmup/stale/error/partial/missing ≠ 真零
+    liq_window_status: Optional[str] = None
 
     long_short_ratio: Optional[float] = None         # 全局账户多空比
 
@@ -75,11 +77,9 @@ class CoinGlassSnapshot:
     liquidation_speed_long_cleared: Optional[float] = None
     liquidation_speed_short_cleared: Optional[float] = None
 
-    available: bool = False
+    available: bool = False                          # 是否拿到过任何有效响应
     last_success_ts: Optional[int] = None
     last_error: Optional[str] = None
-
-    available: bool = False                          # 是否拿到过任何有效响应
 
 
 @dataclass
@@ -126,6 +126,7 @@ class TechSnapshot:
     adx: Optional[float] = None
     atr: Optional[float] = None
     atr_pct: Optional[float] = None
+    atr_mean: Optional[float] = None  # 近 20 期 ATR 均值 (高波动调节)
     boll_bandwidth: Optional[float] = None
     boll_squeeze: bool = False
 
@@ -163,6 +164,7 @@ class TechScoreResult:
     boll_multiplier: float = 1.0
     atr: Optional[float] = None          # 绝对 ATR (价格单位)
     atr_pct: Optional[float] = None      # ATR / price
+    atr_mean: Optional[float] = None     # 近 20 期 ATR 均值
     missing_fields: List[str] = field(default_factory=list)
     confidence: float = 1.0
     reasoning: str = ""
@@ -177,12 +179,17 @@ class PolymarketSnapshot:
     """Polymarket Gamma API 快照.
 
     注: CME FedWatch 无免费 API, fed_cut_prob 用 Polymarket Fed 市场代替.
+    事件语义: market_id / event_type / expiry — 禁止跨 market_id 算增速.
     """
     btc_prob: Optional[float] = None              # "本月 > $X" 概率 [0,1]
     btc_prob_change_1h: Optional[float] = None    # 1h 变化 (百分点, 0.1 = +10pp)
     btc_market_slug: Optional[str] = None
     btc_market_question: Optional[str] = None
     btc_threshold_usd: Optional[float] = None
+    market_id: Optional[str] = None               # condition_id
+    event_type: Optional[str] = None              # above_at_expiry / touch_during / ...
+    expiry_ms: Optional[int] = None
+    remaining_hours: Optional[float] = None
 
     fed_cut_prob: Optional[float] = None          # 降息概率代理 [0,1]
     fed_hike_prob: Optional[float] = None         # 加息概率代理 [0,1]
@@ -209,9 +216,12 @@ class DeribitSnapshot:
 
 @dataclass
 class OnchainSnapshot:
-    """免费链上代理快照.
+    """免费链上/价格代理快照.
 
-    V8: exchange_reserves / mvrv 为免费代理估算 (面板标 ~).
+    诚实命名:
+      * price_to_365d_avg — 原 mvrv_approx, 不是真实 MVRV
+      * price_momentum_24h — 原 exchange_reserves_proxy, 不是交易所储备
+    旧字段名保留为属性别名以兼容调用方.
     仍常驻 None: NUPL / LTH / SOPR / miner_reserves (无可靠免费源).
     """
     hashrate_ma30_change_pct: Optional[float] = None  # 小数, 0.05 = +5%
@@ -220,12 +230,26 @@ class OnchainSnapshot:
     whale_net_flow_usd: Optional[float] = None
     usdt_mint_24h: Optional[float] = None
     usdt_burn_24h: Optional[float] = None
-    # V8 代理
-    exchange_reserves_proxy: Optional[float] = None   # 相对基线的偏离 [-1,1], +流出交易所偏多
-    mvrv_approx: Optional[float] = None               # 粗略 MVRV
+    # 诚实代理名
+    price_momentum_24h: Optional[float] = None   # [-1,1], +偏多动量
+    price_to_365d_avg: Optional[float] = None    # 现价/365日均价
+    # 兼容旧名
+    exchange_reserves_proxy: Optional[float] = None
+    mvrv_approx: Optional[float] = None
     available: bool = False
     last_success_ts: Optional[int] = None
     last_error: Optional[str] = None
+
+    def sync_proxy_aliases(self) -> None:
+        """双向同步新旧字段, 以诚实名为准."""
+        if self.price_to_365d_avg is not None:
+            self.mvrv_approx = self.price_to_365d_avg
+        elif self.mvrv_approx is not None:
+            self.price_to_365d_avg = self.mvrv_approx
+        if self.price_momentum_24h is not None:
+            self.exchange_reserves_proxy = self.price_momentum_24h
+        elif self.exchange_reserves_proxy is not None:
+            self.price_momentum_24h = self.exchange_reserves_proxy
 
 
 @dataclass
