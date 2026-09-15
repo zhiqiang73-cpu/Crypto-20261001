@@ -64,11 +64,13 @@ ONCHAIN_INDICATOR_WEIGHTS = {
 }
 
 DERIVATIVES_INDICATOR_WEIGHTS = {
-    "long_term":  {"implied_volatility": 0.35, "open_interest": 0.20, "funding_rate": 0.15,
+    # liquidation_heatmap: 历史强平分布，未经独立验证不得作为「未来清算磁铁」方向分 → 权重 0
+    # 原 short 0.25 重分到 funding/OI/CVD；long 0.05 重分到 IV/OI
+    "long_term":  {"implied_volatility": 0.37, "open_interest": 0.22, "funding_rate": 0.15,
                    "option_max_pain": 0.15, "long_short_ratio": 0.05,
-                   "liquidation_heatmap": 0.05, "cvd": 0.05, "liquidations_realtime": 0},
-    "short_term": {"funding_rate": 0.25, "liquidation_heatmap": 0.25, "open_interest": 0.20,
-                   "cvd": 0.15, "liquidations_realtime": 0.08, "long_short_ratio": 0.03,
+                   "liquidation_heatmap": 0.0, "cvd": 0.06, "liquidations_realtime": 0},
+    "short_term": {"funding_rate": 0.32, "liquidation_heatmap": 0.0, "open_interest": 0.28,
+                   "cvd": 0.22, "liquidations_realtime": 0.10, "long_short_ratio": 0.04,
                    "option_max_pain": 0.02, "implied_volatility": 0.02}
 }
 

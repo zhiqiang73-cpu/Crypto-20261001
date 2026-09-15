@@ -143,9 +143,8 @@ class TestHeatmapAndLiq(unittest.TestCase):
             session=SessionZone.US,
         )
         r = self.m.map(snap, StrategyHorizon.SHORT_TERM)
-        self.assertAlmostEqual(
-            r.indicator_scores["liquidation_heatmap"], 70.0, delta=0.1
-        )
+        # Round-4: 历史强平不得作为未验证「未来磁铁」方向分
+        self.assertEqual(r.indicator_scores["liquidation_heatmap"], 0.0)
 
     def test_long_liquidation_bounce(self):
         snap = DataSnapshot(

@@ -42,10 +42,17 @@ class PredictionFactorMapper:
         missing: List[str] = []
         scores: Dict[str, float] = {}
 
-        # Predict.fun / 币安预测市场 Up/Down (多窗口共识)
-        # 近结算价 (≈0/1) 无信息量 → missing
+        # Predict.fun：短线只用 1h 窗概率，禁止多窗混合冒充 1h
         pf = snapshot.predict_fun
-        up = pf.btc_up_prob if pf else None
+        if hkey == "short_term":
+            up = getattr(pf, "btc_up_prob_1h", None) if pf else None
+            if up is None and pf and (getattr(pf, "active_window", None) in ("1h", "60m", "1H")):
+                up = pf.btc_up_prob
+        else:
+            # 长期优先 1d，否则不进入方向分
+            up = getattr(pf, "btc_up_prob_1d", None) if pf else None
+            if up is None and pf and getattr(pf, "active_window", None) in ("1d", "24h", "1D"):
+                up = pf.btc_up_prob
         if up is not None and 0.05 < up < 0.95:
             scores["predict_fun_btc"] = interpolate_anchors(
                 up, PREDICT_FUN_UP_ANCHORS
@@ -64,7 +71,11 @@ class PredictionFactorMapper:
 
         pm = snapshot.polymarket
 
-        if pm.btc_prob is not None:
+        if hkey == "short_term":
+            # 月度 Polymarket 事件 ≠ 1h 交易机会；无可靠期限转换前不进短线方向分
+            scores["polymarket_prob"] = 0.0
+            missing.append("polymarket_prob")
+        elif pm.btc_prob is not None:
             # 阈值距离校准: 远离现价的低概率 ≠ 强看空
             scores["polymarket_prob"] = map_polymarket_relative(
                 pm.btc_prob,

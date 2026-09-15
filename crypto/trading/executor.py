@@ -338,6 +338,48 @@ class TradeExecutor:
             decision = decision.value
         decision = str(decision)
 
+        # 成交前复核：用执行场所新鲜 mark，禁止用信号价平移目标掩盖追价
+        from trading.pretrade import PretradeLimits, recheck_entry
+        side = None
+        if decision in ("STRONG_LONG", "STANDARD_LONG"):
+            side = "LONG"
+        elif decision in ("STRONG_SHORT", "STANDARD_SHORT"):
+            side = "SHORT"
+        if side:
+            signal_px = float(getattr(snap, "mark_price", None) or price)
+            signal_ts = int(getattr(snap, "timestamp_ms", None) or 0)
+            now = int(time.time() * 1000)
+            try:
+                exec_mark = float(await self.client.mark_price())
+            except Exception as exc:
+                self.last_error = f"pretrade_mark_failed:{exc}"
+                return actions
+            quote_ts = now  # client.mark_price 即时拉取
+            cfg_snap = getattr(snap, "config_snapshot", None) or {}
+            exit_cfg = (cfg_snap.get("exit_strategy") or {}).get(horizon) or {}
+            hard_sl_atr = float(exit_cfg.get("hard_sl_atr") or (1.0 if horizon == "short_term" else 2.0))
+            tp1_atr = float(exit_cfg.get("tp1_atr") or (1.2 if horizon == "short_term" else 2.0))
+            atr_v = float(atr) if atr else None
+            sl_dist = (atr_v * hard_sl_atr) if atr_v else None
+            tp_dist = (atr_v * tp1_atr) if atr_v else None
+            pre = recheck_entry(
+                side=side,
+                signal_price=signal_px,
+                signal_ts_ms=signal_ts or now,
+                now_ms=now,
+                exec_mark=exec_mark,
+                quote_ts_ms=quote_ts,
+                atr=atr_v,
+                hard_sl_distance=sl_dist,
+                tp_distance=tp_dist,
+                limits=PretradeLimits(),
+            )
+            if not pre.ok:
+                self.last_error = "pretrade:" + ",".join(pre.reasons)
+                logger.info("pretrade block %s %s", horizon, pre.reasons)
+                return actions
+            price = exec_mark
+
         confs = self._face_confidences(snap)
         min_conf = min(confs.values()) if confs else 1.0
 

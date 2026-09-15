@@ -1,0 +1,39 @@
+{
+  "version": "v2",
+  "created_at_ms": 1789513465233,
+  "parent": "v1",
+  "kind": "baseline",
+  "source_proposal": "round4_effective_config",
+  "model": "",
+  "valid_sample_count": 0,
+  "changes": [],
+  "params": {
+    "DIMENSION_WEIGHTS.short_term.news": 0.2,
+    "DIMENSION_WEIGHTS.short_term.data": 0.35,
+    "DIMENSION_WEIGHTS.short_term.tech": 0.25,
+    "DIMENSION_WEIGHTS.short_term.prediction": 0.2,
+    "DIMENSION_WEIGHTS.long_term.news": 0.35,
+    "DIMENSION_WEIGHTS.long_term.data": 0.25,
+    "DIMENSION_WEIGHTS.long_term.tech": 0.1,
+    "DIMENSION_WEIGHTS.long_term.prediction": 0.3,
+    "DECISION_THRESHOLDS.strong_long": 45,
+    "DECISION_THRESHOLDS.standard_long": 20,
+    "DECISION_THRESHOLDS.watch_long": 8,
+    "DECISION_THRESHOLDS.standard_short": -20,
+    "DECISION_THRESHOLDS.strong_short": -45,
+    "SAFETY_VALVE_THRESHOLD": 50,
+    "ADX_BOOST": 1.2,
+    "ADX_DAMPEN": 0.6,
+    "BOLL_SQUEEZE_BOOST": 1.15
+  },
+  "content_hash": "129763acbe3789a00a00280ae0ec2de8e58030129f1c0a3a7dda439bdb45b5c5",
+  "applied_groups": [
+    "dim_weight",
+    "threshold",
+    "safety_valve"
+  ],
+  "advisory_groups": [
+    "tech_mult"
+  ],
+  "note": "V8.2 出厂对齐：20/35/25/20 与 ±20。部署时再切 ACTIVE→v2；观察期不改 ACTIVE。"
+}

@@ -191,7 +191,12 @@ def snapshot_to_panel(
 ) -> Dict[str, Any]:
     """对齐 HTML 里 TF.short / TF.long 结构."""
     hkey = horizon.value
-    w = DIMENSION_WEIGHTS[hkey]
+    # 本轮生效配置（来自评分快照）；禁止回退模块常量冒充
+    cfg_snap = getattr(snap, "config_snapshot", None) or {}
+    w = (cfg_snap.get("dimension_weights") or {}).get(hkey) or DIMENSION_WEIGHTS[hkey]
+    th_eff = cfg_snap.get("decision_thresholds") or DECISION_THRESHOLDS
+    cfg_version = cfg_snap.get("version") or "unknown"
+    cfg_hash = cfg_snap.get("content_hash") or ""
     cs = snap.composite_score if snap.is_full_cs else snap.partial_cs
     if snap.overridden and snap.suppressed_cs is not None:
         cs_display = snap.suppressed_cs
@@ -423,7 +428,15 @@ def snapshot_to_panel(
             "long_pct": float(RISK_PER_TRADE_PCT.get("long_term", 0.01)),
             "formula": "qty = (equity × risk_pct) / (ATR × hard_sl_atr)",
         },
-        "thresholds": DECISION_THRESHOLDS,
+        "thresholds": th_eff,
+        "config_version": cfg_version,
+        "content_hash": cfg_hash,
+        "base_weights": {
+            "news": float(w.get("news", 0)),
+            "data": float(w.get("data", 0)),
+            "tech": float(w.get("tech", 0)),
+            "prediction": float(w.get("prediction", 0)),
+        },
         "watch": {
             "liq": _fmt_yi(liq),
             "liq_usd": liq,

@@ -1335,10 +1335,7 @@ function renderHero(tf){
   document.getElementById('hVal').style.color     = tf.tone === 'long' ? 'var(--long)'
                                                   : tf.tone === 'short' ? 'var(--short)' : 'var(--flat)';
 
-  const th = tf.thresholds || {
-    standard_long: 20, strong_long: 45,
-    standard_short: -20, strong_short: -45,
-  };
+  const th = tf.thresholds || {};
   const buy = Number(th.standard_long);
   const buyStrong = Number(th.strong_long);
   const sell = Number(th.standard_short);
@@ -1346,6 +1343,9 @@ function renderHero(tf){
   const gapBuy = buy - cs;
   const gates = document.getElementById('hGates');
   if (gates) {
+    if (![buy, buyStrong, sell].every(Number.isFinite)) {
+      gates.innerHTML = `开仓门槛：等待生效配置（禁止硬编码默认）`;
+    } else {
     let gapHtml;
     if (cs >= buyStrong) {
       gapHtml = `<span class="gap is-ready">已达强多 ≥ ${fmt(buyStrong)}</span>`;
@@ -1356,7 +1356,10 @@ function renderHero(tf){
     }
     gates.innerHTML =
       `买入门槛 <b>≥ ${fmt(buy)}</b>（强多 ≥ ${fmt(buyStrong)}） · ` +
-      `卖出门槛 <b>≤ ${fmt(sell)}</b><br>${gapHtml}`;
+      `卖出门槛 <b>≤ ${fmt(sell)}</b>` +
+      (tf.config_version ? ` · cfg <b>${tf.config_version}</b>` : '') +
+      `<br>${gapHtml}`;
+    }
   }
 
   const tier = document.getElementById('hTier');

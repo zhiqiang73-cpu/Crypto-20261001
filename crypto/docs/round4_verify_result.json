@@ -1,0 +1,11 @@
+{
+  "engineering_offline": "PASS",
+  "testnet_execution": "UNVERIFIED",
+  "strategy_oos_edge": "INSUFFICIENT_EVIDENCE",
+  "live_ready": "NOT_SATISFIED",
+  "active_version": "v1",
+  "effective_standard_long": 35.0,
+  "factory_standard_long": 20,
+  "failures": 0,
+  "tests_run": 40
+}

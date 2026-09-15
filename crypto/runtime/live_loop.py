@@ -258,20 +258,16 @@ class LiveScoringLoop:
     async def _score_once_unlocked(self) -> LiveScoreSnapshot:
         now_ms = int(time.time() * 1000)
         t0 = time.time()
-        # 决策开始前钉死不可变配置 — 禁止评分后重新盖章
-        try:
-            from review.overrides import active_version_name, content_hash, effective_params
-            _params = effective_params()
-            decision_config_snapshot = {
-                "version": active_version_name() or "v1",
-                "content_hash": content_hash(_params),
-                "params": dict(_params) if isinstance(_params, dict) else _params,
-                "fixed_at_ms": now_ms,
-            }
-        except Exception:
-            decision_config_snapshot = {
-                "version": "v1", "content_hash": None, "params": {}, "fixed_at_ms": now_ms,
-            }
+        # 决策开始前钉死不可变配置 — 本轮评分/决策/面板解释必须共用
+        from config.effective_config import freeze_effective_config
+        from review.decision_audit import DecisionAuditLog, DecisionAuditRecord, new_decision_id
+        cfg = freeze_effective_config(allow_factory_fallback=False, now_ms=now_ms)
+        self.engine.apply_frozen_config(cfg)
+        decision_config_snapshot = cfg.to_snapshot_dict()
+        decision_id = new_decision_id()
+        block_reasons: list = []
+        if not cfg.load_ok:
+            block_reasons.append(f"config_invalid:{cfg.load_error or 'load_failed'}")
         # REST 兜底补齐订单簿 / CVD / spread, 避免 WS 暖机期数据面大面积缺项
         try:
             bsnap = await self.binance.ensure_microstructure()
@@ -457,11 +453,11 @@ class LiveScoringLoop:
         breakdown: Dict[str, float] = {}
         composite: Optional[float] = None
 
-        # 巨鲸共线检测（生产路径，用 mapper 子分）
-        _ind_news = getattr(news_result, "indicator_scores", None) or {}
+        # 巨鲸共线检测（生产路径，用 mapper 真实子分字段）
+        _sub_news = getattr(news_result, "sub_scores", None) or {}
         _ind_data = getattr(data_result, "indicator_scores", None) or {}
         whale_parts = {
-            "news_whale": float(_ind_news.get("whale_institutional") or 0),
+            "news_whale": float(_sub_news.get("whale_institutional") or 0),
             "data_whale": float(_ind_data.get("whale_transfers") or 0),
         }
         _cs_faces = detect_collinear_whale(
@@ -484,7 +480,9 @@ class LiveScoringLoop:
                 prediction=scores["prediction"],  # type: ignore[arg-type]
             )
             ev = self.engine.evaluate(
-                self.horizon, dim, confidences=face_conf
+                self.horizon, dim, confidences=face_conf,
+                weights=cfg.dimension_weights[self.horizon.value],
+                thresholds=cfg.decision_thresholds,
             )
             cs = ev.composite_score
             decision = ev.decision
@@ -568,8 +566,8 @@ class LiveScoringLoop:
             atr_pct=getattr(tech_result, "atr_pct", None) or getattr(tech_snap, "atr_pct", None),
             atr_mean=getattr(tech_result, "atr_mean", None) or getattr(tech_snap, "atr_mean", None),
         )
-        # 方向与质量分离
-        w_all = DIMENSION_WEIGHTS[self.horizon.value]
+        # 方向与质量分离 — 覆盖率用本轮快照权重，禁止再读模块常量
+        w_all = cfg.dimension_weights[self.horizon.value]
         coverage = available_weight_ratio(w_all, missing)
         conf_vals = [v for v in face_conf.values() if v is not None]
         quality = sum(conf_vals) / len(conf_vals) if conf_vals else 0.0
@@ -582,15 +580,36 @@ class LiveScoringLoop:
         contract = get_contract(self.horizon.value)
         tradable = True
         reject = None
-        if coverage < contract.min_coverage:
+        if not cfg.load_ok:
+            tradable = False
+            reject = f"config_invalid:{cfg.load_error or 'load_failed'}"
+            block_reasons.append(reject)
+        elif coverage < contract.min_coverage:
             tradable = False
             reject = f"coverage={coverage:.2f}<{contract.min_coverage}"
+            block_reasons.append(reject)
         elif quality < contract.min_quality:
             tradable = False
             reject = f"quality={quality:.2f}<{contract.min_quality}"
+            block_reasons.append(reject)
         elif overridden:
             tradable = False
             reject = "black_swan"
+            block_reasons.append(reject)
+        _stale_limits = cfg.staleness_limits or {}
+        for src, age in (staleness or {}).items():
+            if age is None:
+                continue
+            lim = float(_stale_limits.get(src, _stale_limits.get("default", 300)))
+            if float(age) > lim:
+                reason = f"stale:{src}={float(age):.0f}s>{lim:.0f}s"
+                block_reasons.append(reason)
+                if src in ("binance", "mark_price", "predict_fun") or (
+                    src == "polymarket" and self.horizon.value == "long_term"
+                ):
+                    tradable = False
+                    if reject is None:
+                        reject = reason
         scoring = ScoringOutput(
             directional_score=float(composite if composite is not None else partial),
             data_quality=round(quality, 3),
@@ -601,23 +620,21 @@ class LiveScoringLoop:
         )
         out.scoring = scoring
         out.tradable = tradable
-        # 关键 DataRecord：mark 无事件时间或无效 → 不可新开
         _evt = getattr(bsnap, "event_time_ms", None)
         mark_rec = make_record(
             "mark_price",
             bsnap.mark_price,
             unit="USDT",
             source="binance",
-            event_time_ms=_evt,  # 禁止用评分 now 冒充事件时间
+            event_time_ms=_evt,
             fetch_time_ms=out.timestamp_ms or 0,
-            max_age_sec=float(STALENESS_LIMITS.get("mark_price", 60)),
+            max_age_sec=float((cfg.staleness_limits or {}).get("mark_price", 60)),
         )
         if _evt is None and mark_rec.value is not None:
             from trading.models import DataValidity
             mark_rec.validity = DataValidity.INVALID
             mark_rec.quality_reason = "missing_event_time"
         liq_status = getattr(getattr(fsnap, "coinglass", None) or fsnap, "liq_window_status", None)
-        # fsnap may be FactorInput-like
         liq_rec = make_record(
             "liq_5m_usd",
             getattr(fsnap, "liq_total_5m_usd", None),
@@ -634,6 +651,65 @@ class LiveScoringLoop:
         out.data_records = {"mark_price": mark_rec, "liq_5m_usd": liq_rec}
         out.reject_reason = reject
         out.config_snapshot = decision_config_snapshot
+
+        actionable = decision.value in (
+            "STRONG_LONG", "STANDARD_LONG", "STRONG_SHORT", "STANDARD_SHORT"
+        )
+        if not cfg.load_ok:
+            signal_state = "data_unfit"
+        elif not actionable:
+            signal_state = "no_signal"
+        elif not tradable:
+            signal_state = "data_unfit" if any(
+                str(b).startswith("stale:") or "coverage" in str(b) or "quality" in str(b)
+                for b in block_reasons
+            ) else "risk_blocked"
+        else:
+            signal_state = "signal_ok"
+
+        try:
+            hz = self.horizon.value
+            eff_w = dict(cfg.dimension_weights.get(hz) or {})
+            DecisionAuditLog().append(DecisionAuditRecord(
+                decision_id=decision_id,
+                horizon=hz,
+                config_version=cfg.version,
+                content_hash=cfg.content_hash,
+                started_at_ms=int(decision_config_snapshot.get("fixed_at_ms") or now_ms),
+                finished_at_ms=now_ms,
+                mark_price=bsnap.mark_price,
+                atr=out.atr,
+                face_scores={
+                    "news": scores.get("news"),
+                    "data": scores.get("data"),
+                    "tech": scores.get("tech"),
+                    "prediction": scores.get("prediction"),
+                },
+                face_confidences={k: float(v) for k, v in face_conf.items() if isinstance(v, (int, float))},
+                effective_weights=eff_w,
+                contributions=dict(breakdown or {}),
+                cs_raw=float(composite if composite is not None else partial),
+                cs_final=float(composite if composite is not None else partial),
+                decision_raw=decision.value,
+                decision_final=decision.value,
+                is_full_cs=bool(is_full and not overridden),
+                signal_state=signal_state,
+                block_reasons=list(block_reasons),
+                primary_block=(reject or (block_reasons[0] if block_reasons else "")),
+                tradable=bool(tradable and actionable),
+                staleness_sec={k: float(v) for k, v in (staleness or {}).items() if v is not None},
+                missing_fields=list(missing or []),
+                safety_valve=bool(safety),
+                overridden=bool(overridden),
+            ))
+        except Exception as exc:
+            logger.error("decision_audit write failed — 阻断新开以保可追溯: %s", exc)
+            out.tradable = False
+            out.reject_reason = f"audit_write_failed:{exc}"
+            if out.scoring:
+                out.scoring.tradable = False
+                out.scoring.reject_reason = out.reject_reason
+
         self._latest = out
         return out
 

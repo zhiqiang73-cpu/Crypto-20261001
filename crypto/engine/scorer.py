@@ -14,16 +14,34 @@ class FactorScoringEngine:
         self.weights = {k: dict(v) for k, v in DIMENSION_WEIGHTS.items()}
         self.th = dict(DECISION_THRESHOLDS)
         self.safety_valve_threshold = SAFETY_VALVE_THRESHOLD
+        self.config_version = "factory"
+        self.config_hash = ""
+        self.config_load_ok = True
         if use_active_overrides:
             # 延迟导入: 避免 engine ← review ← engine 的循环引用
             try:
-                from review.overrides import apply_to_engine
-                apply_to_engine(self)
-            except Exception as exc:  # noqa: BLE001 - 配置坏了不能拖垮评分
+                from config.effective_config import apply_config_to_engine, freeze_effective_config
+                cfg = freeze_effective_config(allow_factory_fallback=False)
+                if not cfg.load_ok:
+                    self.config_load_ok = False
+                    import logging
+                    logging.getLogger(__name__).error(
+                        "生效配置无效, 交易路径应阻断: %s", cfg.load_error
+                    )
+                else:
+                    apply_config_to_engine(self, cfg)
+                    self.config_load_ok = True
+            except Exception as exc:  # noqa: BLE001
+                self.config_load_ok = False
                 import logging
-                logging.getLogger(__name__).warning(
-                    "加载生效配置失败, 回退出厂默认: %s", exc
+                logging.getLogger(__name__).error(
+                    "加载生效配置失败, 不得静默用出厂默认继续交易: %s", exc
                 )
+
+    def apply_frozen_config(self, cfg) -> None:
+        from config.effective_config import apply_config_to_engine
+        apply_config_to_engine(self, cfg)
+        self.config_load_ok = bool(getattr(cfg, "load_ok", True))
 
     def evaluate(
         self,
@@ -31,12 +49,33 @@ class FactorScoringEngine:
         scores: DimensionScores,
         reasoning: str = "",
         confidences: Optional[Dict[str, float]] = None,
+        *,
+        weights: Optional[Dict[str, float]] = None,
+        thresholds: Optional[Dict[str, float]] = None,
     ) -> EvaluationResult:
         """一次计算, 同时给出方向和强度.
 
         confidences: 各面可用权重占比; 参与 CS 加权并在 breakdown 中体现.
+        可选 weights/thresholds 覆盖实例状态 — 必须来自本轮不可变快照。
         """
-        w = self.weights[horizon.value]
+        w = weights if weights is not None else self.weights[horizon.value]
+        if thresholds is not None:
+            saved = self.th
+            self.th = thresholds
+            try:
+                return self._evaluate_body(horizon, scores, reasoning, confidences, w)
+            finally:
+                self.th = saved
+        return self._evaluate_body(horizon, scores, reasoning, confidences, w)
+
+    def _evaluate_body(
+        self,
+        horizon: StrategyHorizon,
+        scores: DimensionScores,
+        reasoning: str,
+        confidences: Optional[Dict[str, float]],
+        w: Dict[str, float],
+    ) -> EvaluationResult:
         face = {
             "news": scores.news,
             "data": scores.data,

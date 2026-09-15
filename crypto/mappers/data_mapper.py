@@ -282,10 +282,11 @@ class DataFactorMapper:
     def _map_heatmap(
         self, magnet: Optional[float], missing: List[str]
     ) -> float:
+        # 历史强平分布 ≠ 经验证的「未来清算磁铁」。权重已置 0；
+        # 保留观测但不进入方向分（不因改名继续贡献）。
         if magnet is None:
             missing.append("liquidation_heatmap")
-            return 0.0
-        return interpolate_anchors(magnet, HEATMAP_MAGNET_ANCHORS)
+        return 0.0
 
     def _map_open_interest(
         self,
