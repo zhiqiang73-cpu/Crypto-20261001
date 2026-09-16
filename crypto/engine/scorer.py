@@ -82,7 +82,13 @@ class FactorScoringEngine:
             "tech": scores.tech,
             "prediction": scores.prediction,
         }
-        cs, boost = compute_cs_with_boost(face, w, confidences=confidences)
+        conf_use = dict(confidences or {})
+        if getattr(self, "collinear_groups", None) is not None:
+            conf_use["_collinear_groups"] = self.collinear_groups
+        cs, boost = compute_cs_with_boost(
+            face, w, confidences=conf_use,
+            enable_boost=getattr(self, "enable_agreement_boost", None),
+        )
         cs = round(cs, 2)
 
         # breakdown: 用有效权重 (Wi×Ci) 归一后的贡献

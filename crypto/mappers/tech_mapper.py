@@ -25,6 +25,8 @@ class TechFactorMapper:
         self,
         snapshot: TechSnapshot,
         horizon: StrategyHorizon = StrategyHorizon.SHORT_TERM,
+        *,
+        strategy_params=None,
     ) -> TechScoreResult:
         missing: List[str] = []
         if not snapshot.available:
@@ -62,22 +64,28 @@ class TechFactorMapper:
         if snapshot.ema200 is None:
             missing.append("ema_stack")
 
-        weights = TECH_INDICATOR_WEIGHTS[horizon.value]
+        sp = strategy_params or {}
+        tech_w = sp.get("TECH_INDICATOR_WEIGHTS", TECH_INDICATOR_WEIGHTS)
+        weights = tech_w[horizon.value]
+        adx_strong = float(sp.get("ADX_STRONG", ADX_STRONG))
+        adx_weak = float(sp.get("ADX_WEAK", ADX_WEAK))
+        adx_boost = float(sp.get("ADX_BOOST", ADX_BOOST))
+        adx_dampen = float(sp.get("ADX_DAMPEN", ADX_DAMPEN))
+        boll_boost = float(sp.get("BOLL_SQUEEZE_BOOST", BOLL_SQUEEZE_BOOST))
         raw = 0.0
         for k, w in weights.items():
             if w == 0:
                 continue
-            raw += w * scores.get(k, 0.0)
+            raw += float(w) * scores.get(k, 0.0)
 
-        # ADX 调节: 放大/缩小趋势方向分数 (作用于结构相关部分的整体)
         adx_mult = 1.0
         if snapshot.adx is not None:
-            if snapshot.adx >= ADX_STRONG:
-                adx_mult = ADX_BOOST
-            elif snapshot.adx < ADX_WEAK:
-                adx_mult = ADX_DAMPEN
+            if snapshot.adx >= adx_strong:
+                adx_mult = adx_boost
+            elif snapshot.adx < adx_weak:
+                adx_mult = adx_dampen
 
-        boll_mult = BOLL_SQUEEZE_BOOST if snapshot.boll_squeeze else 1.0
+        boll_mult = boll_boost if snapshot.boll_squeeze else 1.0
 
         conf = available_weight_ratio(weights, missing)
         # 调节只放大有方向的 raw (保留符号)

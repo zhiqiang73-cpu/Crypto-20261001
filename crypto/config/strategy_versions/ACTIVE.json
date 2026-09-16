@@ -1,0 +1,9 @@
+{
+  "strategy_version": "sb_m2_current_baseline",
+  "parameters_hash": "68bd5ec75ce4b9c801b8213a062dad9f15e5d6bf7eba594573f57102ac27fbe7",
+  "implementation_id": "a4620e22ebecfe38a0f6346f5fe5cf6d0eec5906fe155ddb5883326e50c1e12c",
+  "strategy_identity": "07fde285504810e6cfb9a0ead9a97efd7ade4ddb0ddc9f97767a8767ca539199",
+  "activated_at_ms": 1789517107037,
+  "previous": null,
+  "reason": "complete_strategy_governance_repair"
+}

@@ -197,6 +197,9 @@ def snapshot_to_panel(
     th_eff = cfg_snap.get("decision_thresholds") or DECISION_THRESHOLDS
     cfg_version = cfg_snap.get("version") or "unknown"
     cfg_hash = cfg_snap.get("content_hash") or ""
+    risk_eff = cfg_snap.get("risk_per_trade_pct") or (
+        (cfg_snap.get("parameters") or {}).get("RISK_PER_TRADE_PCT")
+    ) or RISK_PER_TRADE_PCT
     cs = snap.composite_score if snap.is_full_cs else snap.partial_cs
     if snap.overridden and snap.suppressed_cs is not None:
         cs_display = snap.suppressed_cs
@@ -424,13 +427,18 @@ def snapshot_to_panel(
         "atr": snap.atr,
         "atr_pct": snap.atr_pct,
         "risk": {
-            "short_pct": float(RISK_PER_TRADE_PCT.get("short_term", 0.005)),
-            "long_pct": float(RISK_PER_TRADE_PCT.get("long_term", 0.01)),
+            "short_pct": float(risk_eff.get("short_term", 0.005)),
+            "long_pct": float(risk_eff.get("long_term", 0.01)),
             "formula": "qty = (equity × risk_pct) / (ATR × hard_sl_atr)",
         },
         "thresholds": th_eff,
         "config_version": cfg_version,
         "content_hash": cfg_hash,
+        "parameters_hash": cfg_snap.get("parameters_hash") or cfg_hash,
+        "implementation_id": cfg_snap.get("implementation_id") or "",
+        "strategy_identity": cfg_snap.get("strategy_identity") or "",
+        "schema_version": cfg_snap.get("schema_version") or "",
+        "migration_note": cfg_snap.get("migration_note") or "",
         "base_weights": {
             "news": float(w.get("news", 0)),
             "data": float(w.get("data", 0)),

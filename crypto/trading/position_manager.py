@@ -368,6 +368,7 @@ class PositionManager:
         atr: Optional[float] = None,
         atr_mean: Optional[float] = None,
         require_atr: bool = True,
+        strategy_params: Optional[dict] = None,
     ) -> tuple:
         bal = await self.client.get_balance()
         # 策略权益 = wallet + upnl；禁止 wallet/available 互兜底冒充
@@ -382,11 +383,14 @@ class PositionManager:
             logger.warning("拒绝开仓: 无有效 ATR horizon=%s", horizon)
             return 0.0, 0.0, 0.0
 
-        risk_pct = float(RISK_PER_TRADE_PCT.get(horizon, 0.005))
+        sp = strategy_params or {}
+        risk_table = sp.get("RISK_PER_TRADE_PCT", RISK_PER_TRADE_PCT)
+        exit_table = sp.get("EXIT_STRATEGY", EXIT_STRATEGY)
+        risk_pct = float(risk_table.get(horizon, 0.005))
         risk_usdt = equity * risk_pct
         risk_cap = risk_usdt  # 强信号也不得超过此上限
 
-        cfg = EXIT_STRATEGY.get(horizon) or EXIT_STRATEGY["short_term"]
+        cfg = exit_table.get(horizon) or exit_table["short_term"]
         stop_atr_mult = float(cfg.get("hard_sl_atr") or 1.0)
         stop_pct_fallback = float(cfg.get("hard_sl_pct") or 0.01)
 
@@ -399,27 +403,34 @@ class PositionManager:
 
         qty = risk_usdt / stop_distance
 
-        if abs(cs) >= POSITION_CS_STRONG_THRESHOLD:
+        strong_threshold = float(sp.get("POSITION_CS_STRONG_THRESHOLD", POSITION_CS_STRONG_THRESHOLD))
+        strong_mult = float(sp.get("POSITION_CS_STRONG_MULT", POSITION_CS_STRONG_MULT))
+        conf_threshold = float(sp.get("POSITION_CONF_LOW_THRESHOLD", POSITION_CONF_LOW_THRESHOLD))
+        conf_mult = float(sp.get("POSITION_CONF_LOW_MULT", POSITION_CONF_LOW_MULT))
+        atr_ratio = float(sp.get("POSITION_ATR_HIGH_RATIO", POSITION_ATR_HIGH_RATIO))
+        atr_mult = float(sp.get("POSITION_ATR_HIGH_MULT", POSITION_ATR_HIGH_MULT))
+        if abs(cs) >= strong_threshold:
             # 强信号可在预算内加大仓位意图，但 risk_usdt 不得超过声明上限 risk_cap
-            qty *= POSITION_CS_STRONG_MULT
+            qty *= strong_mult
             # 立即按上限回钳数量
             max_qty_by_risk = risk_cap / stop_distance
             if qty > max_qty_by_risk:
                 qty = max_qty_by_risk
             risk_usdt = min(qty * stop_distance, risk_cap)
-        if min_confidence < POSITION_CONF_LOW_THRESHOLD:
-            qty *= POSITION_CONF_LOW_MULT
-            risk_usdt *= POSITION_CONF_LOW_MULT
+        if min_confidence < conf_threshold:
+            qty *= conf_mult
+            risk_usdt *= conf_mult
         if (
             atr is not None
             and atr_mean is not None
             and atr_mean > 0
-            and atr > atr_mean * POSITION_ATR_HIGH_RATIO
+            and atr > atr_mean * atr_ratio
         ):
-            qty *= POSITION_ATR_HIGH_MULT
-            risk_usdt *= POSITION_ATR_HIGH_MULT
+            qty *= atr_mult
+            risk_usdt *= atr_mult
 
-        max_pct = float(MAX_NOTIONAL_PCT.get(horizon) or POSITION_NOTIONAL_PCT.get(horizon, 0.1))
+        max_table = sp.get("MAX_NOTIONAL_PCT", MAX_NOTIONAL_PCT)
+        max_pct = float(max_table.get(horizon) or POSITION_NOTIONAL_PCT.get(horizon, 0.1))
         max_notional = max(MIN_NOTIONAL_USDT, equity * max_pct)
         other_notional = 0.0
         for h, p in self.positions.items():
@@ -427,7 +438,7 @@ class PositionManager:
                 continue
             if p is not None and not p.is_flat():
                 other_notional += abs(p.quantity) * price
-        total_cap = equity * float(TOTAL_MAX_NOTIONAL_PCT)
+        total_cap = equity * float(sp.get("TOTAL_MAX_NOTIONAL_PCT", TOTAL_MAX_NOTIONAL_PCT))
         remaining_cap = max(0.0, total_cap - other_notional)
         max_notional = min(max_notional, remaining_cap)
 
@@ -479,7 +490,7 @@ class PositionManager:
         active_lev = LEVERAGE_SHORT_TERM
         for h, p in self.positions.items():
             if p and not p.is_flat():
-                active_lev = max(active_lev, self.leverage[h])
+                active_lev = max(active_lev, int(p.leverage or self.leverage[h]))
         try:
             await self.client.set_leverage(active_lev, self.symbol)
         except Exception as exc:
@@ -552,6 +563,7 @@ class PositionManager:
         atr: Optional[float] = None,
         atr_mean: Optional[float] = None,
         entry_cs: Optional[float] = None,
+        config_snapshot: Optional[dict] = None,
     ) -> List[TradeAction]:
         if horizon not in ("short_term", "long_term"):
             return []
@@ -560,6 +572,7 @@ class PositionManager:
                 horizon, decision, price,
                 cs=cs, min_confidence=min_confidence, atr=atr, atr_mean=atr_mean,
                 entry_cs=entry_cs,
+                config_snapshot=config_snapshot,
             )
 
     async def _on_signal_locked(
@@ -573,6 +586,7 @@ class PositionManager:
         atr: Optional[float] = None,
         atr_mean: Optional[float] = None,
         entry_cs: Optional[float] = None,
+        config_snapshot: Optional[dict] = None,
     ) -> List[TradeAction]:
         await self.bootstrap()
         decision = str(decision)
@@ -600,6 +614,7 @@ class PositionManager:
                 horizon, desired, decision, price, "reverse",
                 cs=cs, min_confidence=min_confidence, atr=atr, atr_mean=atr_mean,
                 entry_cs=entry_cs if entry_cs is not None else cs,
+                config_snapshot=config_snapshot,
             )
             if open_act:
                 actions.append(open_act)
@@ -613,6 +628,7 @@ class PositionManager:
                 horizon, desired, decision, price, "signal",
                 cs=cs, min_confidence=min_confidence, atr=atr, atr_mean=atr_mean,
                 entry_cs=entry_cs if entry_cs is not None else cs,
+                config_snapshot=config_snapshot,
             )
             if open_act:
                 actions.append(open_act)
@@ -812,16 +828,20 @@ class PositionManager:
         atr: Optional[float] = None,
         atr_mean: Optional[float] = None,
         entry_cs: float = 0.0,
+        config_snapshot: Optional[dict] = None,
     ) -> Optional[TradeAction]:
         existing = self.positions.get(horizon)
         if existing and not existing.is_flat():
             logger.warning("position_mgr: %s 已有仓, 拒绝开仓", horizon)
             return None
-        lev = self.leverage[horizon]
+        strategy_params = (config_snapshot or {}).get("parameters") or {}
+        lev_key = "LEVERAGE_SHORT_TERM" if horizon == "short_term" else "LEVERAGE_LONG_TERM"
+        lev = int(strategy_params.get(lev_key, self.leverage[horizon]))
         qty, risk_usdt, stop_distance = await self._calc_qty(
             horizon, price,
             cs=cs, min_confidence=min_confidence, atr=atr, atr_mean=atr_mean,
             require_atr=True,
+            strategy_params=strategy_params,
         )
         if qty <= 0:
             logger.warning("position_mgr: qty=0, 跳过")
@@ -871,6 +891,7 @@ class PositionManager:
             risk_usdt=risk_usdt,
             cs_decay_done=False,
             trailing_tightened=False,
+            config_snapshot=dict(config_snapshot or {}),
         )
         self._record_internal_match(price, before_net, intended)
 

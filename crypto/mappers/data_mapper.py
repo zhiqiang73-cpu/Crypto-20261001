@@ -70,14 +70,25 @@ BLOCK_TRADE_SCORES = {
 class DataFactorMapper:
     """将 DataSnapshot 映射为数据面综合分 S_data."""
 
+    def _mv(self, name: str, default):
+        return getattr(self, "_strategy_mapping", {}).get(name, default)
+
     def map(
         self,
         snapshot: DataSnapshot,
         horizon: StrategyHorizon = StrategyHorizon.SHORT_TERM,
+        *,
+        strategy_params: Optional[Dict] = None,
     ) -> DataScoreResult:
         hkey = horizon.value
         missing: List[str] = []
         scores: Dict[str, float] = {}
+        sp = strategy_params
+        self._strategy_mapping = (sp or {}).get("MAPPING") or {}
+        layer_w = (sp or {}).get("DATA_LAYER_WEIGHTS", DATA_LAYER_WEIGHTS)[hkey] if sp else DATA_LAYER_WEIGHTS[hkey]
+        onchain_w = (sp or {}).get("ONCHAIN_INDICATOR_WEIGHTS", ONCHAIN_INDICATOR_WEIGHTS)[hkey] if sp else ONCHAIN_INDICATOR_WEIGHTS[hkey]
+        deriv_w = (sp or {}).get("DERIVATIVES_INDICATOR_WEIGHTS", DERIVATIVES_INDICATOR_WEIGHTS)[hkey] if sp else DERIVATIVES_INDICATOR_WEIGHTS[hkey]
+        micro_w = (sp or {}).get("MICROSTRUCTURE_INDICATOR_WEIGHTS", MICROSTRUCTURE_INDICATOR_WEIGHTS)[hkey] if sp else MICROSTRUCTURE_INDICATOR_WEIGHTS[hkey]
 
         bn = snapshot.binance
         cg = snapshot.coinglass
@@ -106,7 +117,7 @@ class DataFactorMapper:
         der = snapshot.deribit
         if der and der.max_pain_distance is not None:
             scores["option_max_pain"] = interpolate_anchors(
-                der.max_pain_distance, MAX_PAIN_DISTANCE_ANCHORS
+                der.max_pain_distance, self._mv("MAX_PAIN_DISTANCE_ANCHORS", MAX_PAIN_DISTANCE_ANCHORS)
             )
         else:
             scores["option_max_pain"] = 0.0
@@ -114,7 +125,7 @@ class DataFactorMapper:
 
         if der and der.iv is not None:
             scores["implied_volatility"] = interpolate_anchors(
-                der.iv, IV_ANCHORS
+                der.iv, self._mv("IV_ANCHORS", IV_ANCHORS)
             )
         else:
             scores["implied_volatility"] = 0.0
@@ -164,7 +175,7 @@ class DataFactorMapper:
                 mom_val = getattr(oc, "exchange_reserves_proxy", None)
         if mom_val is not None:
             scores["price_momentum_24h"] = interpolate_anchors(
-                mom_val, EXCHANGE_RESERVES_PROXY_ANCHORS
+                mom_val, self._mv("EXCHANGE_RESERVES_PROXY_ANCHORS", EXCHANGE_RESERVES_PROXY_ANCHORS)
             )
         else:
             scores["price_momentum_24h"] = 0.0
@@ -173,12 +184,12 @@ class DataFactorMapper:
         scores["exchange_reserves"] = 0.0
         missing.append("exchange_reserves")
 
-        onchain_keys = list(ONCHAIN_INDICATOR_WEIGHTS[hkey].keys())
+        onchain_keys = list(onchain_w.keys())
         for k in onchain_keys:
             if k not in scores:
                 scores[k] = 0.0
                 # 仅对权重>0 的缺项计入 missing (零权重永久缺源不拖 conf)
-                if ONCHAIN_INDICATOR_WEIGHTS[hkey].get(k, 0) > 0:
+                if float(onchain_w.get(k, 0) or 0) > 0:
                     missing.append(k)
 
         # ----- 时区调节: 方向性指标 × multiplier -----
@@ -194,26 +205,18 @@ class DataFactorMapper:
                 if k in scores:
                     scores[k] = clamp(scores[k] * session_mult)
 
-        # ----- 子层加权 (缺项权重重归一化) -----
-        layer_w = DATA_LAYER_WEIGHTS[hkey]
-        onchain_s = renormalized_weighted_sum(
-            scores, ONCHAIN_INDICATOR_WEIGHTS[hkey], missing
-        )
-        deriv_s = renormalized_weighted_sum(
-            scores, DERIVATIVES_INDICATOR_WEIGHTS[hkey], missing
-        )
-        micro_s = renormalized_weighted_sum(
-            scores, MICROSTRUCTURE_INDICATOR_WEIGHTS[hkey], missing
-        )
+        # ----- 子层加权 (缺项权重重归一化) — 权重来自本轮策略快照 -----
+        onchain_s = renormalized_weighted_sum(scores, onchain_w, missing)
+        deriv_s = renormalized_weighted_sum(scores, deriv_w, missing)
+        micro_s = renormalized_weighted_sum(scores, micro_w, missing)
 
-        # 全局可用权重占比 (层权重 × 子指标权重)
         all_w: Dict[str, float] = {}
-        for k, w in ONCHAIN_INDICATOR_WEIGHTS[hkey].items():
-            all_w[k] = layer_w["onchain"] * float(w)
-        for k, w in DERIVATIVES_INDICATOR_WEIGHTS[hkey].items():
-            all_w[k] = layer_w["derivatives"] * float(w)
-        for k, w in MICROSTRUCTURE_INDICATOR_WEIGHTS[hkey].items():
-            all_w[k] = layer_w["microstructure"] * float(w)
+        for k, w in onchain_w.items():
+            all_w[k] = float(layer_w["onchain"]) * float(w)
+        for k, w in deriv_w.items():
+            all_w[k] = float(layer_w["derivatives"]) * float(w)
+        for k, w in micro_w.items():
+            all_w[k] = float(layer_w["microstructure"]) * float(w)
         conf = available_weight_ratio(all_w, missing)
 
         raw_data = (
@@ -225,7 +228,7 @@ class DataFactorMapper:
 
         black_swan = (
             cg.liq_total_5m_usd is not None
-            and cg.liq_total_5m_usd >= BLACK_SWAN_LIQ_5M_USD
+            and cg.liq_total_5m_usd >= float(self._mv("BLACK_SWAN_LIQ_5M_USD", BLACK_SWAN_LIQ_5M_USD))
         )
 
         # 去重 missing 但保持可读
@@ -271,13 +274,13 @@ class DataFactorMapper:
         if annualized is None:
             missing.append("funding_rate")
             return 0.0
-        return interpolate_anchors(annualized, FUNDING_RATE_ANCHORS)
+        return interpolate_anchors(annualized, self._mv("FUNDING_RATE_ANCHORS", FUNDING_RATE_ANCHORS))
 
     def _map_cvd(self, cvd_usd: Optional[float], missing: List[str]) -> float:
         if cvd_usd is None:
             missing.append("cvd")
             return 0.0
-        return interpolate_anchors(cvd_usd, CVD_5M_ANCHORS)
+        return interpolate_anchors(cvd_usd, self._mv("CVD_5M_ANCHORS", CVD_5M_ANCHORS))
 
     def _map_heatmap(
         self, magnet: Optional[float], missing: List[str]
@@ -311,14 +314,14 @@ class DataFactorMapper:
 
         score = 0.0
         if ch_5m is not None:
-            raw = interpolate_anchors(ch_5m, OI_CHANGE_5M_ANCHORS)
+            raw = interpolate_anchors(ch_5m, self._mv("OI_CHANGE_5M_ANCHORS", OI_CHANGE_5M_ANCHORS))
             # 骤降区 (出清): 用费率决定方向; 堆积区保持锚点符号再乘费率
-            if ch_5m <= -OI_DROP_5M_PCT:
+            if ch_5m <= -float(self._mv("OI_DROP_5M_PCT", OI_DROP_5M_PCT)):
                 score = abs(raw) * funding_sign
             else:
-                score = raw * (funding_sign if abs(fr) > FUNDING_NORMAL_ANNUAL_PCT else 1.0)
+                score = raw * (funding_sign if abs(fr) > float(self._mv("FUNDING_NORMAL_ANNUAL_PCT", FUNDING_NORMAL_ANNUAL_PCT)) else 1.0)
 
-        if ch_24h is not None and ch_24h >= OI_EXTREME_BUILD_24H_PCT:
+        if ch_24h is not None and ch_24h >= float(self._mv("OI_EXTREME_BUILD_24H_PCT", OI_EXTREME_BUILD_24H_PCT)):
             build = interpolate_anchors(ch_24h, [
                 (0.05, -10.0), (0.15, -30.0), (0.30, -50.0),
             ])
@@ -348,9 +351,9 @@ class DataFactorMapper:
         long_usd = 0.0 if long_usd is None else float(long_usd)
         short_usd = 0.0 if short_usd is None else float(short_usd)
         if long_usd >= short_usd and long_usd > 0:
-            return round(interpolate_anchors(long_usd, LIQ_REALTIME_USD_ANCHORS), 2)
+            return round(interpolate_anchors(long_usd, self._mv("LIQ_REALTIME_USD_ANCHORS", LIQ_REALTIME_USD_ANCHORS)), 2)
         if short_usd > long_usd and short_usd > 0:
-            return round(-interpolate_anchors(short_usd, LIQ_REALTIME_USD_ANCHORS), 2)
+            return round(-interpolate_anchors(short_usd, self._mv("LIQ_REALTIME_USD_ANCHORS", LIQ_REALTIME_USD_ANCHORS)), 2)
         # 窗口完整真零：分=0 且不记 missing
         return 0.0
 
@@ -358,7 +361,7 @@ class DataFactorMapper:
         if ratio is None:
             missing.append("long_short_ratio")
             return 0.0
-        return interpolate_anchors(ratio, LONG_SHORT_RATIO_ANCHORS)
+        return interpolate_anchors(ratio, self._mv("LONG_SHORT_RATIO_ANCHORS", LONG_SHORT_RATIO_ANCHORS))
 
     def _map_orderbook(
         self, ratio: Optional[float], missing: List[str]
@@ -366,7 +369,7 @@ class DataFactorMapper:
         if ratio is None:
             missing.append("orderbook_depth")
             return 0.0
-        return interpolate_anchors(ratio, BID_ASK_RATIO_ANCHORS)
+        return interpolate_anchors(ratio, self._mv("BID_ASK_RATIO_ANCHORS", BID_ASK_RATIO_ANCHORS))
 
     def _map_spread(
         self, vs_mean: Optional[float], missing: List[str]
@@ -375,8 +378,8 @@ class DataFactorMapper:
         if vs_mean is None:
             missing.append("spread")
             return 0.0, False
-        danger = vs_mean >= SPREAD_BLACK_SWAN_MULT
-        if vs_mean >= SPREAD_DANGER_MULT:
+        danger = vs_mean >= float(self._mv("SPREAD_BLACK_SWAN_MULT", SPREAD_BLACK_SWAN_MULT))
+        if vs_mean >= float(self._mv("SPREAD_DANGER_MULT", SPREAD_DANGER_MULT)):
             return 0.0, danger
         return 0.0, danger
 
@@ -391,7 +394,7 @@ class DataFactorMapper:
         if ch_5m is None:
             missing.append("oi_velocity")
             return 0.0
-        magnitude = abs(interpolate_anchors(ch_5m, OI_CHANGE_5M_ANCHORS))
+        magnitude = abs(interpolate_anchors(ch_5m, self._mv("OI_CHANGE_5M_ANCHORS", OI_CHANGE_5M_ANCHORS)))
         if ch_5m > -OI_DROP_5M_PCT * 0.5:
             return round(magnitude * 0.3 if ch_5m < 0 else 0.0, 2)
         long_liq = long_liq or 0.0
@@ -415,9 +418,9 @@ class DataFactorMapper:
         if long_cleared is not None and (
             short_cleared is None or long_cleared >= short_cleared
         ):
-            return round(interpolate_anchors(long_cleared, LIQ_SPEED_CLEARED_ANCHORS), 2)
+            return round(interpolate_anchors(long_cleared, self._mv("LIQ_SPEED_CLEARED_ANCHORS", LIQ_SPEED_CLEARED_ANCHORS)), 2)
         if short_cleared is not None:
-            return round(-interpolate_anchors(short_cleared, LIQ_SPEED_CLEARED_ANCHORS), 2)
+            return round(-interpolate_anchors(short_cleared, self._mv("LIQ_SPEED_CLEARED_ANCHORS", LIQ_SPEED_CLEARED_ANCHORS)), 2)
         return 0.0
 
     def _map_hashrate(
@@ -426,7 +429,7 @@ class DataFactorMapper:
         if change_pct is None:
             missing.append("hashrate")
             return 0.0
-        return interpolate_anchors(change_pct, HASHRATE_CHANGE_ANCHORS)
+        return interpolate_anchors(change_pct, self._mv("HASHRATE_CHANGE_ANCHORS", HASHRATE_CHANGE_ANCHORS))
 
     def _map_whale(
         self,
@@ -439,18 +442,17 @@ class DataFactorMapper:
             missing.append("whale_transfers")
             return 0.0
         if net_btc is not None:
-            return round(interpolate_anchors(net_btc, WHALE_NET_BTC_ANCHORS), 2)
+            return round(interpolate_anchors(net_btc, self._mv("WHALE_NET_BTC_ANCHORS", WHALE_NET_BTC_ANCHORS)), 2)
         if direction == "to_exchange":
             return -70.0
         if direction == "from_exchange":
             return 70.0
         return 0.0
 
-    @staticmethod
-    def _session_multiplier(session: SessionZone) -> float:
+    def _session_multiplier(self, session: SessionZone) -> float:
         if session == SessionZone.ASIA:
-            return SESSION_ASIA_MULTIPLIER
-        return SESSION_US_MULTIPLIER
+            return float(self._mv("SESSION_ASIA_MULTIPLIER", SESSION_ASIA_MULTIPLIER))
+        return float(self._mv("SESSION_US_MULTIPLIER", SESSION_US_MULTIPLIER))
 
     @staticmethod
     def _weighted_sum(scores: Dict[str, float], weights: Dict[str, float]) -> float:

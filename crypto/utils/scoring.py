@@ -8,6 +8,16 @@ from typing import Optional, Dict, Sequence, Tuple
 from models.snapshots import SessionZone
 
 
+def strategy_mapping_value(strategy_params: Optional[dict], name: str, default):
+    """Read a mapping value from the sealed strategy snapshot.
+
+    Callers may omit strategy_params only for legacy/offline compatibility.
+    Production passes the full immutable decision snapshot.
+    """
+    mapping = (strategy_params or {}).get("MAPPING") or {}
+    return mapping.get(name, default)
+
+
 def interpolate_anchors(
     value: float,
     anchors: Sequence[Tuple[float, float]],
@@ -174,12 +184,19 @@ def apply_collinear_caps(
 ) -> tuple:
     """限制已知共线组对面贡献；返回 (adjusted_weights, note)."""
     try:
-        from config.weights import COLLINEAR_GROUPS
+        groups = None
+        # 优先使用引擎上的密封共线组（来自策略快照）
+        # 调用方可通过 confidences["_collinear_groups"] 注入（测试）
+        if confidences and confidences.get("_collinear_groups"):
+            groups = confidences.get("_collinear_groups")
+        if groups is None:
+            from config.weights import COLLINEAR_GROUPS
+            groups = COLLINEAR_GROUPS
     except Exception:
         return weights, {}
     w = {k: float(weights.get(k, 0)) for k in weights}
     notes = {}
-    whale = COLLINEAR_GROUPS.get("whale") or {}
+    whale = (groups or {}).get("whale") or {}
     max_c = float(whale.get("max_combined_face_contrib") or 0)
     # 仅当映射层标记巨鲸两侧同时有贡献时才封顶（禁止把一切 news+data 同向都当巨鲸）
     whale_active = bool(face_scores.get("_collinear_whale")) or bool(
@@ -325,16 +342,19 @@ def apply_consistency_damping(
     return out
 
 
-def estimate_neutral_prob(rel: float) -> float:
+def estimate_neutral_prob(rel: float, *, strategy_params: Optional[dict] = None) -> float:
     """阈值相对距离 → 公平 Yes 概率 (上行 above 合约).
 
     rel = (threshold - mark) / mark. 负 rel (阈值略低于现价) → 公平概率 > 0.5.
     """
     from config.mapping import NEUTRAL_PROB_BY_REL
 
+    anchors = strategy_mapping_value(
+        strategy_params, "NEUTRAL_PROB_BY_REL", NEUTRAL_PROB_BY_REL
+    )
     abs_rel = abs(float(rel))
     fair_above = interpolate_anchors(
-        abs_rel, NEUTRAL_PROB_BY_REL, clamp_score=(0.01, 0.99)
+        abs_rel, anchors, clamp_score=(0.01, 0.99)
     )
     if rel >= 0:
         return fair_above
@@ -345,12 +365,20 @@ def map_polymarket_relative(
     prob: float,
     threshold: Optional[float],
     mark_price: Optional[float],
+    *,
+    strategy_params: Optional[dict] = None,
 ) -> float:
     """Polymarket 阈值概率 → 方向分 (阈值距离校准).
 
     有阈值+现价时: (实际 - 公平) 映射; 否则退回绝对概率锚点.
     """
     from config.mapping import PROBABILITY_ANCHORS, RELATIVE_PROB_DELTA_ANCHORS
+    probability_anchors = strategy_mapping_value(
+        strategy_params, "PROBABILITY_ANCHORS", PROBABILITY_ANCHORS
+    )
+    relative_anchors = strategy_mapping_value(
+        strategy_params, "RELATIVE_PROB_DELTA_ANCHORS", RELATIVE_PROB_DELTA_ANCHORS
+    )
 
     if (
         threshold is None
@@ -358,9 +386,9 @@ def map_polymarket_relative(
         or mark_price <= 0
         or threshold <= 0
     ):
-        return interpolate_anchors(prob, PROBABILITY_ANCHORS)
+        return interpolate_anchors(prob, probability_anchors)
 
     rel = (float(threshold) - float(mark_price)) / float(mark_price)
-    neutral = estimate_neutral_prob(rel)
+    neutral = estimate_neutral_prob(rel, strategy_params=strategy_params)
     delta = float(prob) - neutral
-    return interpolate_anchors(delta, RELATIVE_PROB_DELTA_ANCHORS)
+    return interpolate_anchors(delta, relative_anchors)

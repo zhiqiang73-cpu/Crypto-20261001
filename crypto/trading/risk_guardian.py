@@ -53,6 +53,10 @@ class RiskGuardian:
         self._stop_ids: Dict[str, str] = {}  # 兼容旧测试
         self._actions: list = []
         self._recover_observe: int = 0
+        self.config_snapshot: Dict[str, Any] = {}
+
+    def set_config_snapshot(self, snapshot: Optional[Dict[str, Any]]) -> None:
+        self.config_snapshot = dict(snapshot or {})
 
     def note_score_result(self, ok: bool) -> None:
         if ok:
@@ -284,7 +288,11 @@ class RiskGuardian:
         return None
 
     def _check_trailing(self, pos, mark: float) -> Optional[ExitAction]:
-        cfg = EXIT_STRATEGY.get(pos.horizon) or EXIT_STRATEGY["short_term"]
+        sealed = pos.config_snapshot or {}
+        exit_table = sealed.get("exit_strategy") or (
+            (sealed.get("parameters") or {}).get("EXIT_STRATEGY")
+        ) or EXIT_STRATEGY
+        cfg = exit_table.get(pos.horizon) or exit_table["short_term"]
         mult = float(cfg.get("trailing_atr") or 1.0)
         if pos.side == "LONG":
             pos.peak_price = max(pos.peak_price or mark, mark)
@@ -318,7 +326,10 @@ class RiskGuardian:
                 self.health = SystemHealth.NOT_READY
             return
         age = time.time() - self.last_mark_ts
-        limit = float(STALENESS_LIMITS.get("mark_price", 60))
+        limits = self.config_snapshot.get("staleness_limits") or (
+            (self.config_snapshot.get("parameters") or {}).get("STALENESS_LIMITS")
+        ) or STALENESS_LIMITS
+        limit = float(limits.get("mark_price", 60))
         if age > limit and self.health in (
             SystemHealth.NORMAL, SystemHealth.DEGRADED, SystemHealth.NOT_READY
         ):

@@ -52,7 +52,11 @@ class ExitChecker:
         if mark_price <= 0 or position.entry_price <= 0:
             return []
 
-        cfg = EXIT_STRATEGY.get(position.horizon) or EXIT_STRATEGY["short_term"]
+        sealed = position.config_snapshot or {}
+        exit_table = sealed.get("exit_strategy") or (
+            (sealed.get("parameters") or {}).get("EXIT_STRATEGY")
+        ) or EXIT_STRATEGY
+        cfg = exit_table.get(position.horizon) or exit_table["short_term"]
         now_ms = now_ms or int(time.time() * 1000)
         pnl = position.pnl_pct(mark_price)
         # 入场 ATR 优先 (仓位与止损一致); 否则用当前 ATR

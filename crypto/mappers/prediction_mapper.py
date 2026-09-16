@@ -36,9 +36,14 @@ class PredictionFactorMapper:
         self,
         snapshot: PredictionSnapshot,
         horizon: StrategyHorizon = StrategyHorizon.SHORT_TERM,
+        *,
+        strategy_params=None,
     ) -> PredictionScoreResult:
         hkey = horizon.value
-        weights = PREDICTION_SUB_WEIGHTS[hkey]
+        pred_w = (strategy_params or {}).get("PREDICTION_SUB_WEIGHTS", PREDICTION_SUB_WEIGHTS)
+        mapping = (strategy_params or {}).get("MAPPING") or {}
+        mv = lambda name, default: mapping.get(name, default)
+        weights = pred_w[hkey]
         missing: List[str] = []
         scores: Dict[str, float] = {}
 
@@ -48,6 +53,9 @@ class PredictionFactorMapper:
             up = getattr(pf, "btc_up_prob_1h", None) if pf else None
             if up is None and pf and (getattr(pf, "active_window", None) in ("1h", "60m", "1H")):
                 up = pf.btc_up_prob
+            # 旧离线快照没有窗口字段；生产采集器必须提供 active_window。
+            if up is None and pf and getattr(pf, "active_window", None) is None:
+                up = pf.btc_up_prob
         else:
             # 长期优先 1d，否则不进入方向分
             up = getattr(pf, "btc_up_prob_1d", None) if pf else None
@@ -55,7 +63,7 @@ class PredictionFactorMapper:
                 up = pf.btc_up_prob
         if up is not None and 0.05 < up < 0.95:
             scores["predict_fun_btc"] = interpolate_anchors(
-                up, PREDICT_FUN_UP_ANCHORS
+                up, mv("PREDICT_FUN_UP_ANCHORS", PREDICT_FUN_UP_ANCHORS)
             )
         else:
             scores["predict_fun_btc"] = 0.0
@@ -64,7 +72,9 @@ class PredictionFactorMapper:
         # Fear & Greed (逆向指标)
         fg = snapshot.fear_greed
         if fg and fg.value is not None:
-            scores["fear_greed"] = interpolate_anchors(fg.value, FEAR_GREED_ANCHORS)
+            scores["fear_greed"] = interpolate_anchors(
+                fg.value, mv("FEAR_GREED_ANCHORS", FEAR_GREED_ANCHORS)
+            )
         else:
             scores["fear_greed"] = 0.0
             missing.append("fear_greed")
@@ -81,6 +91,7 @@ class PredictionFactorMapper:
                 pm.btc_prob,
                 pm.btc_threshold_usd,
                 snapshot.mark_price,
+                strategy_params=strategy_params,
             )
         else:
             scores["polymarket_prob"] = 0.0
@@ -89,7 +100,7 @@ class PredictionFactorMapper:
         if "prob_change_speed" in weights:
             if pm.btc_prob_change_1h is not None:
                 scores["prob_change_speed"] = interpolate_anchors(
-                    pm.btc_prob_change_1h, PROBABILITY_CHANGE_ANCHORS
+                    pm.btc_prob_change_1h, mv("PROBABILITY_CHANGE_ANCHORS", PROBABILITY_CHANGE_ANCHORS)
                 )
             else:
                 scores["prob_change_speed"] = 0.0
@@ -98,7 +109,7 @@ class PredictionFactorMapper:
         # FedWatch 代理 — 映射为 0 视为无方向信息 → missing (避免虚高 conf)
         if pm.fed_cut_prob is not None and pm.fed_hike_prob is not None:
             fw = interpolate_anchors(
-                pm.fed_cut_prob - pm.fed_hike_prob, FEDWATCH_PROXY_ANCHORS
+                pm.fed_cut_prob - pm.fed_hike_prob, mv("FEDWATCH_PROXY_ANCHORS", FEDWATCH_PROXY_ANCHORS)
             )
             if abs(fw) < 1e-9:
                 scores["fedwatch_proxy"] = 0.0
@@ -106,14 +117,14 @@ class PredictionFactorMapper:
             else:
                 scores["fedwatch_proxy"] = fw
         elif pm.fed_cut_prob is not None:
-            fw = interpolate_anchors(pm.fed_cut_prob, FEDWATCH_CUT_ONLY_ANCHORS)
+            fw = interpolate_anchors(pm.fed_cut_prob, mv("FEDWATCH_CUT_ONLY_ANCHORS", FEDWATCH_CUT_ONLY_ANCHORS))
             if abs(fw) < 1e-9:
                 scores["fedwatch_proxy"] = 0.0
                 missing.append("fedwatch_proxy")
             else:
                 scores["fedwatch_proxy"] = fw
         elif pm.fed_hike_prob is not None:
-            fw = interpolate_anchors(pm.fed_hike_prob, FEDWATCH_HIKE_ONLY_ANCHORS)
+            fw = interpolate_anchors(pm.fed_hike_prob, mv("FEDWATCH_HIKE_ONLY_ANCHORS", FEDWATCH_HIKE_ONLY_ANCHORS))
             if abs(fw) < 1e-9:
                 scores["fedwatch_proxy"] = 0.0
                 missing.append("fedwatch_proxy")
@@ -126,7 +137,7 @@ class PredictionFactorMapper:
         dist = snapshot.max_pain_distance
         if dist is not None:
             scores["max_pain"] = interpolate_anchors(
-                dist, MAX_PAIN_DISTANCE_ANCHORS
+                dist, mv("MAX_PAIN_DISTANCE_ANCHORS", MAX_PAIN_DISTANCE_ANCHORS)
             )
         else:
             scores["max_pain"] = 0.0

@@ -35,7 +35,8 @@ class TestPredictionMapper(unittest.TestCase):
         )
         r = PredictionFactorMapper().map(snap, StrategyHorizon.SHORT_TERM)
         self.assertGreater(r.s_prediction, 40)
-        self.assertEqual(r.missing_fields, [])
+        # 月度 Polymarket 与 1h 策略期限不匹配，必须排除并明确标记。
+        self.assertIn("polymarket_prob", r.missing_fields)
 
     def test_missing_all(self):
         r = PredictionFactorMapper().map(

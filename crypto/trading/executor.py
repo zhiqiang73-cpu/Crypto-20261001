@@ -191,10 +191,14 @@ class TradeExecutor:
 
     def _staleness_blocks_entry(self, snap: Any) -> Optional[str]:
         stale_map = getattr(snap, "staleness_sec", None) or {}
+        cfg_snap = getattr(snap, "config_snapshot", None) or {}
+        limits = cfg_snap.get("staleness_limits") or (
+            (cfg_snap.get("parameters") or {}).get("STALENESS_LIMITS")
+        ) or STALENESS_LIMITS
         for source, age in stale_map.items():
             if age is None:
                 continue
-            limit = float(STALENESS_LIMITS.get(source, STALENESS_LIMITS.get("default", 300)))
+            limit = float(limits.get(source, limits.get("default", 300)))
             if float(age) > limit:
                 if self.guardian:
                     if self.guardian.health == SystemHealth.NORMAL:
@@ -238,6 +242,10 @@ class TradeExecutor:
 
     async def on_snapshot(self, snap: Any, horizon: str) -> List[TradeAction]:
         """处理一帧评分快照. horizon: short_term | long_term."""
+        if self.guardian and hasattr(self.guardian, "set_config_snapshot"):
+            self.guardian.set_config_snapshot(
+                getattr(snap, "config_snapshot", None) or {}
+            )
         if not self.configured:
             self.last_error = "binance_keys_missing"
             return []
@@ -347,8 +355,13 @@ class TradeExecutor:
             side = "SHORT"
         if side:
             signal_px = float(getattr(snap, "mark_price", None) or price)
-            signal_ts = int(getattr(snap, "timestamp_ms", None) or 0)
             now = int(time.time() * 1000)
+            raw_signal_ts = getattr(snap, "timestamp_ms", None)
+            signal_ts = (
+                int(raw_signal_ts)
+                if isinstance(raw_signal_ts, (int, float)) and raw_signal_ts > 0
+                else now
+            )
             try:
                 exec_mark = float(await self.client.mark_price())
             except Exception as exc:
@@ -362,6 +375,14 @@ class TradeExecutor:
             atr_v = float(atr) if atr else None
             sl_dist = (atr_v * hard_sl_atr) if atr_v else None
             tp_dist = (atr_v * tp1_atr) if atr_v else None
+            pl = cfg_snap.get("pretrade_limits") or {}
+            limits = PretradeLimits(
+                signal_ttl_sec=float(pl.get("signal_ttl_sec", 120.0)),
+                max_quote_age_sec=float(pl.get("max_quote_age_sec", 5.0)),
+                max_adverse_atr=float(pl.get("max_adverse_atr", 0.5)),
+                max_spread_bps=float(pl.get("max_spread_bps", 8.0)),
+                min_remaining_rr=float(pl.get("min_remaining_rr", 0.8)),
+            )
             pre = recheck_entry(
                 side=side,
                 signal_price=signal_px,
@@ -372,7 +393,7 @@ class TradeExecutor:
                 atr=atr_v,
                 hard_sl_distance=sl_dist,
                 tp_distance=tp_dist,
-                limits=PretradeLimits(),
+                limits=limits,
             )
             if not pre.ok:
                 self.last_error = "pretrade:" + ",".join(pre.reasons)
@@ -393,6 +414,7 @@ class TradeExecutor:
                 atr=atr,
                 atr_mean=atr_mean,
                 entry_cs=cs,
+                config_snapshot=dict(getattr(snap, "config_snapshot", None) or {}),
             )
         except Exception as exc:
             self.last_error = str(exc)

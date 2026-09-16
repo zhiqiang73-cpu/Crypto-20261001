@@ -268,6 +268,9 @@ class LiveScoringLoop:
         block_reasons: list = []
         if not cfg.load_ok:
             block_reasons.append(f"config_invalid:{cfg.load_error or 'load_failed'}")
+        # 本轮完整策略参数（不可变）；mapper/scorer 必须用这份，禁止再读模块常量偷跑
+        from config.strategy_bundle import deep_unfreeze
+        strategy_params = deep_unfreeze(cfg.parameters) if cfg.parameters is not None else None
         # REST 兜底补齐订单簿 / CVD / spread, 避免 WS 暖机期数据面大面积缺项
         try:
             bsnap = await self.binance.ensure_microstructure()
@@ -391,13 +394,19 @@ class LiveScoringLoop:
             session=detect_session_zone(bsnap.event_time_ms),
             timestamp_ms=bsnap.event_time_ms or now_ms,
         )
-        data_result = self.data_mapper.map(data_snap, self.horizon)
+        data_result = self.data_mapper.map(
+            data_snap, self.horizon, strategy_params=strategy_params
+        )
 
         intra, daily = await self.klines.fetch_tech_inputs(self.kline_interval, 300)
         tech_snap = extract_tech_features(intra, daily)
-        tech_result = self.tech_mapper.map(tech_snap, self.horizon)
+        tech_result = self.tech_mapper.map(
+            tech_snap, self.horizon, strategy_params=strategy_params
+        )
 
-        news_result = self.news_mapper.map(news_raw, self.horizon)
+        news_result = self.news_mapper.map(
+            news_raw, self.horizon, strategy_params=strategy_params
+        )
 
         pred_snap = PredictionSnapshot(
             polymarket=pm,
@@ -418,7 +427,9 @@ class LiveScoringLoop:
                 or der.last_success_ts
             ),
         )
-        pred_result = self.prediction_mapper.map(pred_snap, self.horizon)
+        pred_result = self.prediction_mapper.map(
+            pred_snap, self.horizon, strategy_params=strategy_params
+        )
 
         s_news: Optional[float] = news_result.s_news if news_raw.available else None
         s_pred: Optional[float] = (
@@ -437,7 +448,7 @@ class LiveScoringLoop:
             "prediction": float(getattr(pred_result, "confidence", 1.0) or 0.0),
         }
         # 跨面一致性阻尼: 无独立验证时默认关闭，避免先压少数派再交易
-        if ENABLE_CONSISTENCY_DAMPING:
+        if bool(strategy_params.get("ENABLE_CONSISTENCY_DAMPING", ENABLE_CONSISTENCY_DAMPING)):
             present = {k: v for k, v in scores.items() if v is not None}
             damped = apply_consistency_damping(present, face_conf)
             for k, v in damped.items():
@@ -445,7 +456,11 @@ class LiveScoringLoop:
 
         overridden = bool(
             fsnap.liq_total_5m_usd is not None
-            and fsnap.liq_total_5m_usd >= BLACK_SWAN_LIQ_5M_USD
+            and fsnap.liq_total_5m_usd >= float(
+                (strategy_params.get("MAPPING") or {}).get(
+                    "BLACK_SWAN_LIQ_5M_USD", BLACK_SWAN_LIQ_5M_USD
+                )
+            )
         ) or data_result.black_swan_liq
 
         is_full = all(v is not None for v in scores.values())

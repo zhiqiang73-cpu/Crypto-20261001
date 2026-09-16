@@ -72,12 +72,13 @@ def map_etf(
     daily: Optional[float],
     weekly: Optional[float],
     consecutive_weeks: int,
+    anchors=None,
 ) -> float:
     if daily is None and weekly is None:
         return 0.0
     base = 0.0
     if daily is not None:
-        base = interpolate_anchors(daily, ETF_DAILY_FLOW_ANCHORS)
+        base = interpolate_anchors(daily, anchors or ETF_DAILY_FLOW_ANCHORS)
     if weekly is not None:
         if weekly > 1_000_000_000 and consecutive_weeks >= 3:
             return 90.0
@@ -86,11 +87,11 @@ def map_etf(
     return base
 
 
-def map_institutional_from_whale(net_btc: Optional[float]) -> float:
+def map_institutional_from_whale(net_btc: Optional[float], anchors=None) -> float:
     """V8.2: 统一用 WHALE_NET_BTC_ANCHORS 连续插值 (修复阶梯顺序 bug)."""
     if net_btc is None:
         return 0.0
-    return interpolate_anchors(float(net_btc), WHALE_NET_BTC_ANCHORS)
+    return interpolate_anchors(float(net_btc), anchors or WHALE_NET_BTC_ANCHORS)
 
 
 WHALE_INFORMATIVE_BTC = 200.0  # |net| 低于此视为无信息 → missing
@@ -107,17 +108,24 @@ def _uniq(missing: List[str]) -> List[str]:
 
 
 class NewsFactorMapper:
+    def _mv(self, name: str, default):
+        return getattr(self, "_strategy_mapping", {}).get(name, default)
+
     def map(
         self,
         snapshot: NewsSnapshot,
         horizon: StrategyHorizon = StrategyHorizon.SHORT_TERM,
+        *,
+        strategy_params=None,
     ) -> NewsScoreResult:
+        self._strategy_mapping = (strategy_params or {}).get("MAPPING") or {}
         if horizon == StrategyHorizon.LONG_TERM:
-            return self._map_long(snapshot)
-        return self._map_short(snapshot)
+            return self._map_long(snapshot, strategy_params=strategy_params)
+        return self._map_short(snapshot, strategy_params=strategy_params)
 
-    def _map_short(self, snapshot: NewsSnapshot) -> NewsScoreResult:
-        weights = NEWS_SUB_WEIGHTS["short_term_normal"]
+    def _map_short(self, snapshot: NewsSnapshot, *, strategy_params=None) -> NewsScoreResult:
+        news_w = (strategy_params or {}).get("NEWS_SUB_WEIGHTS", NEWS_SUB_WEIGHTS)
+        weights = news_w["short_term_normal"]
         missing: List[str] = []
         scores: Dict[str, float] = {}
 
@@ -135,7 +143,8 @@ class NewsFactorMapper:
             missing.append("whale_institutional")
         else:
             scores["whale_institutional"] = map_institutional_from_whale(
-                snapshot.institutional_score
+                snapshot.institutional_score,
+                self._mv("WHALE_NET_BTC_ANCHORS", WHALE_NET_BTC_ANCHORS),
             )
 
         if snapshot.regulatory_event_score is not None:
@@ -151,7 +160,7 @@ class NewsFactorMapper:
         elif snapshot.cpi_yoy_change is not None:
             # 发布日冲击兜底: CPI 同比变化
             scores["macro_surprise"] = interpolate_anchors(
-                snapshot.cpi_yoy_change, CPI_YOY_CHANGE_ANCHORS
+                snapshot.cpi_yoy_change, self._mv("CPI_YOY_CHANGE_ANCHORS", CPI_YOY_CHANGE_ANCHORS)
             )
         else:
             scores["macro_surprise"] = 0.0
@@ -179,8 +188,9 @@ class NewsFactorMapper:
             ),
         )
 
-    def _map_long(self, snapshot: NewsSnapshot) -> NewsScoreResult:
-        weights = NEWS_SUB_WEIGHTS["long_term"]
+    def _map_long(self, snapshot: NewsSnapshot, *, strategy_params=None) -> NewsScoreResult:
+        news_w = (strategy_params or {}).get("NEWS_SUB_WEIGHTS", NEWS_SUB_WEIGHTS)
+        weights = news_w["long_term"]
         missing: List[str] = list(snapshot.missing_fields)
         scores: Dict[str, float] = {}
 
@@ -193,16 +203,17 @@ class NewsFactorMapper:
                 snapshot.etf_daily_net_usd,
                 snapshot.etf_weekly_net_usd,
                 snapshot.etf_consecutive_inflow_weeks,
+                self._mv("ETF_DAILY_FLOW_ANCHORS", ETF_DAILY_FLOW_ANCHORS),
             )
 
         # 货币政策 — DXY + M2
         mon_parts: List[float] = []
         if snapshot.dxy_change_5d is not None:
             mon_parts.append(
-                interpolate_anchors(snapshot.dxy_change_5d, DXY_TREND_ANCHORS)
+                interpolate_anchors(snapshot.dxy_change_5d, self._mv("DXY_TREND_ANCHORS", DXY_TREND_ANCHORS))
             )
         if snapshot.m2_yoy is not None:
-            mon_parts.append(interpolate_anchors(snapshot.m2_yoy, M2_YOY_ANCHORS))
+            mon_parts.append(interpolate_anchors(snapshot.m2_yoy, self._mv("M2_YOY_ANCHORS", M2_YOY_ANCHORS)))
         if mon_parts:
             scores["monetary_policy"] = sum(mon_parts) / len(mon_parts)
         else:
@@ -221,15 +232,15 @@ class NewsFactorMapper:
         macro_parts: List[float] = []
         if snapshot.cpi_yoy_change is not None:
             macro_parts.append(
-                interpolate_anchors(snapshot.cpi_yoy_change, CPI_YOY_CHANGE_ANCHORS)
+                interpolate_anchors(snapshot.cpi_yoy_change, self._mv("CPI_YOY_CHANGE_ANCHORS", CPI_YOY_CHANGE_ANCHORS))
             )
         if snapshot.yield_curve_10y2y is not None:
             macro_parts.append(
-                interpolate_anchors(snapshot.yield_curve_10y2y, YIELD_CURVE_ANCHORS)
+                interpolate_anchors(snapshot.yield_curve_10y2y, self._mv("YIELD_CURVE_ANCHORS", YIELD_CURVE_ANCHORS))
             )
         if snapshot.pmi is not None:
             # pmi 字段 = INDPRO 同比 (免费代理)
-            macro_parts.append(interpolate_anchors(snapshot.pmi, INDPRO_YOY_ANCHORS))
+            macro_parts.append(interpolate_anchors(snapshot.pmi, self._mv("INDPRO_YOY_ANCHORS", INDPRO_YOY_ANCHORS)))
         if macro_parts:
             scores["macro_data"] = sum(macro_parts) / len(macro_parts)
         else:
@@ -247,7 +258,8 @@ class NewsFactorMapper:
                 missing.append("institutional_gov")
         else:
             scores["institutional_gov"] = map_institutional_from_whale(
-                snapshot.institutional_score
+                snapshot.institutional_score,
+                self._mv("WHALE_NET_BTC_ANCHORS", WHALE_NET_BTC_ANCHORS),
             )
 
         scores["halving"] = map_halving(
@@ -265,7 +277,7 @@ class NewsFactorMapper:
                 missing.append("usdt_dynamics")
         else:
             scores["usdt_dynamics"] = interpolate_anchors(
-                snapshot.usdt_net_mint_24h, USDT_NET_MINT_ANCHORS
+                snapshot.usdt_net_mint_24h, self._mv("USDT_NET_MINT_ANCHORS", USDT_NET_MINT_ANCHORS)
             )
 
         if snapshot.black_swan_score is not None:
