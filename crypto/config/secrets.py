@@ -20,9 +20,6 @@ SECRETS_FILE = PROJECT_ROOT / "runtime" / "secrets.json"
 
 # 允许的字段白名单 — 禁止往 secrets.json 写任意键
 ALLOWED_KEYS = frozenset({
-    "deepseek_api_key",
-    "deepseek_model",
-    "deepseek_base_url",
     "binance_testnet_api_key",
     "binance_testnet_api_secret",
     "binance_testnet_base_url",
@@ -31,9 +28,6 @@ ALLOWED_KEYS = frozenset({
 })
 
 ENV_MAP = {
-    "deepseek_api_key": "DEEPSEEK_API_KEY",
-    "deepseek_model": "DEEPSEEK_MODEL",
-    "deepseek_base_url": "DEEPSEEK_BASE_URL",
     "binance_testnet_api_key": "BINANCE_TESTNET_API_KEY",
     "binance_testnet_api_secret": "BINANCE_TESTNET_API_SECRET",
     "binance_testnet_base_url": "BINANCE_TESTNET_BASE_URL",

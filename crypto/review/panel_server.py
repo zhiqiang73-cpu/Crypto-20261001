@@ -6,7 +6,7 @@
 
 职责:
   * 服务 HTML + /api/live (四面实时 CS)
-  * 复盘档案 / 结算 / DeepSeek 调参建议 / 配置版本
+  * 复盘档案 / 结算 / 统计调参建议 / 配置版本
   * Binance 模拟盘交易 + 自我递归改进
   * 密钥优先读 runtime/secrets.json / 环境变量, 面板可改写
 """
@@ -29,9 +29,6 @@ except ImportError:  # pragma: no cover
     web = None  # type: ignore
 
 from config.review import (
-    DEEPSEEK_DEFAULT_BASE_URL,
-    DEEPSEEK_DEFAULT_MODEL,
-    DEEPSEEK_MODEL_CHOICES,
     PANEL_HOST,
     PANEL_HTML,
     PANEL_PORT,
@@ -43,7 +40,6 @@ from config.strategy_registry import load_registry, upsert_strategy
 from engine.scorer import FactorScoringEngine
 from models.review import SettleStatus, TradeRecord, now_ms
 from models.signals import DimensionScores, StrategyHorizon
-from review import deepseek as ds
 from review import meta_review, overrides, review_loop
 from review.journal import TradeJournal, new_trade_id
 from review.settle import settle_pending
@@ -58,61 +54,22 @@ logger = logging.getLogger(__name__)
 
 
 class ReviewPanelState:
-    """复盘侧状态: 档案 + 内存中的 DeepSeek key + 交易执行器."""
+    """复盘侧状态: 档案 + 交易执行器.
+
+    复盘由 review.statistical_review 纯算法驱动, 不需要任何 API Key,
+    因此本状态里不存在模型客户端。
+    """
 
     def __init__(self) -> None:
-        secrets = load_secrets()
         self.journal = TradeJournal().load()
-        env_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-        file_key = (secrets.get("deepseek_api_key") or "").strip()
-        if env_key:
-            self.api_key: Optional[str] = env_key
-            self.key_source: str = "env"
-        elif file_key:
-            self.api_key = file_key
-            self.key_source = "secrets"
-        else:
-            self.api_key = None
-            self.key_source = "none"
-        self.model: str = (
-            secrets.get("deepseek_model")
-            or os.environ.get("DEEPSEEK_MODEL")
-            or DEEPSEEK_DEFAULT_MODEL
-        )
-        self.base_url: str = (
-            secrets.get("deepseek_base_url")
-            or os.environ.get("DEEPSEEK_BASE_URL")
-            or DEEPSEEK_DEFAULT_BASE_URL
-        )
-        self._client: Optional[ds.DeepSeekClient] = None
         self.executor = TradeExecutor(
             client=BinanceTestnetClient(),
             journal=self.journal,
         )
-        self.scheduler = DailyScheduler(
-            journal=self.journal,
-            get_client=lambda: self.client() if self.api_key else None,
-        )
+        self.scheduler = DailyScheduler(journal=self.journal)
         overrides.ensure_baseline()
 
-    def client(self) -> ds.DeepSeekClient:
-        if not self.api_key:
-            raise ds.DeepSeekAuthError("未配置 DeepSeek API key")
-        if self._client is None or self._client.api_key != self.api_key:
-            self._client = ds.DeepSeekClient(
-                api_key=self.api_key,
-                model=self.model,
-                base_url=self.base_url,
-            )
-        else:
-            self._client.model = self.model
-            self._client.base_url = self.base_url
-        return self._client
-
     async def close(self) -> None:
-        if self._client:
-            await self._client.close()
-            self._client = None
         await self.executor.close()
 
 
@@ -230,9 +187,7 @@ def create_app(
             "has_snapshot": s is not None,
             "full_cs": bool(s and s.is_full_cs),
             "journal_records": len(review.journal),
-            "key_configured": bool(review.api_key),
-            "key_masked": ds.mask_key(review.api_key) if review.api_key else "",
-            "key_source": review.key_source,
+            "review_engine": review_loop.ENGINE_NAME,
             **trading,
         })
 
@@ -317,15 +272,10 @@ def create_app(
         bn_key = secrets.get("binance_testnet_api_key") or ""
         pf_key = secrets.get("predict_fun_api_key") or ""
         return web.json_response({
-            "model_choices": DEEPSEEK_MODEL_CHOICES,
-            "base_url": review.base_url,
-            "model": review.model,
+            "review_engine": review_loop.ENGINE_NAME,
             "valid_sample_target": VALID_SAMPLE_TARGET,
             "settle": SETTLE_CONFIG,
             "config_version": overrides.current_version_label(),
-            "key_configured": bool(review.api_key),
-            "key_masked": ds.mask_key(review.api_key) if review.api_key else "",
-            "key_source": review.key_source,
             "binance_configured": bool(bn_key and secrets.get("binance_testnet_api_secret")),
             "binance_key_masked": mask_secret(bn_key) if bn_key else "",
             "binance_base_url": secrets.get("binance_testnet_base_url")
@@ -346,47 +296,6 @@ def create_app(
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
         return web.json_response({"ok": True, "strategy": row})
 
-    # ------------------------------------------------------------------ key
-    async def api_key_set(request):
-        body = await request.json()
-        key = (body.get("api_key") or "").strip()
-        if not key:
-            return web.json_response({"ok": False, "error": "api_key empty"}, status=400)
-        review.api_key = key
-        review.key_source = "panel"
-        if body.get("model"):
-            review.model = body["model"]
-        if body.get("base_url"):
-            review.base_url = body["base_url"].rstrip("/")
-        client = review.client()
-        try:
-            await client.verify()
-        except Exception as exc:
-            review.api_key = None
-            review.key_source = "none"
-            return web.json_response(
-                {"ok": False, "error": str(exc)}, status=400
-            )
-        save_secrets({
-            "deepseek_api_key": key,
-            "deepseek_model": review.model,
-            "deepseek_base_url": review.base_url,
-        })
-        return web.json_response({
-            "ok": True,
-            "key_masked": ds.mask_key(key),
-            "model": review.model,
-        })
-
-    async def api_key_clear(_request):
-        review.api_key = None
-        review.key_source = "none"
-        save_secrets({"deepseek_api_key": None})
-        if review._client:
-            await review._client.close()
-            review._client = None
-        return web.json_response({"ok": True})
-
     # ------------------------------------------------------------------ settle / review
     async def api_settle_run(_request):
         summary = await settle_pending(review.journal)
@@ -400,13 +309,7 @@ def create_app(
             except Exception:
                 body = {}
         force = bool(body.get("force"))
-        try:
-            client = review.client()
-        except ds.DeepSeekAuthError as exc:
-            return web.json_response({"ok": False, "error": str(exc)}, status=400)
-        proposal = await review_loop.run_review(
-            client, review.journal.all(), force=force
-        )
+        proposal = await review_loop.run_review(review.journal.all(), force=force)
         return web.json_response({"ok": True, "proposal": proposal.to_dict()})
 
     # ------------------------------------------------------------------ proposals / versions
@@ -834,8 +737,6 @@ def create_app(
     app.router.add_get("/api/config", api_config)
     app.router.add_get("/api/strategies", api_strategies)
     app.router.add_post("/api/strategies", api_strategy_add)
-    app.router.add_post("/api/key", api_key_set)
-    app.router.add_delete("/api/key", api_key_clear)
     app.router.add_post("/api/settle/run", api_settle_run)
     app.router.add_post("/api/review/run", api_review_run)
     app.router.add_get("/api/proposals", api_proposals)

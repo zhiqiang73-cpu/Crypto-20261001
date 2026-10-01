@@ -1,6 +1,8 @@
 """每日定时任务 — 02:00 CST 结算 / 注解 / 复盘 / 日总结.
 
 可被 PanelApp 挂到 asyncio 后台; 也支持手动 run_once().
+
+全部步骤均为纯算法, 不调用任何外部模型, 不需要 API Key。
 """
 
 from __future__ import annotations
@@ -18,10 +20,8 @@ from config.review import (
     DAILY_SUMMARY_HOUR_CST,
 )
 from config.weights import DIMENSION_WEIGHTS
-from review import deepseek as ds
-from review import meta_review, overrides, review_loop
+from review import meta_review, overrides, review_loop, statistical_review
 from review.journal import TradeJournal
-from review.prompts.daily_summary import build_daily_summary_messages
 from review.settle import settle_pending
 from review.stats import compute_stats
 
@@ -44,10 +44,8 @@ class DailyScheduler:
     def __init__(
         self,
         journal: Optional[TradeJournal] = None,
-        get_client=None,  # callable → DeepSeekClient | None
     ) -> None:
         self.journal = journal if journal is not None else TradeJournal().load()
-        self.get_client = get_client
         self.last_run: Optional[str] = None
         self.last_result: Dict[str, Any] = {}
         self._running = False
@@ -85,30 +83,20 @@ class DailyScheduler:
             result["steps"]["settle"] = {"error": str(exc)}
             logger.warning("settle: %s", exc)
 
-        client = None
-        if self.get_client:
-            try:
-                client = self.get_client()
-            except Exception as exc:
-                result["steps"]["client"] = {"error": str(exc)}
-
-        # 2. 错单注解
+        # 2. 错单注解 (统计引擎, 无 token 成本, 不再限条数)
         annotated = 0
-        if client is not None:
-            try:
-                stats = compute_stats(self.journal.all())
-                for rec in self.journal.all():
-                    if rec.status == "wrong" and not rec.model_note:
-                        await review_loop.annotate_error(
-                            client, rec, journal=self.journal,
-                            recent_stats=stats.to_dict(),
-                        )
-                        annotated += 1
-                        if annotated >= 15:  # 控 token
-                            break
-                result["steps"]["annotate"] = {"count": annotated}
-            except Exception as exc:
-                result["steps"]["annotate"] = {"error": str(exc)}
+        try:
+            stats = compute_stats(self.journal.all())
+            for rec in self.journal.all():
+                if rec.status == "wrong" and not rec.model_note:
+                    await review_loop.annotate_error(
+                        rec, journal=self.journal,
+                        recent_stats=stats.to_dict(),
+                    )
+                    annotated += 1
+            result["steps"]["annotate"] = {"count": annotated}
+        except Exception as exc:
+            result["steps"]["annotate"] = {"error": str(exc)}
 
         # 3. 自动回滚检查
         state = meta_review.load_meta_state()
@@ -135,10 +123,10 @@ class DailyScheduler:
             result["steps"]["rollback"] = {"error": str(exc)}
 
         # 4. 批次复盘 + 元评审门控 + 自动采纳
-        if client is not None and AUTO_ACCEPT_PROPOSALS and not state.observation_mode:
+        if AUTO_ACCEPT_PROPOSALS and not state.observation_mode:
             try:
                 proposal = await review_loop.run_review(
-                    client, self.journal.all(), force=False
+                    self.journal.all(), force=False
                 )
                 result["steps"]["review"] = {
                     "proposal_id": proposal.proposal_id,
@@ -182,59 +170,48 @@ class DailyScheduler:
                 "skipped": True,
                 "reason": (
                     "observation_mode" if state.observation_mode
-                    else ("no_client" if client is None else "auto_accept_off")
+                    else "auto_accept_off"
                 ),
             }
 
-        # 5. 日总结
+        # 5. 日总结 (统计引擎生成, 确定性)
         date_str = datetime.now(CST).strftime("%Y-%m-%d")
-        if client is not None:
-            try:
-                day_start = datetime.now(CST).replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                )
-                day_ms = int(day_start.timestamp() * 1000)
-                day_recs = [
-                    r for r in self.journal.all() if r.opened_at_ms >= day_ms
-                ]
-                stats = compute_stats(day_recs)
-                conv = meta_review.convergence_status(self.journal.all(), state)
-                weights = {
-                    f"short_term.{k}": v
-                    for k, v in DIMENSION_WEIGHTS["short_term"].items()
-                }
-                weights.update({
-                    f"long_term.{k}": v
-                    for k, v in DIMENSION_WEIGHTS["long_term"].items()
-                })
-                # 用生效参数覆盖
-                eff = overrides.effective_params()
-                for path, val in eff.items():
-                    if path.startswith("DIMENSION_WEIGHTS."):
-                        # DIMENSION_WEIGHTS.short_term.news → short_term.news
-                        parts = path.split(".")
-                        if len(parts) == 3:
-                            weights[f"{parts[1]}.{parts[2]}"] = val
+        try:
+            day_start = datetime.now(CST).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            day_ms = int(day_start.timestamp() * 1000)
+            day_recs = [r for r in self.journal.all() if r.opened_at_ms >= day_ms]
+            day_stats = compute_stats(day_recs)
+            conv = meta_review.convergence_status(self.journal.all(), state)
 
-                messages = build_daily_summary_messages(
-                    date_str, day_recs, stats.to_dict(), weights, conv
-                )
-                summary = await client.chat_json(messages)
-                out = {
-                    "date": date_str,
-                    "generated_at": datetime.now(CST).isoformat(),
-                    "summary": summary,
-                    "stats": stats.to_dict(),
-                    "convergence": conv,
-                }
-                DAILY_SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
-                path = DAILY_SUMMARIES_DIR / f"{date_str}.json"
-                path.write_text(
-                    json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
-                result["steps"]["daily_summary"] = {"path": str(path)}
-            except Exception as exc:
-                result["steps"]["daily_summary"] = {"error": str(exc)}
-                logger.warning("daily_summary: %s", exc)
+            weights = {
+                f"short_term.{k}": v
+                for k, v in DIMENSION_WEIGHTS["short_term"].items()
+            }
+            weights.update({
+                f"long_term.{k}": v
+                for k, v in DIMENSION_WEIGHTS["long_term"].items()
+            })
+            # 用生效参数覆盖
+            for path, val in overrides.effective_params().items():
+                if path.startswith("DIMENSION_WEIGHTS."):
+                    parts = path.split(".")
+                    if len(parts) == 3:
+                        weights[f"{parts[1]}.{parts[2]}"] = val
+
+            summary = statistical_review.build_daily_summary(
+                date_str, day_recs, day_stats, weights, conv
+            )
+            summary["generated_at"] = datetime.now(CST).isoformat()
+            DAILY_SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
+            path = DAILY_SUMMARIES_DIR / f"{date_str}.json"
+            path.write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            result["steps"]["daily_summary"] = {"path": str(path)}
+        except Exception as exc:
+            result["steps"]["daily_summary"] = {"error": str(exc)}
+            logger.warning("daily_summary: %s", exc)
 
         return result
