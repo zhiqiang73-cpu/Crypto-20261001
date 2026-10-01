@@ -1,0 +1,14 @@
+# crypto local secrets & runtime data
+runtime/secrets.json
+runtime/review/positions.json
+runtime/review/*.jsonl
+runtime/review/proposals/
+runtime/review/daily_summaries/
+runtime/strategies/registry.json
+.playwright-mcp/
+.manus/
+.tmp-router/
+__pycache__/
+*.pyc
+.DS_Store
+.env

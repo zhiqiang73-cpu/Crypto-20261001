@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BTC Quant Console</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">BQ</span><div><strong>BTC Quant</strong><small>TRADING OS</small></div></div>
+      <div class="mode-pill"><span class="dot amber"></span><div><b id="modeLabel">PAPER MODE</b><small>主网交易已锁定</small></div></div>
+      <nav class="nav">
+        <button class="nav-item active" data-view="overview"><span>01</span>总览</button>
+        <button class="nav-item" data-view="strategies"><span>02</span>策略中心</button>
+        <button class="nav-item" data-view="positions"><span>03</span>仓位与订单</button>
+        <button class="nav-item" data-view="journal"><span>04</span>交易日志</button>
+        <button class="nav-item" data-view="risk"><span>05</span>风控闸门</button>
+        <button class="nav-item" data-view="account"><span>06</span>账户连接</button>
+      </nav>
+      <div class="sidebar-bottom"><div class="server-state"><span class="dot green"></span><div><b>LOCAL ENGINE</b><small id="engineState">等待连接</small></div></div><small class="build">BUILD 0.1.0 · BTCUSDT</small></div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar"><div><p class="eyebrow">SYSTEM / BTCUSDT PERPETUAL</p><h1 id="pageTitle">交易总览</h1></div><div class="top-actions"><span class="sync"><span class="dot green"></span><span id="syncText">数据同步中</span></span><button class="ghost-btn" id="refreshBtn">刷新数据 <kbd>R</kbd></button></div></header>
+
+      <section class="view active" id="view-overview">
+        <div class="hero-grid">
+          <article class="hero-card"><div class="card-kicker">BINANCE MARK PRICE <span>· WS 1s</span></div><div class="hero-price" id="markPrice">连接中…</div><div class="price-change positive" id="priceChange">等待 Binance WebSocket <span>公开行情</span></div><div class="hero-spark"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></article>
+          <article class="metric-card"><div class="card-kicker">AVAILABLE BALANCE</div><div class="metric-value" id="balance">—</div><div class="metric-foot">USDT <span>后端账户接口</span></div></article>
+          <article class="metric-card"><div class="card-kicker">UNREALIZED PNL</div><div class="metric-value positive" id="upnl">+0.00</div><div class="metric-foot">USDT <span id="positionHint">无持仓</span></div></article>
+          <article class="metric-card accent-card"><div class="card-kicker">RISK HEALTH</div><div class="health-value"><span class="health-ring"></span><strong id="riskHealth">SAFE</strong></div><div class="metric-foot">新开仓 <span class="blocked">已锁定</span></div></article>
+        </div>
+
+        <div class="section-head"><div><p class="eyebrow">ACTIVE STRATEGIES</p><h2>策略运行状态</h2></div><button class="text-btn" data-nav="strategies">管理策略 →</button></div>
+        <div class="strategy-grid">
+          <article class="strategy-card"><div class="strategy-head"><span class="strategy-icon purple">MR</span><div><h3>BTC 均值回归</h3><p>15m · 双向 · Testnet</p></div><span class="tag paused">PAPER ONLY</span></div><div class="strategy-stats"><div><small>本轮信号</small><b>WAIT</b></div><div><small>胜率</small><b>—</b></div><div><small>风险预算</small><b>0.50%</b></div></div><div class="progress"><span style="width:24%"></span></div><div class="strategy-foot"><span>等待回测验收</span><button class="mini-btn">查看规则</button></div></article>
+          <article class="strategy-card"><div class="strategy-head"><span class="strategy-icon blue">TF</span><div><h3>BTC 趋势追踪</h3><p>1h · 双向 · Testnet</p></div><span class="tag paused">PAPER ONLY</span></div><div class="strategy-stats"><div><small>本轮信号</small><b>NEUTRAL</b></div><div><small>胜率</small><b>—</b></div><div><small>风险预算</small><b>0.50%</b></div></div><div class="progress"><span style="width:8%"></span></div><div class="strategy-foot"><span>尚未启用</span><button class="mini-btn">查看规则</button></div></article>
+          <button class="add-strategy" data-nav="strategies"><span>＋</span><b>导入 Claude 策略</b><small>JSON / 结论 / 规则</small></button>
+        </div>
+
+        <div class="lower-grid"><article class="panel"><div class="panel-head"><div><p class="eyebrow">EXECUTION</p><h2>最近活动</h2></div><button class="text-btn" data-nav="journal">查看全部 →</button></div><div class="activity-list" id="activityList"><div class="empty-state"><span>○</span><div><b>暂无真实成交</b><small>Paper 模式只记录信号，不发送订单</small></div></div></div></article><article class="panel risk-panel"><div class="panel-head"><div><p class="eyebrow">GUARDRAILS</p><h2>风控闸门</h2></div><span class="tag safe">ACTIVE</span></div><div class="guard-list"><div><span class="guard-icon">✓</span><div><b>主网交易锁</b><small>LIVE 模式未开放</small></div><strong>ON</strong></div><div><span class="guard-icon">✓</span><div><b>单笔风险上限</b><small>策略级预算</small></div><strong>0.50%</strong></div><div><span class="guard-icon">✓</span><div><b>保护单对账</b><small>RiskGuardian</small></div><strong>READY</strong></div><div><span class="guard-icon">✓</span><div><b>实现指纹</b><small>策略包需要重新封存</small></div><strong class="warn">REVIEW</strong></div></div></article></div>
+      </section>
+
+      <section class="view" id="view-strategies"><div class="section-head"><div><p class="eyebrow">STRATEGY CENTER</p><h2>把验证后的结论变成可审计策略</h2><p class="subline">只接受声明式规则，不执行任意代码。导入后默认为 Paper Only。</p></div><button class="primary-btn">＋ 导入策略</button></div><div class="import-box"><div class="drop-icon">↳</div><div><h3>拖入策略 JSON 或粘贴 Claude 结论</h3><p>支持均值回归、趋势追踪、突破和自定义信号。系统会校验风险、止盈止损和失效条件。</p></div><button class="ghost-btn">选择文件</button></div><div class="table-panel"><div class="table-head"><span>STRATEGY</span><span>KIND</span><span>TIMEFRAME</span><span>STATUS</span><span>RISK</span><span></span></div><div class="table-row"><b>BTC 均值回归</b><span>mean_reversion</span><span>15m</span><span class="tag paused">PAPER ONLY</span><span>0.50%</span><button class="text-btn">详情</button></div><div class="table-row"><b>BTC 趋势追踪</b><span>trend_following</span><span>1h</span><span class="tag paused">PAPER ONLY</span><span>0.50%</span><button class="text-btn">详情</button></div></div></section>
+
+      <section class="view" id="view-positions"><div class="section-head"><div><p class="eyebrow">POSITIONS & ORDERS</p><h2>仓位与订单</h2><p class="subline">先用 Paper 模式验证“限价入场 → 自动计算仓位 → 止盈/止损保护单”的完整编排。</p></div><span class="tag paused">PAPER · 0 EXCHANGE CALLS</span></div><div class="account-grid"><form class="account-form" id="paperOrderForm"><label>方向<select id="paperSide"><option value="LONG">做多 LONG</option><option value="SHORT">做空 SHORT</option></select></label><label>限价<input id="paperLimit" type="number" step="0.01" placeholder="留空使用当前 mark price"></label><label>名义金额 USDT<input id="paperNotional" type="number" step="1" value="100"></label><label>杠杆倍数<input id="paperLeverage" type="number" min="1" max="20" step="1" value="2"></label><label>止盈价<input id="paperTp" type="number" step="0.01" placeholder="自动计算 +0.5%"></label><label>止损价<input id="paperSl" type="number" step="0.01" placeholder="自动计算 -0.3%"></label><button class="primary-btn" type="submit">运行 Paper 限价单测试</button><button class="secondary-btn" type="button" id="paperCloseBtn">运行自动平仓测试</button><p class="form-note" id="paperOrderResult">不会访问 Binance 下单接口，不会产生真实订单。</p></form><div class="account-state" id="paperOrderSummary"><div class="card-kicker">ORDER ORCHESTRATION</div><div class="connection-big">等待测试</div><div class="account-line"><span>入场类型</span><b>LIMIT / GTC</b></div><div class="account-line"><span>保护单</span><b>TP + SL / REDUCE ONLY</b></div><div class="account-line"><span>仓位来源</span><b>名义金额 × 杠杆 ÷ 限价</b></div></div></div></section>
+      <section class="view" id="view-journal"><div class="section-head"><div><p class="eyebrow">TRADE JOURNAL</p><h2>交易日志</h2></div><button class="ghost-btn">导出 JSONL</button></div><div class="empty-large"><div class="empty-orb">≡</div><h3>等待第一条信号记录</h3><p>所有信号、成交、手续费、盈亏和复盘结论都会形成不可变记录。</p></div></section>
+      <section class="view" id="view-risk"><div class="section-head"><div><p class="eyebrow">RISK GUARDIAN</p><h2>风控闸门</h2></div><span class="tag safe">SYSTEM SAFE</span></div><div class="risk-overview"><div class="risk-score"><span>当前状态</span><strong>SAFE</strong><small>所有新开仓仍需人工验收</small></div><div class="risk-checks"><div><b>01</b><span>运行模式</span><strong>paper</strong></div><div><b>02</b><span>策略指纹</span><strong class="warn">drift detected</strong></div><div><b>03</b><span>主网访问</span><strong>blocked</strong></div><div><b>04</b><span>紧急停止</span><strong>ready</strong></div></div></div></section>
+      <section class="view" id="view-account"><div class="section-head"><div><p class="eyebrow">BINANCE FUTURES TESTNET</p><h2>账户连接</h2><p class="subline">密钥只提交到本机后端，保存到本地 secrets 文件；不会发送到聊天或主网。</p></div><span class="tag paused">TESTNET ONLY</span></div><div class="account-grid"><form class="account-form" id="accountForm"><label>API Key<input id="apiKeyInput" type="text" autocomplete="off" spellcheck="false" placeholder="粘贴新的 Testnet API Key" required></label><label>API Secret<input id="apiSecretInput" type="password" autocomplete="new-password" placeholder="粘贴新的 Testnet API Secret" required></label><label>Base URL<input id="baseUrlInput" type="url" value="https://testnet.binancefuture.com" required></label><button class="primary-btn" type="submit">保存并验证 Testnet 连接</button><button class="secondary-btn" type="button" id="testnetSmokeBtn">Testnet 0.001 BTC 入场后立即平仓</button><button class="secondary-btn" type="button" id="testnetFlattenBtn">立即平掉当前 Testnet 仓位</button><p class="form-note" id="accountResult">尚未提交密钥。请确认使用的是重新生成的 Testnet Key。</p></form><div class="account-state"><div class="card-kicker">CONNECTION STATE</div><div class="connection-big" id="accountConnection">未配置</div><div class="account-line"><span>账户余额</span><b id="accountBalance">—</b></div><div class="account-line"><span>交易所仓位</span><b id="accountPosition">—</b></div><div class="account-line"><span>交易权限</span><b class="blocked">Paper / Testnet</b></div></div></div></section>
+    </main>
+  </div>
+  <script src="/app.js?v=4"></script>
+</body>
+</html>
