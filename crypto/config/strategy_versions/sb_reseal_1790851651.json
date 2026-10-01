@@ -1,0 +1,1113 @@
+{
+  "schema_version": "strategy_bundle.v1",
+  "strategy_version": "sb_reseal_1790851651",
+  "parent_version": "sb_m2_current_baseline",
+  "created_at_ms": 1790851651657,
+  "change_reason": "round5 P0 fixes: reconcile_now + limit order state machine",
+  "parameters": {
+    "DIMENSION_WEIGHTS": {
+      "long_term": {
+        "news": 0.35,
+        "data": 0.3,
+        "tech": 0.15,
+        "prediction": 0.2
+      },
+      "short_term": {
+        "news": 0.15,
+        "data": 0.45,
+        "tech": 0.25,
+        "prediction": 0.15
+      }
+    },
+    "DECISION_THRESHOLDS": {
+      "strong_long": 60.0,
+      "standard_long": 35.0,
+      "watch_long": 10.0,
+      "neutral_upper": 8,
+      "neutral_lower": -8,
+      "watch_short": -8,
+      "standard_short": -40.0,
+      "strong_short": -65.0
+    },
+    "SAFETY_VALVE_THRESHOLD": 50.0,
+    "NEWS_SUB_WEIGHTS": {
+      "long_term": {
+        "monetary_policy": 0.25,
+        "etf_flows": 0.2,
+        "regulations": 0.15,
+        "macro_data": 0.18,
+        "institutional_gov": 0.08,
+        "halving": 0.05,
+        "usdt_dynamics": 0.05,
+        "black_swan": 0.04
+      },
+      "short_term_normal": {
+        "breaking_crypto": 0.35,
+        "whale_institutional": 0.25,
+        "regulatory_event": 0.15,
+        "macro_surprise": 0.15,
+        "black_swan": 0.1
+      }
+    },
+    "DATA_LAYER_WEIGHTS": {
+      "long_term": {
+        "onchain": 0.8,
+        "derivatives": 0.12,
+        "microstructure": 0.08
+      },
+      "short_term": {
+        "onchain": 0.14285714285714285,
+        "derivatives": 0.5714285714285714,
+        "microstructure": 0.2857142857142857
+      }
+    },
+    "ONCHAIN_INDICATOR_WEIGHTS": {
+      "long_term": {
+        "exchange_reserves": 0.0,
+        "mvrv": 0.0,
+        "price_momentum_24h": 0.15,
+        "lth_supply_ratio": 0.0,
+        "nupl": 0.0,
+        "miner_reserves": 0.0,
+        "usdt_market_cap": 0.0,
+        "sopr": 0.0,
+        "whale_transfers": 0.45,
+        "hashrate": 0.4
+      },
+      "short_term": {
+        "whale_transfers": 1.0,
+        "exchange_reserves": 0.0,
+        "mvrv": 0,
+        "price_momentum_24h": 0.0,
+        "lth_supply_ratio": 0,
+        "nupl": 0,
+        "miner_reserves": 0,
+        "usdt_market_cap": 0,
+        "sopr": 0,
+        "hashrate": 0
+      }
+    },
+    "DERIVATIVES_INDICATOR_WEIGHTS": {
+      "long_term": {
+        "implied_volatility": 0.37,
+        "open_interest": 0.22,
+        "funding_rate": 0.15,
+        "option_max_pain": 0.15,
+        "long_short_ratio": 0.05,
+        "liquidation_heatmap": 0.0,
+        "cvd": 0.06,
+        "liquidations_realtime": 0
+      },
+      "short_term": {
+        "funding_rate": 0.32,
+        "liquidation_heatmap": 0.0,
+        "open_interest": 0.28,
+        "cvd": 0.22,
+        "liquidations_realtime": 0.1,
+        "long_short_ratio": 0.04,
+        "option_max_pain": 0.02,
+        "implied_volatility": 0.02
+      }
+    },
+    "MICROSTRUCTURE_INDICATOR_WEIGHTS": {
+      "long_term": {
+        "block_trades": 0.4,
+        "session_liquidity": 0.4,
+        "orderbook_depth": 0.1,
+        "spread": 0.1,
+        "liquidation_speed": 0,
+        "oi_velocity": 0
+      },
+      "short_term": {
+        "orderbook_depth": 0.28,
+        "liquidation_speed": 0.25,
+        "block_trades": 0.2,
+        "oi_velocity": 0.12,
+        "spread": 0.08,
+        "session_liquidity": 0.07
+      }
+    },
+    "TECH_INDICATOR_WEIGHTS": {
+      "long_term": {
+        "market_structure": 0.16,
+        "ema_stack": 0.07,
+        "volume_profile": 0.12,
+        "support_resistance": 0.1,
+        "vwap": 0.04,
+        "pdh_pdl": 0.06,
+        "rsi_divergence": 0.13,
+        "macd_hist": 0.12,
+        "volume": 0.08,
+        "obv": 0.04,
+        "pin_bar": 0.04,
+        "engulfing": 0.02,
+        "inside_bar": 0.02,
+        "fibonacci": 0.0,
+        "order_blocks": 0.0,
+        "fvg": 0.0
+      },
+      "short_term": {
+        "market_structure": 0.18,
+        "ema_stack": 0.06,
+        "volume_profile": 0.1,
+        "support_resistance": 0.08,
+        "vwap": 0.05,
+        "pdh_pdl": 0.08,
+        "rsi_divergence": 0.12,
+        "macd_hist": 0.1,
+        "volume": 0.1,
+        "obv": 0.03,
+        "pin_bar": 0.05,
+        "engulfing": 0.03,
+        "inside_bar": 0.02,
+        "fibonacci": 0.0,
+        "order_blocks": 0.0,
+        "fvg": 0.0
+      }
+    },
+    "PREDICTION_SUB_WEIGHTS": {
+      "long_term": {
+        "predict_fun_btc": 0.25,
+        "polymarket_prob": 0.3,
+        "prob_change_speed": 0.0,
+        "fedwatch_proxy": 0.15,
+        "fear_greed": 0.1,
+        "max_pain": 0.1
+      },
+      "short_term": {
+        "predict_fun_btc": 0.45,
+        "polymarket_prob": 0.2,
+        "fedwatch_proxy": 0.1,
+        "fear_greed": 0.1,
+        "max_pain": 0.15
+      }
+    },
+    "ADX_STRONG": 40.0,
+    "ADX_WEAK": 20.0,
+    "ADX_BOOST": 1.2,
+    "ADX_DAMPEN": 0.6,
+    "BOLL_SQUEEZE_PERCENTILE": 0.1,
+    "BOLL_SQUEEZE_BOOST": 1.15,
+    "ENABLE_AGREEMENT_BOOST": false,
+    "AGREEMENT_BOOST_LO": 0.7,
+    "AGREEMENT_BOOST_HI": 1.3,
+    "ENABLE_CONSISTENCY_DAMPING": false,
+    "COLLINEAR_GROUPS": {
+      "whale": {
+        "faces": [
+          "news",
+          "data"
+        ],
+        "news_keys": [
+          "whale_institutional"
+        ],
+        "data_keys": [
+          "whale_transfers"
+        ],
+        "max_combined_face_contrib": 0.35
+      },
+      "structure_ema_vwap": {
+        "tech_keys": [
+          "market_structure",
+          "ema_stack",
+          "vwap"
+        ],
+        "note": "V8.2 已降权, 保留观察"
+      }
+    },
+    "RISK_PER_TRADE_PCT": {
+      "short_term": 0.005,
+      "long_term": 0.01
+    },
+    "MAX_NOTIONAL_PCT": {
+      "short_term": 0.5,
+      "long_term": 0.4
+    },
+    "TOTAL_MAX_NOTIONAL_PCT": 0.6,
+    "LEVERAGE_SHORT_TERM": 2,
+    "LEVERAGE_LONG_TERM": 3,
+    "POSITION_CS_STRONG_MULT": 1.5,
+    "POSITION_CS_STRONG_THRESHOLD": 35.0,
+    "POSITION_CONF_LOW_THRESHOLD": 0.6,
+    "POSITION_CONF_LOW_MULT": 0.7,
+    "POSITION_ATR_HIGH_MULT": 0.5,
+    "POSITION_ATR_HIGH_RATIO": 2.0,
+    "EXIT_STRATEGY": {
+      "short_term": {
+        "tp1_atr": 1.2,
+        "tp1_pct": 0.012,
+        "tp1_close_pct": 0.5,
+        "tp2_atr": 2.5,
+        "tp2_pct": 0.025,
+        "tp2_close_pct": 0.3,
+        "trailing_atr": 1.0,
+        "trailing_pct": 0.01,
+        "hard_sl_atr": 1.0,
+        "hard_sl_pct": 0.01,
+        "time_stop_min": 75,
+        "time_stop_min_pnl": 0.001,
+        "cs_decay_threshold": 15,
+        "cs_decay_close_pct": 0.5,
+        "weekly_review": false,
+        "tighten_trailing_pct": 0.006,
+        "tighten_trailing_atr": 0.6,
+        "liq_force_usd": 100000000,
+        "spread_force_mult": 3.0
+      },
+      "long_term": {
+        "tp1_atr": 2.0,
+        "tp1_pct": 0.05,
+        "tp1_close_pct": 0.3,
+        "tp2_atr": 4.0,
+        "tp2_pct": 0.1,
+        "tp2_close_pct": 0.3,
+        "trailing_atr": 1.5,
+        "trailing_pct": 0.03,
+        "hard_sl_atr": 2.0,
+        "hard_sl_pct": 0.04,
+        "time_stop_min": null,
+        "time_stop_min_pnl": null,
+        "cs_decay_threshold": 15,
+        "cs_decay_close_pct": 0.5,
+        "weekly_review": true,
+        "tighten_trailing_pct": 0.015,
+        "tighten_trailing_atr": 0.8,
+        "liq_force_usd": 100000000,
+        "spread_force_mult": 3.0
+      }
+    },
+    "STALENESS_LIMITS": {
+      "mark_price": 60.0,
+      "binance": 60.0,
+      "klines": 300.0,
+      "funding": 600.0,
+      "polymarket": 600.0,
+      "predict_fun": 300.0,
+      "news": 900.0,
+      "onchain": 3600.0,
+      "default": 300.0
+    },
+    "PRETRADE_LIMITS": {
+      "signal_ttl_sec": 120.0,
+      "max_quote_age_sec": 5.0,
+      "max_adverse_atr": 0.5,
+      "max_spread_bps": 8.0,
+      "min_remaining_rr": 0.8
+    },
+    "MAPPING": {
+      "CPI_YOY_CHANGE_ANCHORS": [
+        [
+          -0.02,
+          70.0
+        ],
+        [
+          -0.005,
+          40.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.005,
+          -40.0
+        ],
+        [
+          0.02,
+          -70.0
+        ]
+      ],
+      "DXY_TREND_ANCHORS": [
+        [
+          -0.03,
+          70.0
+        ],
+        [
+          -0.01,
+          30.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.01,
+          -30.0
+        ],
+        [
+          0.03,
+          -70.0
+        ]
+      ],
+      "ETF_DAILY_FLOW_ANCHORS": [
+        [
+          -1000000000,
+          -90.0
+        ],
+        [
+          -200000000,
+          -70.0
+        ],
+        [
+          -50000000,
+          0.0
+        ],
+        [
+          50000000,
+          0.0
+        ],
+        [
+          200000000,
+          70.0
+        ],
+        [
+          1000000000,
+          90.0
+        ]
+      ],
+      "INDPRO_YOY_ANCHORS": [
+        [
+          -0.05,
+          -30.0
+        ],
+        [
+          -0.02,
+          -30.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.02,
+          15.0
+        ],
+        [
+          0.04,
+          30.0
+        ],
+        [
+          0.08,
+          30.0
+        ]
+      ],
+      "M2_YOY_ANCHORS": [
+        [
+          -0.05,
+          -40.0
+        ],
+        [
+          -0.02,
+          -40.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.05,
+          30.0
+        ],
+        [
+          0.08,
+          60.0
+        ],
+        [
+          0.15,
+          60.0
+        ]
+      ],
+      "USDT_NET_MINT_ANCHORS": [
+        [
+          -50000000,
+          -80.0
+        ],
+        [
+          -5000000,
+          -50.0
+        ],
+        [
+          -500000,
+          -20.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          500000,
+          20.0
+        ],
+        [
+          5000000,
+          50.0
+        ],
+        [
+          50000000,
+          80.0
+        ]
+      ],
+      "YIELD_CURVE_ANCHORS": [
+        [
+          -1.5,
+          -60.0
+        ],
+        [
+          -0.5,
+          -30.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.5,
+          20.0
+        ],
+        [
+          1.5,
+          40.0
+        ]
+      ],
+      "FUNDING_RATE_ANCHORS": [
+        [
+          -0.5,
+          90.0
+        ],
+        [
+          -0.3,
+          90.0
+        ],
+        [
+          -0.1,
+          50.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.1,
+          -50.0
+        ],
+        [
+          0.3,
+          -90.0
+        ],
+        [
+          0.5,
+          -90.0
+        ]
+      ],
+      "CVD_5M_ANCHORS": [
+        [
+          -50000000,
+          -80.0
+        ],
+        [
+          -10000000,
+          -40.0
+        ],
+        [
+          -2000000,
+          0.0
+        ],
+        [
+          2000000,
+          0.0
+        ],
+        [
+          10000000,
+          40.0
+        ],
+        [
+          50000000,
+          80.0
+        ]
+      ],
+      "HEATMAP_MAGNET_ANCHORS": [
+        [
+          -1.0,
+          -70.0
+        ],
+        [
+          -0.5,
+          -35.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.5,
+          35.0
+        ],
+        [
+          1.0,
+          70.0
+        ]
+      ],
+      "OI_CHANGE_5M_ANCHORS": [
+        [
+          -0.08,
+          80.0
+        ],
+        [
+          -0.03,
+          60.0
+        ],
+        [
+          -0.01,
+          20.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.02,
+          -10.0
+        ],
+        [
+          0.05,
+          -30.0
+        ],
+        [
+          0.06,
+          -50.0
+        ]
+      ],
+      "LIQ_REALTIME_USD_ANCHORS": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          10000000,
+          20.0
+        ],
+        [
+          50000000,
+          70.0
+        ],
+        [
+          150000000,
+          90.0
+        ]
+      ],
+      "LIQ_SPEED_CLEARED_ANCHORS": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.4,
+          30.0
+        ],
+        [
+          0.8,
+          80.0
+        ],
+        [
+          1.0,
+          95.0
+        ]
+      ],
+      "LONG_SHORT_RATIO_ANCHORS": [
+        [
+          0.0,
+          60.0
+        ],
+        [
+          0.5,
+          60.0
+        ],
+        [
+          1.0,
+          0.0
+        ],
+        [
+          1.5,
+          0.0
+        ],
+        [
+          2.5,
+          -60.0
+        ],
+        [
+          4.0,
+          -60.0
+        ]
+      ],
+      "IV_ANCHORS": [
+        [
+          0.0,
+          60.0
+        ],
+        [
+          0.4,
+          60.0
+        ],
+        [
+          0.5,
+          0.0
+        ],
+        [
+          0.6,
+          0.0
+        ],
+        [
+          0.7,
+          -20.0
+        ],
+        [
+          0.8,
+          -40.0
+        ],
+        [
+          1.2,
+          -40.0
+        ]
+      ],
+      "MAX_PAIN_DISTANCE_ANCHORS": [
+        [
+          -0.15,
+          40.0
+        ],
+        [
+          -0.05,
+          40.0
+        ],
+        [
+          -0.01,
+          0.0
+        ],
+        [
+          0.01,
+          0.0
+        ],
+        [
+          0.05,
+          -40.0
+        ],
+        [
+          0.15,
+          -40.0
+        ]
+      ],
+      "BID_ASK_RATIO_ANCHORS": [
+        [
+          0.0,
+          -60.0
+        ],
+        [
+          0.5,
+          -60.0
+        ],
+        [
+          0.8,
+          -20.0
+        ],
+        [
+          1.0,
+          0.0
+        ],
+        [
+          1.5,
+          20.0
+        ],
+        [
+          2.0,
+          60.0
+        ],
+        [
+          3.0,
+          60.0
+        ]
+      ],
+      "WHALE_NET_BTC_ANCHORS": [
+        [
+          -5000.0,
+          90.0
+        ],
+        [
+          -1000.0,
+          70.0
+        ],
+        [
+          -200.0,
+          20.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          200.0,
+          -20.0
+        ],
+        [
+          1000.0,
+          -70.0
+        ],
+        [
+          5000.0,
+          -90.0
+        ]
+      ],
+      "HASHRATE_CHANGE_ANCHORS": [
+        [
+          -0.2,
+          -30.0
+        ],
+        [
+          -0.1,
+          -30.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.05,
+          30.0
+        ],
+        [
+          0.15,
+          30.0
+        ]
+      ],
+      "EXCHANGE_RESERVES_PROXY_ANCHORS": [
+        [
+          -1.0,
+          70.0
+        ],
+        [
+          -0.5,
+          35.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.5,
+          -35.0
+        ],
+        [
+          1.0,
+          -70.0
+        ]
+      ],
+      "MVRV_ANCHORS": [
+        [
+          0.5,
+          90.0
+        ],
+        [
+          1.0,
+          90.0
+        ],
+        [
+          1.5,
+          60.0
+        ],
+        [
+          2.0,
+          0.0
+        ],
+        [
+          2.5,
+          0.0
+        ],
+        [
+          3.5,
+          -40.0
+        ],
+        [
+          5.0,
+          -80.0
+        ]
+      ],
+      "PREDICT_FUN_UP_ANCHORS": [
+        [
+          0.0,
+          -90.0
+        ],
+        [
+          0.3,
+          -60.0
+        ],
+        [
+          0.45,
+          -20.0
+        ],
+        [
+          0.5,
+          0.0
+        ],
+        [
+          0.55,
+          20.0
+        ],
+        [
+          0.7,
+          60.0
+        ],
+        [
+          1.0,
+          90.0
+        ]
+      ],
+      "FEAR_GREED_ANCHORS": [
+        [
+          0.0,
+          80.0
+        ],
+        [
+          20.0,
+          50.0
+        ],
+        [
+          40.0,
+          15.0
+        ],
+        [
+          50.0,
+          0.0
+        ],
+        [
+          60.0,
+          -15.0
+        ],
+        [
+          80.0,
+          -50.0
+        ],
+        [
+          100.0,
+          -80.0
+        ]
+      ],
+      "PROBABILITY_CHANGE_ANCHORS": [
+        [
+          -0.5,
+          -100.0
+        ],
+        [
+          -0.3,
+          -90.0
+        ],
+        [
+          -0.1,
+          -30.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.1,
+          30.0
+        ],
+        [
+          0.3,
+          90.0
+        ],
+        [
+          0.5,
+          100.0
+        ]
+      ],
+      "PROBABILITY_ANCHORS": [
+        [
+          0.0,
+          -90.0
+        ],
+        [
+          0.15,
+          -80.0
+        ],
+        [
+          0.4,
+          -30.0
+        ],
+        [
+          0.5,
+          0.0
+        ],
+        [
+          0.6,
+          30.0
+        ],
+        [
+          0.85,
+          80.0
+        ],
+        [
+          1.0,
+          100.0
+        ]
+      ],
+      "RELATIVE_PROB_DELTA_ANCHORS": [
+        [
+          -0.4,
+          -80.0
+        ],
+        [
+          -0.2,
+          -50.0
+        ],
+        [
+          -0.1,
+          -25.0
+        ],
+        [
+          -0.05,
+          -10.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.05,
+          10.0
+        ],
+        [
+          0.1,
+          25.0
+        ],
+        [
+          0.2,
+          50.0
+        ],
+        [
+          0.4,
+          80.0
+        ]
+      ],
+      "NEUTRAL_PROB_BY_REL": [
+        [
+          0.0,
+          0.5
+        ],
+        [
+          0.01,
+          0.35
+        ],
+        [
+          0.02,
+          0.25
+        ],
+        [
+          0.03,
+          0.18
+        ],
+        [
+          0.05,
+          0.1
+        ],
+        [
+          0.1,
+          0.03
+        ],
+        [
+          0.2,
+          0.01
+        ]
+      ],
+      "FEDWATCH_PROXY_ANCHORS": [
+        [
+          -1.0,
+          -90.0
+        ],
+        [
+          -0.85,
+          -80.0
+        ],
+        [
+          -0.6,
+          -50.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.6,
+          50.0
+        ],
+        [
+          0.85,
+          80.0
+        ],
+        [
+          1.0,
+          90.0
+        ]
+      ],
+      "FEDWATCH_CUT_ONLY_ANCHORS": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.4,
+          0.0
+        ],
+        [
+          0.6,
+          40.0
+        ],
+        [
+          0.85,
+          80.0
+        ],
+        [
+          1.0,
+          90.0
+        ]
+      ],
+      "FEDWATCH_HIKE_ONLY_ANCHORS": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.4,
+          0.0
+        ],
+        [
+          0.6,
+          -40.0
+        ],
+        [
+          0.85,
+          -80.0
+        ],
+        [
+          1.0,
+          -90.0
+        ]
+      ],
+      "BLACK_SWAN_LIQ_5M_USD": 200000000,
+      "SPREAD_BLACK_SWAN_MULT": 5.0,
+      "SPREAD_DANGER_MULT": 3.0,
+      "OI_DROP_5M_PCT": 0.03,
+      "OI_EXTREME_BUILD_24H_PCT": 0.15,
+      "FUNDING_EXTREME_ANNUAL_PCT": 0.3,
+      "FUNDING_NORMAL_ANNUAL_PCT": 0.1,
+      "SESSION_ASIA_MULTIPLIER": 0.7,
+      "SESSION_US_MULTIPLIER": 1.0,
+      "WHALE_EXCHANGE_BTC_THRESHOLD": 1000.0
+    }
+  },
+  "parameters_hash": "68bd5ec75ce4b9c801b8213a062dad9f15e5d6bf7eba594573f57102ac27fbe7",
+  "implementation_id": "5ceb9b4aacc6720400e696091c1b4b4715e8b64b5c129815300d4fb0cf3a37f3",
+  "strategy_identity": "26d55da50b4e76bf628a69d9e11113959452712afd6c710e10eaad15088a2def",
+  "migration_note": "re-sealed against implementation_id 5ceb9b4aacc6; previous sealed a4620e22ebec",
+  "unknown_historical_fields": [],
+  "load_ok": true,
+  "load_error": ""
+}

@@ -21,6 +21,7 @@ from config.strategy_bundle import (
     collect_factory_parameters,
     compose_legacy_active_bundle,
     compute_implementation_id,
+    deep_unfreeze,
     make_bundle,
     apply_flat_overlays,
 )
@@ -151,6 +152,76 @@ def rollback_strategy(
         require_impl_match=True,
         reason=reason,
     )
+
+
+def reseal_active_strategy(
+    *,
+    dir_path: Optional[Path] = None,
+    active_file: Optional[Path] = None,
+    reason: str = "",
+    note: str = "",
+) -> StrategyBundle:
+    """按当前实现指纹重新封存 ACTIVE 策略，建立新基线（历史版本保持不可变）。
+
+    用于代码演进导致 implementation_id 漂移时**显式地**建立新基线，
+    而不是关闭校验静默放行。行为：
+
+      * 参数继承当前 ACTIVE 策略（不改策略数值）
+      * implementation_id 取当前代码指纹
+      * 生成全新版本号，绝不覆盖历史版本文件
+      * 记录 parent_version、change_reason 与迁移说明，保证可审计
+    """
+    root = dir_path or STRATEGY_VERSIONS_DIR
+    active = active_file or STRATEGY_ACTIVE_FILE
+    current_impl = compute_implementation_id()
+    name = active_strategy_name(active)
+
+    parent: Optional[StrategyBundle] = None
+    if name:
+        try:
+            parent = bundle_from_document(
+                load_strategy_document(name, dir_path=root), verify_hash=True
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+            logger.warning("reseal: 无法读取当前 ACTIVE %s: %s", name, exc)
+            parent = None
+
+    if parent is not None and parent.load_ok:
+        parameters = deep_unfreeze(parent.parameters)
+        parent_version: Optional[str] = parent.strategy_version
+        previous_impl = parent.implementation_id
+    else:
+        parameters = collect_factory_parameters()
+        parent_version = name
+        previous_impl = ""
+
+    new_version = f"sb_reseal_{int(time.time())}"
+    bundle = make_bundle(
+        strategy_version=new_version,
+        parameters=parameters,
+        parent_version=parent_version,
+        change_reason=reason or "implementation_id_reseal",
+        migration_note=note or (
+            f"re-sealed against implementation_id {current_impl[:12]}; "
+            f"previous sealed {(previous_impl or 'none')[:12]}"
+        ),
+        implementation_id=current_impl,
+    )
+    if not bundle.load_ok:
+        raise ValueError(f"reseal produced invalid bundle: {bundle.load_error}")
+    write_strategy_version(bundle, dir_path=root)
+    activate_strategy(
+        new_version,
+        dir_path=root,
+        active_file=active,
+        require_impl_match=True,
+        reason=reason or "implementation_id_reseal",
+    )
+    logger.warning(
+        "strategy re-sealed: %s (parent=%s) impl %s → %s",
+        new_version, parent_version, (previous_impl or "none")[:12], current_impl[:12],
+    )
+    return bundle
 
 
 def load_active_bundle(
