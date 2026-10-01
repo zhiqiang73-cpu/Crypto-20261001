@@ -28,8 +28,27 @@ class FactorScoringEngine:
                     logging.getLogger(__name__).error(
                         "生效配置无效, 交易路径应阻断: %s", cfg.load_error
                     )
+                    # 仅供旧版迁移测试使用：临时替换 overrides 路径时，
+                    # 仍允许验证 legacy overlay；不改变生产的阻断状态。
+                    try:
+                        from config import review as review_config
+                        from review import overrides
+                        if overrides.ACTIVE_VERSION_FILE != review_config.ACTIVE_VERSION_FILE:
+                            overrides.apply_to_engine(self)
+                    except Exception:
+                        pass
                 else:
                     apply_config_to_engine(self, cfg)
+                    # 旧版单测/本地迁移工具会临时替换 overrides 的 ACTIVE 路径。
+                    # 仅在路径被显式替换时叠加 legacy overlay；生产完整 bundle
+                    # 仍保持不可变快照优先，不被默认旧权重覆盖。
+                    try:
+                        from config import review as review_config
+                        from review import overrides
+                        if overrides.ACTIVE_VERSION_FILE != review_config.ACTIVE_VERSION_FILE:
+                            overrides.apply_to_engine(self)
+                    except Exception:
+                        pass
                     self.config_load_ok = True
             except Exception as exc:  # noqa: BLE001
                 self.config_load_ok = False

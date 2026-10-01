@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover
 
 from config.review import BINANCE_TESTNET_DEFAULT_BASE, TRADING_SYMBOL
 from config.secrets import get_secret, mask_secret
+from trading.runtime_mode import validate_exchange_target
 from trading.models import AccountBalance, ManagedOrder, OrderResult, OrderState, PositionInfo
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ class BinanceTestnetClient:
             or get_secret("binance_testnet_base_url")
             or BINANCE_TESTNET_DEFAULT_BASE
         ).rstrip("/")
+        validate_exchange_target(self.base_url)
         self.symbol = symbol
         self.timeout_sec = timeout_sec
         self._session: Optional[Any] = None
