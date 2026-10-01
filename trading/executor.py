@@ -599,6 +599,20 @@ class TradeExecutor:
             "allow_new_entries": self.manager._allow_new_entries,
         }
 
+    async def reconcile(self, *, reason: str = "manual") -> dict:
+        """从交易所实时状态重新对账，必要时解除开仓阻塞。
+
+        只读交易所状态并更新本地账本，不主动下单；孤立仓需人工决定归属或平仓。
+        """
+        result = await self.manager.reconcile_now(reason=reason)
+        if self.guardian and not self.manager.active_positions():
+            try:
+                await self.guardian.release_protection_if_flat(True)
+            except Exception as exc:
+                result.setdefault("warnings", []).append(f"release_protection: {exc}")
+        result["guardian"] = self.guardian.status() if self.guardian else None
+        return result
+
     async def force_close(self, horizon: str) -> Optional[dict]:
         act = await self.manager.force_close(horizon)
         if act:

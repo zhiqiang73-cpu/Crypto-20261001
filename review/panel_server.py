@@ -471,79 +471,171 @@ def create_app(
         return web.json_response({"ok": True, "action": act})
 
     async def api_testnet_limit_then_close(request):
-        """One-shot, user-confirmed Testnet smoke test: LIMIT entry then reduce-only close."""
+        """受控 Testnet 冒烟测试：限价入场后立即 reduceOnly 平仓。
+
+        限价单改走 client.place_limit_order（提交后轮询确认），
+        不再把刚提交的 NEW 状态误判为失败并取消。
+        无论成功与否，结束前都会重新对账，避免留下陈旧的开仓阻塞。
+        """
         client = review.executor.client
         if not client.configured:
-            return web.json_response({"ok": False, "error": "binance_keys_missing"}, status=400)
-        body = await request.json()
-        qty = float(body.get("quantity") or 0.001)
-        if qty != 0.001:
-            return web.json_response({"ok": False, "error": "smoke test only permits quantity=0.001 BTC"}, status=400)
-        before = await client.get_position()
-        if getattr(before, "quantity", 0) and abs(float(before.quantity)) > 1e-12:
-            return web.json_response({"ok": False, "error": "account is not flat; refusing to mix with existing position"}, status=409)
-        mark = float(await client.mark_price())
-        info = await client.exchange_info()
-        tick = 0.1
-        for symbol_info in info.get("symbols") or []:
-            if symbol_info.get("symbol") != client.symbol:
-                continue
-            for f in symbol_info.get("filters") or []:
-                if f.get("filterType") == "PRICE_FILTER":
-                    tick = float(f.get("tickSize") or tick)
-        raw_price = mark * 1.01
-        price = round(round(raw_price / tick) * tick, 8)  # valid tick, marketable BUY limit
-        step = await client._lot_step()
-        qty = client._qty_precision(qty, step)
-        cid = f"smoke{int(asyncio.get_event_loop().time() * 1000) % 10_000_000_000}"
+            return web.json_response(
+                {"ok": False, "stage": "preflight", "error": "binance_keys_missing"},
+                status=400,
+            )
         try:
-            raw = await client._request("POST", "/fapi/v1/order", {
-                "symbol": client.symbol, "side": "BUY", "type": "LIMIT",
-                "timeInForce": "IOC", "quantity": qty, "price": price,
-                "newClientOrderId": cid,
-            }, signed=True)
+            body = await request.json()
+        except Exception:
+            body = {}
+        qty = float((body or {}).get("quantity") or 0.001)
+        if qty != 0.001:
+            return web.json_response(
+                {"ok": False, "stage": "preflight",
+                 "error": "smoke test only permits quantity=0.001 BTC"},
+                status=400,
+            )
+        try:
+            before = await client.get_position()
+            if abs(float(getattr(before, "quantity", 0) or 0)) > 1e-12:
+                return web.json_response({
+                    "ok": False, "stage": "preflight",
+                    "error": "account is not flat; refusing to mix with existing position",
+                    "position_before": {"side": before.side, "quantity": before.quantity},
+                }, status=409)
+            mark = float(await client.mark_price())
+            # 买入价高于 mark 1%，作为吃单限价确保立即成交
+            entry = await client.place_limit_order(
+                "LONG", qty, mark * 1.01,
+                time_in_force="IOC",
+                fill_timeout_sec=6.0,
+                poll_interval_sec=0.5,
+                cancel_if_unfilled=True,
+            )
+            filled = float(entry.cum_filled_qty or entry.filled_qty or 0)
+            if filled <= 0:
+                recon = await review.executor.reconcile(
+                    reason="testnet_smoke_entry_unfilled"
+                )
+                after_unfilled = await client.get_position()
+                return web.json_response({
+                    "ok": False, "stage": "entry",
+                    "error": "limit_not_filled",
+                    "entry_order": entry.__dict__,
+                    "mark_at_submit": mark,
+                    "position_after": {
+                        "side": after_unfilled.side,
+                        "quantity": after_unfilled.quantity,
+                    },
+                    "reconciliation": recon,
+                }, status=409)
+            close = await client.market_open("SHORT", filled, reduce_only=True)
+            after = await client.get_position()
+            flat = abs(float(getattr(after, "quantity", 0) or 0)) <= 1e-12
+            recon = await review.executor.reconcile(reason="testnet_smoke_done")
+            return web.json_response({
+                "ok": bool(close.ok and flat),
+                "stage": "done",
+                "entry_order": entry.__dict__,
+                "close_order": close.__dict__,
+                "filled_qty": filled,
+                "position_before": {"side": before.side, "quantity": before.quantity},
+                "position_after": {"side": after.side, "quantity": after.quantity},
+                "entry_avg_price": entry.avg_price or 0,
+                "mark_at_submit": mark,
+                "flat_verified": flat,
+                "reconciliation": recon,
+            }, status=200 if (close.ok and flat) else 502)
         except Exception as exc:
-            return web.json_response({"ok": False, "stage": "entry", "error": str(exc), "position_after": {"side": "UNKNOWN"}}, status=502)
-        entry = client._raw_to_managed(raw, client_order_id=cid)
-        if entry.state.value not in ("FILLED", "PARTIALLY_FILLED"):
-            await client.cancel_order(order_id=entry.exchange_order_id, symbol=client.symbol)
-            return web.json_response({"ok": False, "stage": "entry", "entry_order": entry.to_order_result().__dict__, "error": "limit_not_filled_cancelled"}, status=409)
-        filled = float(entry.filled_qty or entry.cum_filled_qty or 0)
-        close = await client.market_open("SHORT", filled, reduce_only=True)
-        after = await client.get_position()
-        flat = not getattr(after, "quantity", 0) or abs(float(after.quantity)) <= 1e-12
-        return web.json_response({
-            "ok": bool(close.ok and flat), "entry_order": entry.to_order_result().__dict__,
-            "close_order": close.__dict__, "position_before": {"side": before.side, "quantity": before.quantity},
-            "position_after": {"side": after.side, "quantity": after.quantity},
-            "entry_limit_price": price, "mark_at_submit": mark, "flat_verified": flat,
-        }, status=200 if close.ok and flat else 502)
+            recon = None
+            try:
+                recon = await review.executor.reconcile(reason="testnet_smoke_error")
+            except Exception:
+                pass
+            return web.json_response({
+                "ok": False, "stage": "exception",
+                "error": f"{type(exc).__name__}: {exc}",
+                "reconciliation": recon,
+            }, status=502)
 
     async def api_testnet_flatten_now(_request):
-        """Close the currently observed Testnet BTCUSDT position only."""
+        """平掉当前观测到的 Testnet BTCUSDT 仓位，并强制重新对账。
+
+        平仓后必须对账，否则本地账本会与交易所脱节并永久阻塞开仓。
+        """
         client = review.executor.client
         if not client.configured:
-            return web.json_response({"ok": False, "error": "binance_keys_missing"}, status=400)
-        pos = await client.get_position()
-        qty = float(getattr(pos, "quantity", 0) or 0)
-        side = str(getattr(pos, "side", "FLAT") or "FLAT").upper()
-        if qty <= 0 or side == "FLAT":
-            return web.json_response({"ok": True, "already_flat": True, "position_after": {"side": "FLAT", "quantity": 0.0}})
-        close = await client.market_open("SHORT" if side == "LONG" else "LONG", qty, reduce_only=True)
-        after = await client.get_position()
-        flat = not getattr(after, "quantity", 0) or abs(float(after.quantity)) <= 1e-12
-        return web.json_response({
-            "ok": bool(close.ok and flat), "close_order": close.__dict__,
-            "position_before": {"side": side, "quantity": qty, "entry_price": getattr(pos, "entry_price", 0)},
-            "position_after": {"side": after.side, "quantity": after.quantity},
-            "flat_verified": flat,
-        }, status=200 if close.ok and flat else 502)
+            return web.json_response(
+                {"ok": False, "stage": "preflight", "error": "binance_keys_missing"},
+                status=400,
+            )
+        try:
+            pos = await client.get_position()
+            qty = float(getattr(pos, "quantity", 0) or 0)
+            side = str(getattr(pos, "side", "FLAT") or "FLAT").upper()
+            if qty <= 0 or side == "FLAT":
+                recon = await review.executor.reconcile(
+                    reason="flatten_now_already_flat"
+                )
+                return web.json_response({
+                    "ok": True, "already_flat": True, "stage": "done",
+                    "position_after": {"side": "FLAT", "quantity": 0.0},
+                    "reconciliation": recon,
+                })
+            close = await client.market_open(
+                "SHORT" if side == "LONG" else "LONG", qty, reduce_only=True
+            )
+            after = await client.get_position()
+            flat = abs(float(getattr(after, "quantity", 0) or 0)) <= 1e-12
+            recon = await review.executor.reconcile(reason="flatten_now_done")
+            return web.json_response({
+                "ok": bool(close.ok and flat),
+                "stage": "done",
+                "close_order": close.__dict__,
+                "position_before": {
+                    "side": side, "quantity": qty,
+                    "entry_price": getattr(pos, "entry_price", 0),
+                },
+                "position_after": {"side": after.side, "quantity": after.quantity},
+                "flat_verified": flat,
+                "reconciliation": recon,
+            }, status=200 if (close.ok and flat) else 502)
+        except Exception as exc:
+            recon = None
+            try:
+                recon = await review.executor.reconcile(reason="flatten_now_error")
+            except Exception:
+                pass
+            return web.json_response({
+                "ok": False, "stage": "exception",
+                "error": f"{type(exc).__name__}: {exc}",
+                "reconciliation": recon,
+            }, status=502)
 
     async def api_trading_toggle(request):
         body = await request.json()
         enabled = bool(body.get("enabled", True))
         review.executor.set_enabled(enabled)
         return web.json_response({"ok": True, "enabled": review.executor.enabled})
+
+    async def api_trading_reconcile(request):
+        """从交易所实时状态重新对账，用于清除陈旧的开仓阻塞。
+
+        与重启的区别：可在运行期调用，返回结构化判定结果。
+        不一致时保持阻塞并在 stage/error 中说明原因，不假装成功。
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        reason = str((body or {}).get("reason") or "manual")
+        try:
+            result = await review.executor.reconcile(reason=reason)
+        except Exception as exc:
+            return web.json_response({
+                "ok": False, "stage": "exception",
+                "error": f"{type(exc).__name__}: {exc}",
+            }, status=502)
+        return web.json_response(result)
 
     async def api_trading_history(request):
         limit = int(request.rel_url.query.get("limit") or 20)
@@ -659,7 +751,12 @@ def create_app(
         review.executor.manager.client = review.executor.client
         try:
             info = await review.executor.client.verify()
-            return web.json_response({"ok": True, **info})
+            recon = None
+            try:
+                recon = await review.executor.reconcile(reason="keys_rebound")
+            except Exception as exc:
+                recon = {"ok": False, "stage": "exception", "error": str(exc)}
+            return web.json_response({"ok": True, **info, "reconciliation": recon})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
@@ -748,6 +845,7 @@ def create_app(
     app.router.add_post("/api/versions/rollback", api_versions_rollback)
     app.router.add_get("/api/trading/status", api_trading_status)
     app.router.add_post("/api/trading/flatten_orphan", api_trading_flatten_orphan)
+    app.router.add_post("/api/trading/reconcile", api_trading_reconcile)
     app.router.add_post("/api/trading/close", api_trading_close)
     app.router.add_post("/api/testnet/smoke-limit-close", api_testnet_limit_then_close)
     app.router.add_post("/api/testnet/flatten-now", api_testnet_flatten_now)

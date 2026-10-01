@@ -443,12 +443,26 @@ class BinanceTestnetClient:
         side_u = side.upper()
         order_side = "SELL" if side_u == "LONG" else "BUY"
         cid = client_order_id or _new_client_order_id("sl")
+        # 触发价必须按 PRICE_FILTER.tickSize 对齐。
+        # 硬编码 round(...,2) 会在 tick=0.10 以外的合约上触发
+        # -4014 Price not increased by tick size，导致保护单静默失效。
+        tick = await self.price_tick(symbol)
+        trigger = self._price_precision(float(stop_price), tick)
+        if trigger <= 0:
+            return ManagedOrder(
+                client_order_id=cid,
+                state=OrderState.REJECTED,
+                error=f"stop price invalid: {stop_price}",
+                symbol=symbol,
+                is_stop=True,
+                is_algo=True,
+            )
         params: Dict[str, Any] = {
             "algoType": "CONDITIONAL",
             "symbol": symbol,
             "side": order_side,
             "type": "STOP_MARKET",
-            "triggerPrice": round(float(stop_price), 2),
+            "triggerPrice": trigger,
             "workingType": "MARK_PRICE",
             "clientAlgoId": cid,
         }
@@ -489,14 +503,21 @@ class BinanceTestnetClient:
                 mo.state = OrderState.ACKNOWLEDGED
             return mo
         except BinanceClientError as exc:
+            # 只有明确的参数/权限拒单才是 REJECTED；
+            # 网络与超时类保持 UNKNOWN，交由调用方查询确认，避免误判保护单失败。
+            text = str(exc)
+            is_reject = any(
+                code in text
+                for code in ("-2015", "-1111", "-1102", "-4014", "-2021", "Invalid")
+            )
             return ManagedOrder(
                 client_order_id=cid,
-                state=OrderState.REJECTED,
-                error=str(exc),
+                state=OrderState.REJECTED if is_reject else OrderState.UNKNOWN,
+                error=text,
                 symbol=symbol,
                 is_stop=True,
                 is_algo=True,
-                stop_price=float(stop_price),
+                stop_price=trigger,
                 position_side=side_u,
             )
 
@@ -545,6 +566,12 @@ class BinanceTestnetClient:
         n = int(qty / step)
         return round(n * step, 8)
 
+    def _price_precision(self, price: float, tick: float = 0.1) -> float:
+        """把价格对齐到交易所 tick，避免 -4014 Price not increased by tick size."""
+        if tick <= 0:
+            return round(price, 8)
+        return round(round(price / tick) * tick, 8)
+
     async def _lot_step(self, symbol: Optional[str] = None) -> float:
         info = await self.exchange_info()
         sym = symbol or self.symbol
@@ -555,6 +582,25 @@ class BinanceTestnetClient:
                 if f.get("filterType") == "LOT_SIZE":
                     return float(f.get("stepSize") or 0.001)
         return 0.001
+
+    async def price_tick(self, symbol: Optional[str] = None) -> float:
+        """读取 PRICE_FILTER.tickSize；失败时退回 0.1."""
+        try:
+            info = await self.exchange_info()
+        except BinanceClientError:
+            return 0.1
+        sym = symbol or self.symbol
+        for s in info.get("symbols") or []:
+            if s.get("symbol") != sym:
+                continue
+            for f in s.get("filters") or []:
+                if f.get("filterType") == "PRICE_FILTER":
+                    try:
+                        tick = float(f.get("tickSize") or 0.1)
+                    except (TypeError, ValueError):
+                        tick = 0.1
+                    return tick if tick > 0 else 0.1
+        return 0.1
 
     async def market_open(
         self,
@@ -655,6 +701,14 @@ class BinanceTestnetClient:
             filled = mo.cum_filled_qty or mo.filled_qty
             if mo.state in (OrderState.FILLED, OrderState.PARTIALLY_FILLED) or filled > 0:
                 return mo.to_order_result()
+            # 持仓模式不匹配（-4061）→ 翻转模式后重试。
+            # 必须放在"已提交未决"返回之前，否则该重试分支永远不可达。
+            if "-4061" in str(exc) and not getattr(self, "_mode_flipped", False):
+                self._mode_flipped = True  # type: ignore[attr-defined]
+                self._hedge_mode = not bool(self._hedge_mode)
+                return await self.market_open(
+                    side, quantity, symbol, reduce_only, client_order_id=cid
+                )
             if mo.state in (OrderState.ACKNOWLEDGED, OrderState.SUBMITTED, OrderState.UNKNOWN) or mo.error:
                 return OrderResult(
                     ok=False,
@@ -668,12 +722,6 @@ class BinanceTestnetClient:
                     submitted_qty=qty,
                     cum_filled_qty=0.0,
                     quantity=0.0,
-                )
-            if "-4061" in str(exc) and not getattr(self, "_mode_flipped", False):
-                self._mode_flipped = True  # type: ignore[attr-defined]
-                self._hedge_mode = not bool(self._hedge_mode)
-                return await self.market_open(
-                    side, quantity, symbol, reduce_only, client_order_id=cid
                 )
             # 仅明确拒单（鉴权/参数）才 REJECTED；网络类保持 UNKNOWN
             is_reject = isinstance(exc, BinanceClientError) and (
@@ -691,6 +739,152 @@ class BinanceTestnetClient:
                 cum_filled_qty=0.0,
                 quantity=0.0,
             )
+
+    async def place_limit_order(
+        self,
+        side: str,
+        quantity: float,
+        price: float,
+        symbol: Optional[str] = None,
+        *,
+        time_in_force: str = "GTC",
+        reduce_only: bool = False,
+        client_order_id: Optional[str] = None,
+        fill_timeout_sec: float = 6.0,
+        poll_interval_sec: float = 0.5,
+        cancel_if_unfilled: bool = False,
+    ) -> OrderResult:
+        """限价单：提交后轮询确认成交，绝不把 NEW 当作失败。
+
+        关键规则（修复历史误判）:
+          * 刚提交返回 NEW/PENDING_NEW 是正常的，必须轮询而不是直接取消
+          * 网络异常时先查询订单；只有确认零成交才允许取消
+          * 部分成交后即使被取消，也按实际成交量返回
+          * 只有明确拒单（-2013 / -2015 / -1111）才标记 REJECTED
+        """
+        symbol = symbol or self.symbol
+        step = await self._lot_step(symbol)
+        qty = self._qty_precision(quantity, step)
+        if qty <= 0:
+            return OrderResult(
+                ok=False, error=f"quantity too small: {quantity}", symbol=symbol
+            )
+        tick = await self.price_tick(symbol)
+        limit_price = self._price_precision(price, tick)
+        if limit_price <= 0:
+            return OrderResult(
+                ok=False, error=f"price invalid: {price}", symbol=symbol
+            )
+        side_u = side.upper()
+        order_side = "BUY" if side_u == "LONG" else "SELL"
+        cid = client_order_id or _new_client_order_id("lmt")
+        tif = (time_in_force or "GTC").upper()
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": order_side,
+            "type": "LIMIT",
+            "timeInForce": tif,
+            "quantity": qty,
+            "price": limit_price,
+            "newClientOrderId": cid,
+        }
+        hedge = False
+        try:
+            hedge = await self.get_position_mode()
+        except Exception:
+            hedge = bool(self._hedge_mode)
+        if hedge:
+            params["positionSide"] = (
+                ("LONG" if order_side == "SELL" else "SHORT")
+                if reduce_only
+                else ("LONG" if order_side == "BUY" else "SHORT")
+            )
+        elif reduce_only:
+            params["reduceOnly"] = "true"
+
+        submit_error = ""
+        submit_raw: Dict[str, Any] = {}
+        try:
+            submit_raw = await self._request(
+                "POST", "/fapi/v1/order", params, signed=True
+            )
+        except (BinanceClientError, asyncio.TimeoutError, OSError) as exc:
+            submit_error = str(exc)
+            if "-4061" in submit_error and not getattr(self, "_mode_flipped", False):
+                self._mode_flipped = True  # type: ignore[attr-defined]
+                self._hedge_mode = not bool(self._hedge_mode)
+                return await self.place_limit_order(
+                    side, quantity, price, symbol,
+                    time_in_force=time_in_force, reduce_only=reduce_only,
+                    client_order_id=cid, fill_timeout_sec=fill_timeout_sec,
+                    poll_interval_sec=poll_interval_sec,
+                    cancel_if_unfilled=cancel_if_unfilled,
+                )
+            if "-2013" in submit_error or "Order does not exist" in submit_error:
+                return OrderResult(
+                    ok=False, error=submit_error, symbol=symbol, side=order_side,
+                    client_order_id=cid, order_state=OrderState.REJECTED.value,
+                    requested_qty=quantity, submitted_qty=qty,
+                    cum_filled_qty=0.0, quantity=0.0,
+                )
+            # 其余网络类错误：继续走查询路径，不判定失败
+
+        entry = (
+            self._raw_to_managed(submit_raw, client_order_id=cid)
+            if submit_raw
+            else ManagedOrder(
+                client_order_id=cid, state=OrderState.UNKNOWN,
+                symbol=symbol, side=order_side, raw={},
+            )
+        )
+        if entry.state == OrderState.FILLED:
+            return entry.to_order_result()
+
+        deadline = time.time() + max(0.0, fill_timeout_sec)
+        last = entry
+        while time.time() < deadline:
+            await asyncio.sleep(poll_interval_sec)
+            last = await self.query_order(client_order_id=cid, symbol=symbol)
+            if last.state == OrderState.FILLED:
+                return last.to_order_result()
+            if last.state in (OrderState.CANCELED, OrderState.REJECTED):
+                break
+            if last.state == OrderState.UNKNOWN and last.error and not submit_error:
+                break  # 查询本身失败：保持 UNKNOWN，不冒充失败
+
+        filled = float(last.cum_filled_qty or last.filled_qty or 0)
+        if filled > 0:
+            return last.to_order_result()
+
+        if cancel_if_unfilled:
+            canceled = await self.cancel_order(client_order_id=cid, symbol=symbol)
+            canceled.cum_filled_qty = float(canceled.cum_filled_qty or 0)
+            canceled.filled_qty = canceled.cum_filled_qty
+            if canceled.state == OrderState.UNKNOWN and not canceled.error:
+                canceled.state = OrderState.CANCELED
+            return canceled.to_order_result()
+
+        return OrderResult(
+            ok=False,
+            order_id=last.exchange_order_id or entry.exchange_order_id,
+            symbol=symbol,
+            side=order_side,
+            position_side=side_u,
+            quantity=0.0,
+            requested_qty=quantity,
+            submitted_qty=qty,
+            cum_filled_qty=0.0,
+            avg_price=0.0,
+            status=last.state.value,
+            client_order_id=cid,
+            order_state=last.state.value,
+            error=(
+                f"submitted_unknown: {submit_error}"
+                if submit_error
+                else "unfilled_after_timeout"
+            ),
+            raw=last.raw if isinstance(last.raw, dict) else {},
+        )
 
     async def market_close(self, symbol: Optional[str] = None) -> OrderResult:
         """平掉当前全部仓位 (单向净仓或双向两边)."""

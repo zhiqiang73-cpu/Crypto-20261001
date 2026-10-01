@@ -18,7 +18,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from config.review import (
     EXIT_STRATEGY,
@@ -357,6 +357,116 @@ class PositionManager:
                 exch.side,
             )
         return res
+
+    def reconciliation_snapshot(self) -> Dict[str, Any]:
+        """对账状态快照，供 API 与前端展示。"""
+        return {
+            "reconciliation_needed": self.reconciliation_needed,
+            "allow_new_entries": self._allow_new_entries,
+            "local_net": self._local_net(),
+            "orphan_exchange_qty": self.orphan_exchange_qty,
+            "positions": self.snapshot(),
+            "state_version": self._state_version,
+        }
+
+    async def reconcile_now(self, *, reason: str = "manual") -> Dict[str, Any]:
+        """任意时刻从交易所实时状态重新推导一致性，并决定是否解除开仓阻塞。
+
+        与 reconcile_on_startup 的区别：可在运行期调用，用于清除陈旧的对账标志，
+        无需重启进程。判定规则：
+
+          1. 交易所净仓与本地账本一致 → 清除阻塞，恢复开仓
+          2. 本地空仓、交易所有仓 → 记为孤立仓，保持阻塞（需人工决定归属或平仓）
+          3. 本地有仓、交易所已空 → 视为外部平仓，清空本地账本后解除阻塞
+          4. 两边都有仓但数量不符 → 无法可靠归属，保持阻塞
+
+        原则：一致性只能从交易所实时状态重新推导，不能依赖内存里的陈旧布尔值。
+        """
+        before = self.reconciliation_snapshot()
+        try:
+            exch = await self.client.get_position(self.symbol)
+        except Exception as exc:
+            self.reconciliation_needed = True
+            self._allow_new_entries = False
+            self._persist()
+            return {
+                "ok": False, "reason": reason, "stage": "get_position",
+                "error": str(exc), "before": before,
+                "after": self.reconciliation_snapshot(), "actions": [],
+            }
+
+        exchange_signed = 0.0
+        if getattr(exch, "side", "FLAT") == "LONG":
+            exchange_signed = float(exch.quantity or 0)
+        elif getattr(exch, "side", "FLAT") == "SHORT":
+            exchange_signed = -float(exch.quantity or 0)
+        local = self._local_net()
+        actions: List[Any] = []
+
+        # 规则 1：一致
+        if abs(local - exchange_signed) <= QTY_EPS:
+            self.reconciliation_needed = False
+            self.orphan_exchange_qty = 0.0
+            self._allow_new_entries = True
+            self.bump_version()
+            self._persist()
+            return {
+                "ok": True, "reason": reason, "stage": "consistent",
+                "local_net": local, "exchange_signed": exchange_signed,
+                "before": before, "after": self.reconciliation_snapshot(),
+                "actions": [],
+            }
+
+        # 规则 3：本地有仓、交易所已空 → 外部平仓，清空本地账本
+        if abs(exchange_signed) <= QTY_EPS and abs(local) > QTY_EPS:
+            actions = self.apply_external_position_update(
+                exchange_signed=0.0, reason=f"external_flat:{reason}"
+            )
+            self.reconciliation_needed = False
+            self.orphan_exchange_qty = 0.0
+            self._allow_new_entries = True
+            self.bump_version()
+            self._persist()
+            logger.warning(
+                "对账：交易所已空而本地有仓 %.6f → 按外部平仓清空本地账本", local
+            )
+            return {
+                "ok": True, "reason": reason, "stage": "external_flat_applied",
+                "local_net": local, "exchange_signed": exchange_signed,
+                "before": before, "after": self.reconciliation_snapshot(),
+                "actions": [a.to_dict() for a in actions if hasattr(a, "to_dict")],
+            }
+
+        # 规则 2：本地空仓、交易所有仓 → 孤立仓
+        if abs(local) <= QTY_EPS and abs(exchange_signed) > QTY_EPS:
+            self.reconciliation_needed = True
+            self._allow_new_entries = False
+            self.orphan_exchange_qty = exchange_signed
+            self.bump_version()
+            self._persist()
+            return {
+                "ok": False, "reason": reason,
+                "stage": "orphan_exchange_position",
+                "error": "交易所存在本地账本无法归属的仓位，需人工决定平仓或归属",
+                "local_net": local, "exchange_signed": exchange_signed,
+                "orphan_exchange_qty": exchange_signed,
+                "before": before, "after": self.reconciliation_snapshot(),
+                "actions": [],
+            }
+
+        # 规则 4：两边都有仓但数量不符
+        self.reconciliation_needed = True
+        self._allow_new_entries = False
+        self.orphan_exchange_qty = exchange_signed
+        self.bump_version()
+        self._persist()
+        return {
+            "ok": False, "reason": reason, "stage": "quantity_mismatch",
+            "error": f"本地净仓 {local:.6f} 与交易所 {exchange_signed:.6f} 不符",
+            "local_net": local, "exchange_signed": exchange_signed,
+            "before": before, "after": self.reconciliation_snapshot(),
+            "actions": [],
+        }
 
     async def _calc_qty(
         self,
