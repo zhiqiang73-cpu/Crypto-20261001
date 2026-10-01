@@ -6,13 +6,13 @@
       → 按「事后价格」结算对错 (先触目标=对 / 先触止损=错 / 都没触=无效)
       → 错误样本写入复盘池
       → 有效样本 (对+错) 累积到 VALID_SAMPLE_TARGET
-      → DeepSeek 输出参数微调建议 (只出建议)
+      → 统计引擎输出参数微调建议 (只出建议)
       → 人工在面板点「采纳」后才写入新版配置, 旧版自动留档可回滚
 
 设计要点:
   * 分母是「有效样本」而不是成交笔数 — 横盘与被覆盖的笔不计入胜率。
   * 结算口径本身不参与调参 (否则是自证循环)。
-  * 模型只能在 TUNABLE_PARAMS 白名单内提议, 且受 PROPOSAL_GUARD 夹取。
+  * 引擎只能在 TUNABLE_PARAMS 白名单内提议, 且受 PROPOSAL_GUARD 夹取。
 """
 
 from __future__ import annotations
@@ -56,24 +56,17 @@ ACTIONABLE_DECISIONS = frozenset({
 # ---------------------------------------------------------------------------
 VALID_SAMPLE_TARGET = 100           # 有效样本达标线 (对 + 错), 不含无效/排除
 MIN_NEW_ERRORS_FOR_RERUN = 10       # 上版建议后又攒够多少错单才允许再跑
-MAX_ERRORS_IN_PAYLOAD = 40          # 送进模型的错单上限 (取最近 N 笔)
-MAX_TRADES_IN_PAYLOAD = 120         # 送进模型的总样本上限, 控 token
+MAX_ERRORS_IN_PAYLOAD = 40          # 送进引擎的错单上限 (取最近 N 笔)
+MAX_TRADES_IN_PAYLOAD = 120         # 送进引擎的总样本上限
 
 # ---------------------------------------------------------------------------
-# 三、DeepSeek
+# 三、复盘引擎
 # ---------------------------------------------------------------------------
-# API key 不入库、不落盘: 由面板输入 → 本机后端仅驻内存 → 转发 DeepSeek。
-# 也支持 DEEPSEEK_API_KEY 环境变量回退 (优先级低于面板输入)。
-DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"
-DEEPSEEK_MODEL_CHOICES = ["deepseek-chat", "deepseek-reasoner"]
-DEEPSEEK_TEMPERATURE = 0.2          # 评审任务要稳定, 不要发挥
-DEEPSEEK_MAX_TOKENS = 4000
-DEEPSEEK_TIMEOUT_SEC = 120
-DEEPSEEK_VERIFY_MAX_TOKENS = 8
+# 复盘引擎: 纯统计规则, 不调用任何外部模型, 不需要 API Key。
+# 见 review/statistical_review.py。
 
 # ---------------------------------------------------------------------------
-# 四、建议护栏 — 模型输出必须过这几关才会展示在面板上
+# 四、建议护栏 — 引擎输出必须过这几关才会展示在面板上
 # ---------------------------------------------------------------------------
 PROPOSAL_GUARD: Dict[str, Any] = {
     "max_params_per_set": 5,        # 一次最多改 5 个参数, 防止大爆炸式重写

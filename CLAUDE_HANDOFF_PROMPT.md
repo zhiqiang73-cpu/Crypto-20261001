@@ -67,8 +67,8 @@ docs/PROJECT_MILESTONES.md
 **2026-10-01 已完成**：P0 全部 6 项（对账恢复 + 限价单状态机）、P1-1/2/3/5。
 测试从 306 增至 327 项，全部通过。
 
-**下一步优先级**：P1-4 配置 LLM Key 跑通 M8 复盘闭环（**当前唯一硬阻塞**）→
-Testnet 复验限价入场与保护单 → M10 进程守护与 48 小时稳定性。
+**下一步优先级**：Testnet 复验限价入场与保护单 → M10 进程守护与 48 小时稳定性 →
+M7 逐笔盈亏前端展示。**注意：复盘闭环已不再依赖 LLM，不再需要任何 API Key。**
 
 > **运维约束（务必记住）**：修改 `config/strategy_bundle.py::_IMPL_FILES` 中任一文件后，
 > 必须执行 `python3 -m scripts.reseal_strategy --reason "原因"`，否则实现指纹漂移会
@@ -107,7 +107,7 @@ Testnet 复验限价入场与保护单 → M10 进程守护与 48 小时稳定�
 
 ### 2.4 运行与面板层 `runtime/` + `review/` + `frontend/`
 
-`runtime/live_loop.py` 是长驻评分循环，`runtime/panel_server.py` 负责实时行情接口，`review/panel_server.py` 是主 API 服务（约 780 行，路由集中在 730–763 行），`review/meta_review.py` 与 `review/deepseek.py` 负责 AI 复盘。
+`runtime/live_loop.py` 是长驻评分循环，`runtime/panel_server.py` 负责实时行情接口，`review/panel_server.py` 是主 API 服务（约 780 行，路由集中在 730–763 行），`review/meta_review.py` 与 `review/statistical_review.py` 负责复盘（纯算法，无 LLM）。
 
 前端是**独立重做**的 BTC Quant Console，位于 `frontend/`，包含总览、策略中心、仓位与订单、交易日志、风控闸门、账户连接六个页面。
 
@@ -245,38 +245,51 @@ Testnet 接口曾因未捕获 `BinanceClientError` 而返回 HTTP 500，前端�
 
 ---
 
-## 6. LLM / AI 复盘配置现状（已核实）
+## 6. 复盘引擎：已彻底移除 LLM（2026-10-01）
 
-用户询问过是否使用 OpenRouter。**核实结论：不是 OpenRouter，代码默认走 DeepSeek 官方 API。**
+**结论：本项目不再需要任何 LLM API Key，也不再发起任何模型请求。**
 
-`config/review.py` 第 67–69 行：
+原先「读交易档案 → 提出调参建议」这一步交给外部 LLM（DeepSeek）。用户明确要求系统内
+不引入 LLM Key，因此已替换为确定性统计引擎 `review/statistical_review.py`。
 
-```python
-DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"
-DEEPSEEK_MODEL_CHOICES = ["deepseek-chat", "deepseek-reasoner"]
-```
+- **已删除的文件**：`review/deepseek.py`、`review/prompt.py`、`review/prompts/`
+- **已移除的配置**：`config/review.py` 的 `DEEPSEEK_*` 常量；`config/secrets.py` 白名单
+  与 `ENV_MAP` 中的 deepseek 三项
+- **已移除的路由**：面板的 `POST /api/key`、`DELETE /api/key`
+- **已改造的调用方**：`review/review_loop.run_review(records, force=)`（不再收 client）、
+  `review/review_loop.annotate_error(rec, journal=, recent_stats=)`、
+  `runtime/scheduler.DailyScheduler(journal=)`（不再收 get_client）
 
-`review/deepseek.py` 是 OpenAI 兼容客户端，调用路径为 `{base_url}/chat/completions`（第 157 行）。
+### 统计引擎的四条规则
 
-**但当前根本没有配置任何 LLM Key**，实测结果：
+| 规则 | 信号 | 动作 |
+| --- | --- | --- |
+| 维度权重 | 各面「赢单均值 − 错单均值」的**组内相对**判别力 | 高于组内均值加权、低于则减权 |
+| 决策阈值 | 各档位实际胜率 | 胜率 < 45% 收紧、> 60% 放宽 |
+| 安全阀 | 整体胜率 | 偏低则抬高开仓门槛 |
+| 技术乘数 | 技术面判别力符号 | 反向判别时抑制 ADX / 布林收口乘数 |
 
-| 检查项 | 结果 |
-| --- | --- |
-| `runtime/secrets.json` | 只有 `binance_testnet_api_key` / `binance_testnet_api_secret` / `binance_testnet_base_url`，**无 `deepseek_api_key`** |
-| 本地 `.env` | 不存在 |
-| 环境变量 `DEEPSEEK_API_KEY` | unset |
-| 环境变量 `DEEPSEEK_BASE_URL` | unset |
-| 环境变量 `OPENROUTER_API_KEY` | unset |
-| 环境变量 `OPENAI_API_KEY` | unset |
+全部阈值常量集中在 `review/statistical_review.py` 顶部，便于人工审阅与测试钉死。
 
-后果：交易执行链路可用，但 AI 复盘/元评审那一段跑不起来。`review/panel_server.py` 第 98–100 行的 `client()` 在无 key 时直接抛 `DeepSeekAuthError("未配置 DeepSeek API key")`。
+### 与旧实现共享的安全边界（不要削弱）
 
-`config/secrets.py` 的白名单已允许 `deepseek_api_key`、`deepseek_model`、`deepseek_base_url` 三个字段，所以配置只需写入 `runtime/secrets.json` 即可。若改用 OpenRouter，只需把 `deepseek_base_url` 改成 `https://openrouter.ai/api/v1`、`deepseek_model` 改成 `deepseek/deepseek-chat`，**不需要改代码**。
+建议**仍然**必须通过 `review_loop.validate_changes()`：
+白名单 → 类型/有限性 → 条数上限 → 区间夹取 → 相对幅度 →
+权重组归一（和恒为 1.0）→ 阈值不交叉。
+只有 `accept_proposal()` 才会写新版本，旧版自动留档可回滚。
 
-**安全要求：不要要求用户把 API Key 发到聊天里。** 应引导用户在本地页面填写，或让用户自己编辑 `runtime/secrets.json`。
+### 两条防自欺设计（不要"优化"掉）
 
----
+1. **相对而非绝对** — 所有面读数普遍偏高只反映市场状态，不是调参信号。
+   `test_relative_tilt_not_absolute_level` 专门钉死这一点。
+2. **对称失效单独处理** — 带符号均值会正负相消；错单里读数幅度明显更大的面，
+   即便判别力为正也会被打折（`EXTREME_MUTE_FACTOR`）。
+
+### 如果将来想接回 LLM
+
+不要直接改回 `run_review`。正确做法是新增一个「建议来源」实现，产出同样的
+`{param, current, proposed, rationale, expected_effect, confidence}` 结构，
+交给 `validate_changes()` —— 护栏层与建议来源无关。
 
 ## 7. 密钥与安全边界
 
@@ -289,7 +302,10 @@ DEEPSEEK_MODEL_CHOICES = ["deepseek-chat", "deepseek-reasoner"]
 3. 只允许 Binance Futures Testnet：`https://testnet.binancefuture.com`。
 4. 不要启用主网 URL，不要绕过 `runtime_mode.py`。
 5. 任何真实 Testnet 下单前，必须先说明精确的方向、数量、订单类型和退出方式，并取得用户明确确认。
-6. 用户此前在聊天里暴露过 `sk-a29d7e68...`（DeepSeek）和 `pred_sk_e8fd22c2...`（Predict.fun），**这两个 key 应视为已泄露，需要重新生成**。
+6. 用户此前在聊天里暴露过 `sk-a29d7e68...`（DeepSeek）、`pred_sk_e8fd22c2...`
+   （Predict.fun）和 Binance Testnet Key/Secret，**这些 key 都应视为已泄露**。
+   DeepSeek key 现已**完全不需要**（LLM 已移除），可直接作废；
+   Binance Testnet key 与 Predict.fun key 需要重新生成。
 
 ---
 

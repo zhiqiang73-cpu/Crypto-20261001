@@ -1,9 +1,12 @@
-"""复盘回路 — 触发条件、调用模型、护栏校验、采纳与版本留档.
+"""复盘回路 — 触发条件、产出建议、护栏校验、采纳与版本留档.
 
 职责边界:
   * 本模块**只出建议**, 不自动改任何生效参数。
-  * 所有模型输出必须过 validate_changes() 护栏才会被展示。
+  * 所有建议必须过 validate_changes() 护栏才会被展示。
   * 只有 accept_proposal() 才会写新版本, 且旧版自动留档可回滚。
+
+建议来源是 review.statistical_review —— 纯统计规则, 零外部依赖,
+不需要任何 API Key。本模块不感知任何模型供应商。
 """
 
 from __future__ import annotations
@@ -30,12 +33,14 @@ from models.review import (
     TradeRecord,
     now_ms,
 )
-from review import deepseek as ds
 from review import overrides
-from review.prompt import build_error_annotation_messages, build_review_messages
+from review import statistical_review as sr
 from review.stats import compute_stats
 
 logger = logging.getLogger(__name__)
+
+# 建议来源标识 —— 写进建议档案的 model 字段, 便于回溯是哪个引擎产的
+ENGINE_NAME = "statistical"
 
 
 # --------------------------------------------------------------------------- 护栏
@@ -250,12 +255,15 @@ def can_run(
 
 # --------------------------------------------------------------------------- 跑复盘
 async def run_review(
-    client: "ds.DeepSeekClient",
     records: Sequence[TradeRecord],
     extra_context: str = "",
     force: bool = False,
 ) -> ProposalSet:
-    """调用模型产出一次参数建议. force=True 可绕过样本量门槛 (面板「强制演练」)."""
+    """产出一次参数建议. force=True 可绕过样本量门槛 (面板「强制演练」).
+
+    建议由统计引擎生成, 全程离线、确定性、不发起任何网络请求。
+    extra_context 保留为兼容参数, 当前统计引擎不使用它。
+    """
     last = latest_decided_proposal()
     since_ms = last.created_at_ms if last else None
     since_errors = (
@@ -270,7 +278,7 @@ async def run_review(
         return ProposalSet(
             proposal_id=_new_proposal_id(),
             created_at_ms=now_ms(),
-            model=client.model,
+            model=ENGINE_NAME,
             valid_sample_count=stats.valid,
             status=ProposalStatus.BLOCKED.value,
             blocked_reason=why,
@@ -279,67 +287,48 @@ async def run_review(
         )
 
     current = overrides.effective_params()
-    version = overrides.current_version_label()
-    # 注入版本绩效卡, 让模型知道上次改了什么、结果如何
+
+    # 元评审的学习率衰减: 每采纳一版就把单次改动幅度收紧一档
     try:
         from review import meta_review as _mr
-        card = _mr.build_performance_card(
-            overrides.active_version_name() or "v1", records
-        )
-        lr = _mr.current_max_relative_change()
-        extra_context = (
-            (extra_context + "\n" if extra_context else "")
-            + f"current_learning_rate={lr:.4f}; "
-            + f"version_performance={card.to_dict()}"
-        )
-        max_rel = lr
+        max_rel = _mr.current_max_relative_change()
     except Exception:
         max_rel = None
 
-    messages = build_review_messages(stats, records, current, version, extra_context)
-    raw = await client.chat_json(messages)
+    produced = sr.propose_from_stats(stats, current, records)
 
     changes, notes = validate_changes(
-        raw.get("changes") or [], current, max_relative_change=max_rel
+        produced.changes, current, max_relative_change=max_rel
     )
     proposal = ProposalSet(
         proposal_id=_new_proposal_id(),
         created_at_ms=now_ms(),
-        model=client.model,
+        model=ENGINE_NAME,
         valid_sample_count=stats.valid,
-        diagnosis=str(raw.get("diagnosis") or ""),
+        diagnosis=produced.diagnosis,
         changes=changes,
-        risks=str(raw.get("risks") or ""),
+        risks=produced.risks,
         stats_snapshot=stats.to_dict(),
         status=ProposalStatus.PENDING.value if changes else ProposalStatus.BLOCKED.value,
         blocked_reason="" if changes else (
-            "模型未给出可用改动" + ("；" + "；".join(notes) if notes else "")
+            "统计引擎未给出可用改动"
+            + ("；" + "；".join(produced.notes + notes) if (produced.notes or notes) else "")
         ),
     )
-    if notes:
-        proposal.risks = (proposal.risks + "\n\n护栏说明: " + "；".join(notes)).strip()
+    all_notes = list(produced.notes) + list(notes)
+    if all_notes:
+        proposal.risks = (proposal.risks + "\n\n护栏说明: " + "；".join(all_notes)).strip()
     save_proposal(proposal)
     return proposal
 
 
 async def annotate_error(
-    client: "ds.DeepSeekClient",
     rec: TradeRecord,
     journal=None,
     recent_stats: Optional[Dict[str, Any]] = None,
 ) -> TradeRecord:
-    """给一笔错单写模型分析备注, 并写回 journal."""
-    messages = build_error_annotation_messages(rec, recent_stats)
-    raw = await client.chat_json(messages)
-    parts = []
-    face = str(raw.get("primary_face") or "").strip()
-    if face:
-        parts.append(f"[{face}]")
-    if raw.get("what_went_wrong"):
-        parts.append(str(raw["what_went_wrong"]))
-    if raw.get("note"):
-        parts.append(f"提醒: {raw['note']}")
-    rec.model_note = " ".join(parts)[:800]
+    """给一笔错单写统计注解, 并写回 journal (纯算法, 不调用外部模型)."""
+    rec.model_note = sr.annotate_record(rec, recent_stats)
     if journal is not None:
         journal.update(rec)
     return rec

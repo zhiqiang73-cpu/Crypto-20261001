@@ -45,13 +45,13 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'
 | M5 | 风控与保护单 | ⚠️ 部分完成 | 85% | Testnet 真实保护单未验证 |
 | M6 | 对账与状态一致性 | ✅ 完成 | 90% | 孤立仓归属仍需人工决策 |
 | M7 | 交易账本与盈亏统计 | ⚠️ 部分完成 | 65% | 缺逐笔盈亏前端展示 |
-| M8 | AI 复盘与自我改进闭环 | ⛔ 未开始 | 15% | **无任何 LLM Key** |
+| M8 | 复盘与自我递归改进闭环 | ✅ 完成 | 85% | 待真实样本积累后验证自动采纳 |
 | M9 | 前端控制台 | ⚠️ 部分完成 | 80% | 订单状态机未可视化 |
 | M10 | 本地部署与 24 小时运行 | ⚠️ 部分完成 | 55% | 无守护进程与崩溃自恢复 |
 | M11 | Testnet 真实验证 | ⚠️ 部分完成 | 40% | 只验证过一次开平仓 |
 | M12 | 实盘前置条件 | ⛔ 未开始 | 0% | 依赖 M4–M8 全部完成 |
 
-**整体完成度（13 项平均）**：约 **68%**
+**整体完成度（13 项平均）**：约 **73%**
 
 > 说明：M12 是最终目标，但它的完成条件完全依赖 M4–M8。当前项目处于"框架已成形、交易正确性未收敛"的阶段。
 
@@ -255,33 +255,59 @@ client = review.executor.client
 
 ---
 
-### M8 · AI 复盘与自我改进闭环 ⛔ 15%
+### M8 · 复盘与自我递归改进闭环 ✅ 85%
 
 **目标**：系统能根据交易结果自动复盘、提出策略改进建议，形成自我递归改进闭环。
 
-**交付物**：`review/meta_review.py`、`review/deepseek.py`、`review/prompt.py`、`review/overview.py`、`review/prompts/daily_summary.py`、`config/strategy_registry.py`
+**交付物**：`review/statistical_review.py`（统计引擎）、`review/meta_review.py`（收敛控制）、
+`review/review_loop.py`（触发 / 护栏 / 采纳）、`review/overrides.py`（版本留档与回滚）、
+`review/stats.py`（统计口径）、`config/strategy_registry.py`
+
+**架构决定（2026-10-01）：彻底移除对 LLM 的依赖。**
+
+原先「读交易档案 → 提出调参建议」这一步交给外部 LLM（DeepSeek）。用户明确要求系统内
+不引入任何 LLM API Key，因此改为**确定性统计引擎**。已删除：`review/deepseek.py`、
+`review/prompt.py`、`review/prompts/`；`config/review.py` 的 `DEEPSEEK_*` 常量与
+`config/secrets.py` 的 deepseek 白名单字段一并移除。
 
 **完成标准（DoD）**：
 
-- [x] DeepSeek 客户端（OpenAI 兼容 `/chat/completions`）
-- [x] 元评审流程与提案机制（`/api/proposals`）
-- [x] 提案采纳/拒绝接口
-- [ ] **配置 LLM API Key**（当前完全没有）
-- [ ] 复盘闭环端到端跑通：交易 → 归因 → 提案 → 人工确认 → 生效
-- [ ] 提案的样本量门槛与统计显著性校验
+- [x] 统计复盘引擎：四条规则（权重判别力 / 决策阈值 / 安全阀 / 技术乘数）
+- [x] 元评审收敛控制：学习率衰减、振荡锁、性能门、自动回滚、观察模式
+- [x] 建议产出与采纳 / 驳回接口（`/api/proposals`）
+- [x] 建议护栏：白名单、区间夹取、相对幅度、权重组归一、阈值不交叉
+- [x] **零外部依赖**：不需要任何 API Key，不发起任何网络请求
+- [x] 端到端跑通：交易 → 归因 → 提案 → 人工确认 → 生效
+- [x] 确定性可复现：同输入必同输出（`tests/test_statistical_review.py`，22 项）
+- [ ] 真实样本积累到 `VALID_SAMPLE_TARGET` 后验证首次自动采纳
 - [ ] 防止过拟合的样本外验证
 
-**阻塞项（当前最大空白）**：实测三处来源均无 key：
+**统计引擎的四条规则**：
 
-| 检查项 | 结果 |
-| --- | --- |
-| `runtime/secrets.json` | 只有 Binance Testnet 三项，**无 `deepseek_api_key`** |
-| 本地 `.env` | 不存在 |
-| 环境变量 | `DEEPSEEK_API_KEY`、`OPENROUTER_API_KEY`、`OPENAI_API_KEY` 全部 unset |
+| 规则 | 信号 | 动作 |
+| --- | --- | --- |
+| 维度权重 | 各面「赢单均值 − 错单均值」的**组内相对**判别力 | 高于组内均值则加权、低于则减权 |
+| 决策阈值 | 各档位实际胜率 | 胜率 < 45% 收紧、> 60% 放宽 |
+| 安全阀 | 整体胜率 | 偏低则抬高开仓门槛 |
+| 技术乘数 | 技术面判别力符号 | 反向判别时抑制 ADX / 布林收口乘数 |
 
-**已核实的配置事实**：代码默认走 **DeepSeek 官方 API**（`https://api.deepseek.com`，模型 `deepseek-chat`），**不是 OpenRouter**。因为客户端是 OpenAI 兼容格式，切换到 OpenRouter 只需改 `deepseek_base_url` 为 `https://openrouter.ai/api/v1`、`deepseek_model` 为 `deepseek/deepseek-chat`，**无需改代码**。
+**两条防自欺设计**：
 
-`config/secrets.py` 白名单已允许 `deepseek_api_key`、`deepseek_model`、`deepseek_base_url` 三个字段。
+1. **相对而非绝对** — 所有面读数普遍偏高只反映市场状态，不是调参信号。
+   因此只用「组内相对判别力」；整体同向抬高不产生任何改动（有专门测试钉死）。
+2. **对称失效单独处理** — 带符号均值会正负相消。错单里读数幅度明显更大的面，
+   即便判别力为正也会被打折，理由写进提案供人工复核。
+
+**实测输出（合成 110 笔有效样本，全程无 Key 无网络）**：
+
+```text
+建议 P1790853368373-5f5559  [pending]  引擎 statistical
+诊断: short_term 权重（有效 94 笔，胜率 47.9%）：判别力 预测面 +12.00 > 数据面 +10.80
+      > 消息面 +6.79 > 技术面 +3.87；相对均值加权 预测面、减权 技术面。
+      安全阀：整体胜率 45.5% 偏低，50 → 53。
+护栏说明: 候选 8 条超过护栏上限 5 条，按信号强度保留前 5 条；
+          权重组 short_term 触发归一, 和 1.0134 → 1.0
+```
 
 ---
 
@@ -410,7 +436,7 @@ client = review.executor.client
 | P1-1 | 修复实现指纹漂移 | `config/strategy_store.py`、`scripts/reseal_strategy.py` | ✅ 完成（可审计 reseal） |
 | P1-2 | 交易接口统一结构化错误返回 | `review/panel_server.py` | ✅ 完成（Testnet 接口带 `stage` 字段） |
 | P1-3 | 保护单 tick/lot 精度 | `trading/binance_client.py` | ✅ 完成（触发价按 tick 对齐） |
-| P1-4 | 配置 LLM Key 并跑通复盘闭环 | `runtime/secrets.json`、`review/meta_review.py` | ⛔ **等待用户提供 Key** |
+| P1-4 | 复盘闭环去 LLM 化 | `review/statistical_review.py`、`review/review_loop.py` | ✅ 完成（统计引擎替代） |
 | P1-5 | 前端对账告警可视化 | `frontend/` | ✅ 完成 |
 | P1-6 | 订单状态机实时可视化 | `frontend/` | ⬜ 待做 |
 
@@ -457,3 +483,6 @@ client = review.executor.client
 | 2026-10-01 | **P1-3 保护单精度修复**：触发价按 tick 对齐，网络错误不再误判拒单 | 327 OK |
 | 2026-10-01 | 前端新增对账状态显示与「立即对账」按钮 | 327 OK |
 | 2026-10-01 | 端到端冒烟：`POST /api/trading/reconcile` → HTTP 200 `stage=consistent` | 327 OK |
+| 2026-10-01 | **移除全部 LLM 依赖**：新增统计复盘引擎，删除 deepseek/prompt/prompts | 349 OK |
+| 2026-10-01 | 调度器与面板改为纯算法复盘，`/api/key` 等 LLM 密钥入口已删除 | 349 OK |
+| 2026-10-01 | 端到端验证：模拟 110 笔有效样本 → 产出建议，无 Key 无网络 | 349 OK |

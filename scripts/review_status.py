@@ -5,7 +5,7 @@
     python3 scripts/review_status.py add --price 63000 --atr 400 --data 54 --tech 62
     python3 scripts/review_status.py settle
     python3 scripts/review_status.py simulate --n 110 --journal runtime/review/sim_journal.jsonl
-    python3 scripts/review_status.py run --force            # 需要 DEEPSEEK_API_KEY
+    python3 scripts/review_status.py run --force            # 统计引擎, 无需任何 Key
     python3 scripts/review_status.py accept P20260913-abc123
     python3 scripts/review_status.py versions
     python3 scripts/review_status.py rollback v1
@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import random
 import sys
 from pathlib import Path
@@ -30,7 +29,7 @@ from models.review import SettleStatus, TradeRecord, now_ms          # noqa: E40
 from models.signals import StrategyHorizon, DimensionScores          # noqa: E402
 from review import overrides                                         # noqa: E402
 from review import review_loop as rl                                 # noqa: E402
-from review.deepseek import DeepSeekClient                           # noqa: E402
+from review import statistical_review as sr                          # noqa: E402
 from review.journal import TradeJournal, new_trade_id                # noqa: E402
 from review.settle import settle_pending                             # noqa: E402
 from review.stats import compute_stats                               # noqa: E402
@@ -38,14 +37,6 @@ from review.stats import compute_stats                               # noqa: E40
 
 def _journal(args) -> TradeJournal:
     return TradeJournal(Path(args.journal)) if args.journal else TradeJournal()
-
-
-def _client() -> DeepSeekClient:
-    key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
-    if not key:
-        print("需要 DEEPSEEK_API_KEY 环境变量, 或在面板「配置」页填写。", file=sys.stderr)
-        raise SystemExit(2)
-    return DeepSeekClient(api_key=key)
 
 
 # --------------------------------------------------------------------------- status
@@ -245,7 +236,7 @@ def _assign_synthetic_outcome(rec: TradeRecord, rng: random.Random) -> None:
     rec.settle_detail = {"reason": "synthetic_target_first" if correct else "synthetic_stop_first"}
 
 
-# --------------------------------------------------------------------------- 模型
+# --------------------------------------------------------------------------- 注解 / 复盘
 def cmd_annotate(args) -> int:
     journal = _journal(args)
     targets = ([r for r in journal.errors() if not r.model_note]
@@ -255,54 +246,40 @@ def cmd_annotate(args) -> int:
         print("没有需要分析的错单。")
         return 0
 
-    async def run() -> None:
-        client = _client()
-        try:
-            stats = compute_stats(journal.all())
-            for rec in targets:
-                await rl.annotate_error(client, rec, journal=journal, recent_stats={
-                    "valid": stats.valid, "win_rate": stats.win_rate,
-                    "face_means": stats.face_means,
-                })
-                print(f"{rec.trade_id}: {rec.model_note}")
-        finally:
-            await client.close()
-
-    asyncio.run(run())
+    stats = compute_stats(journal.all())
+    for rec in targets:
+        rec.model_note = sr.annotate_record(rec, {
+            "valid": stats.valid, "win_rate": stats.win_rate,
+            "face_means": stats.face_means,
+        })
+        journal.update(rec)
+        print(f"{rec.trade_id}: {rec.model_note}")
     return 0
 
 
 def cmd_run(args) -> int:
     journal = _journal(args)
-
-    async def run() -> int:
-        client = _client()
-        try:
-            proposal = await rl.run_review(client, journal.all(), force=args.force)
-            print(f"建议 {proposal.proposal_id}  [{proposal.status}]  模型 {proposal.model}")
-            print(f"有效样本 {proposal.valid_sample_count}")
-            if proposal.blocked_reason:
-                print(f"受阻: {proposal.blocked_reason}")
-            if proposal.diagnosis:
-                print(f"\n诊断:\n{proposal.diagnosis}")
-            if proposal.changes:
-                print("\n改动建议:")
-                for c in proposal.changes:
-                    flag = "  [被护栏夹取]" if c.clamped else ""
-                    print(f"  {c.param}\n    {c.current} → {c.proposed}  ({c.delta_pct:+.1%}){flag}")
-                    if c.rationale:
-                        print(f"    理由: {c.rationale}")
-                    if c.expected_effect:
-                        print(f"    预期: {c.expected_effect}")
-            if proposal.risks:
-                print(f"\n风险:\n{proposal.risks}")
-            if proposal.changes:
-                print(f"\n确认请执行: python3 scripts/review_status.py accept {proposal.proposal_id}")
-            return 0
-        finally:
-            await client.close()
-
-    return asyncio.run(run())
+    proposal = asyncio.run(rl.run_review(journal.all(), force=args.force))
+    print(f"建议 {proposal.proposal_id}  [{proposal.status}]  引擎 {proposal.model}")
+    print(f"有效样本 {proposal.valid_sample_count}")
+    if proposal.blocked_reason:
+        print(f"受阻: {proposal.blocked_reason}")
+    if proposal.diagnosis:
+        print(f"\n诊断:\n{proposal.diagnosis}")
+    if proposal.changes:
+        print("\n改动建议:")
+        for c in proposal.changes:
+            flag = "  [被护栏夹取]" if c.clamped else ""
+            print(f"  {c.param}\n    {c.current} → {c.proposed}  ({c.delta_pct:+.1%}){flag}")
+            if c.rationale:
+                print(f"    理由: {c.rationale}")
+            if c.expected_effect:
+                print(f"    预期: {c.expected_effect}")
+    if proposal.risks:
+        print(f"\n风险:\n{proposal.risks}")
+    if proposal.changes:
+        print(f"\n确认请执行: python3 scripts/review_status.py accept {proposal.proposal_id}")
+    return 0
 
 
 def cmd_proposals(args) -> int:
@@ -388,7 +365,7 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--trade-id", dest="trade_id")
     n.set_defaults(func=cmd_annotate)
 
-    r = sub.add_parser("run", parents=[common], help="调用模型产出参数微调建议")
+    r = sub.add_parser("run", parents=[common], help="用统计引擎产出参数微调建议 (无需 Key)")
     r.add_argument("--force", action="store_true", help="无视样本量门槛")
     r.set_defaults(func=cmd_run)
 
