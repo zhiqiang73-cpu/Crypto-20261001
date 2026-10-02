@@ -218,9 +218,19 @@
       setPnl($("mReal"), s.realized_pnl);
       if ($("realHint")) $("realHint").textContent = `净盈亏 ${signed(s.net_pnl)} USDT`;
 
-      if ($("pCount")) $("pCount").textContent = String(s.trade_count ?? "—");
+      if ($("statsStart")) $("statsStart").textContent = s.stats_start || "—";
+      if ($("pCount")) $("pCount").textContent = String(s.closed_trades ?? "—");
+      if ($("pCountHint")) {
+        $("pCountHint").textContent =
+          `已平仓笔数 · 成交 ${s.trade_count ?? 0} 笔`;
+      }
       if ($("pWinLoss")) $("pWinLoss").textContent = `${s.wins ?? 0} / ${s.losses ?? 0}`;
       if ($("pWinRate")) $("pWinRate").textContent = pct(s.win_rate);
+      if ($("pPF")) {
+        $("pPF").textContent = (s.profit_factor === null || s.profit_factor === undefined)
+          ? "—"
+          : Number(s.profit_factor).toFixed(2);
+      }
       if ($("pFee")) $("pFee").textContent = num(s.commission, 4);
 
       if ($("posBox") && s.position && s.position.side && s.position.side !== "FLAT") {
@@ -334,6 +344,7 @@
         return;
       }
       const list = (d.orders || []).slice().reverse();
+      if ($("ordersStart")) $("ordersStart").textContent = d.stats_start || "—";
       if ($("histOrdersTag")) $("histOrdersTag").textContent = list.length + " 条";
       if (!list.length) {
         box.innerHTML = empty("暂无历史委托", "币安返回空列表");
@@ -368,6 +379,7 @@
         return;
       }
       const list = (d.trades || []).slice().reverse();
+      if ($("tradesStart")) $("tradesStart").textContent = d.stats_start || "—";
       if ($("histTradesTag")) $("histTradesTag").textContent = list.length + " 条";
       if (!list.length) {
         box.innerHTML = empty("暂无历史成交", "币安返回空列表");

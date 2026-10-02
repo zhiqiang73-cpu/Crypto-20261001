@@ -555,3 +555,42 @@ KDJ 极值反转，金叉且 K<30 做多 / 死叉且 K>70 做空，反手出场�
 - **24 小时不间断运行未实现**：会话服务存活上限约 2 小时，需 launchd 守护
 - 灾难止损与风控熔断尚未在真实行情中触发过
 - 追价的实际 maker 占比需累积样本后统计
+
+---
+
+## 2026-10-02（第二次）· 统计起算日 + 策略清理
+
+### 1. 删除 `trend_filter_long_v1`
+用户确认「趋势过滤多头 (BTCUSDT 4h)」也已无用，从 `config/strategies/` 删除。
+至此注册表只剩**运行中的唯一策略** `deployed_kdj_extreme_v1.json`；
+上文提到的灰色「未启用」策略说明随之作废。
+
+### 2. 盈亏与胜率统计起算日 = 2026-10-02
+用户要求「赚了多少」「胜率之类的」「历史委托」「历史成交」全部从 10-02 起算。
+
+- `review/panel_server.py` 新增 `STATS_START_DATE`（默认 `2026-10-02`，
+  可用环境变量覆盖）与 `stats_start_ms()`，按本机时区当日 00:00 换算为毫秒。
+- `trading/binance_client.py` 的 `all_orders()` / `user_trades()` 新增
+  `start_time` 参数，直接透传币安 `startTime`，由交易所侧过滤。
+- `/api/account/summary`、`/api/binance/orders`、`/api/binance/trades`
+  三个接口全部应用该起点，并在响应中回传 `stats_start` 供前端标注。
+
+### 3. 指标口径修正
+- 新增 `closed_trades`（已平仓笔数 = 胜 + 负），与 `trade_count`（成交笔数，
+  含开仓腿）区分，避免「笔数」与「胜负」数量对不上。
+- `profit_factor` 在无亏损时返回 `null`（前端显示「—」），不再错误显示 0.00。
+- 第一页 FEES 卡片改为 **PROFIT FACTOR**，累计手续费移到卡片下方说明行。
+
+### 验证结果
+- **全量回归 364 项全部通过**
+- `node --check frontend/app.js` 通过
+- 接口实测（`stats_start=2026-10-02`）：
+  - `/api/account/summary`：已实现 1.739、手续费 3.187、净 −1.448、
+    成交 2 笔 / 已平仓 1 笔、胜 1 负 0、盈亏比 `null`
+  - `/api/binance/orders`、`/api/binance/trades` 各只返回该日起 2 条记录
+    （未加过滤时分别为 10 条 / 9 条）
+  - 前端 index / app.js / styles.css 全部 HTTP 200
+
+### 备份
+远端 `backup/main` 经核实已包含上一轮「删除 kdj_rsi_reversal_v1」提交
+（`1d59ecf`），此前记录的推送失败实为误判。

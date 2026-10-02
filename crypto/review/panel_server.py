@@ -23,6 +23,27 @@ from typing import Any, Dict, Optional
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
+# ---------------------------------------------------------------------------
+# 统计起点
+#
+# 用户要求：「赚了多少」与胜率等指标从 2026-10-02 起算，历史委托与历史成交
+# 同样只显示该日期之后的记录。日期按本机时区的当日 00:00 解释，
+# 可用环境变量 STATS_START_DATE (YYYY-MM-DD) 覆盖。
+# ---------------------------------------------------------------------------
+STATS_START_DATE = os.getenv("STATS_START_DATE", "2026-10-02")
+
+
+def stats_start_ms() -> int:
+    """统计起点的毫秒时间戳；日期无效时返回 0，表示不过滤。"""
+    from datetime import datetime as _dt
+
+    try:
+        d = _dt.strptime(STATS_START_DATE.strip(), "%Y-%m-%d")
+    except Exception:
+        return 0
+    return int(d.timestamp() * 1000)
+
+
 try:
     from aiohttp import web
 except ImportError:  # pragma: no cover
@@ -762,8 +783,14 @@ def create_app(
         except Exception:
             limit = 50
         try:
-            orders = await client.all_orders(limit=limit)
-            return web.json_response({"connected": True, "orders": orders})
+            orders = await client.all_orders(
+                limit=limit, start_time=stats_start_ms()
+            )
+            return web.json_response({
+                "connected": True,
+                "orders": orders,
+                "stats_start": STATS_START_DATE,
+            })
         except Exception as exc:
             return web.json_response({
                 "connected": False,
@@ -783,8 +810,14 @@ def create_app(
         except Exception:
             limit = 50
         try:
-            trades = await client.user_trades(limit=limit)
-            return web.json_response({"connected": True, "trades": trades})
+            trades = await client.user_trades(
+                limit=limit, start_time=stats_start_ms()
+            )
+            return web.json_response({
+                "connected": True,
+                "trades": trades,
+                "stats_start": STATS_START_DATE,
+            })
         except Exception as exc:
             return web.json_response({
                 "connected": False,
@@ -804,7 +837,9 @@ def create_app(
             pos = await client.get_position()
             trades = []
             try:
-                trades = await client.user_trades(limit=200)
+                trades = await client.user_trades(
+                    limit=200, start_time=stats_start_ms()
+                )
             except Exception:
                 trades = []
             pnls = [float(t.get("realizedPnl", 0) or 0) for t in trades]
@@ -816,6 +851,7 @@ def create_app(
             gross_loss = -sum(p for p in pnls if p < 0)
             return web.json_response({
                 "connected": True,
+                "stats_start": STATS_START_DATE,
                 "wallet_balance": float(
                     getattr(bal, "total_wallet_balance", 0) or 0
                 ),
@@ -827,10 +863,14 @@ def create_app(
                 "commission": commission,
                 "net_pnl": realized - commission,
                 "trade_count": len(trades),
+                "closed_trades": wins + losses,
                 "wins": wins,
                 "losses": losses,
                 "win_rate": (wins / (wins + losses)) if (wins + losses) else 0.0,
-                "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else 0.0,
+                # 无亏损时盈亏比无定义, 返回 null 让前端显示「—」而不是 0。
+                "profit_factor": (
+                    (gross_win / gross_loss) if gross_loss > 0 else None
+                ),
                 "position": {
                     "side": str(getattr(pos, "side", "FLAT") or "FLAT"),
                     "quantity": float(getattr(pos, "quantity", 0) or 0),
