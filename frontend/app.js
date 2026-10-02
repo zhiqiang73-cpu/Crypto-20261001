@@ -98,23 +98,47 @@
   }
 
   // ------------------------------------------------------------- 实时行情
+  //
+  // WS 地址**由后端下发**, 不再硬编码。
+  // 2026-10-02 事故: 前端曾写死主网 WS 地址, 与测试网下单错位。
+  // 现在拿不到后端下发的地址就只重试, 绝不退回主网 ——
+  // 宁可暂时无行情, 也不显示另一个市场的价格。
+  let marketWsUrl = null;
+  let marketLabel = "";
+
   function renderPrice(price) {
     const n = Number(price);
     if (!Number.isFinite(n)) return;
     if ($("markPrice"))
       $("markPrice").textContent =
         "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    if ($("priceChange")) $("priceChange").innerHTML = "实时推送中 <span>Binance Futures WebSocket</span>";
-    if ($("syncText")) $("syncText").textContent = "Binance 实时同步";
+    const tag = marketLabel ? `Binance ${marketLabel}` : "Binance";
+    if ($("priceChange")) $("priceChange").innerHTML = `实时推送中 <span>${tag} WebSocket</span>`;
+    if ($("syncText")) $("syncText").textContent = `${tag} 实时同步`;
     if ($("engineState")) $("engineState").textContent = "行情已连接";
   }
 
+  async function resolveMarketWs() {
+    try {
+      const d = await api("/api/market");
+      if (d && d.ok && d.market_ws) {
+        marketWsUrl = d.market_ws + "?streams=btcusdt@markPrice@1s";
+        marketLabel = d.market_label || d.market || "";
+      }
+    } catch (_) {}
+    return marketWsUrl;
+  }
+
   function connectMarkPrice() {
-    const open = () => {
+    const open = async () => {
       try {
-        markSocket = new WebSocket(
-          "wss://fstream.binance.com/stream?streams=btcusdt@markPrice@1s"
-        );
+        if (!marketWsUrl) await resolveMarketWs();
+        if (!marketWsUrl) {
+          if ($("syncText")) $("syncText").textContent = "等待后端下发行情地址";
+          setTimeout(open, 3000);
+          return;
+        }
+        markSocket = new WebSocket(marketWsUrl);
         markSocket.onmessage = (e) => {
           try {
             const packet = JSON.parse(e.data);

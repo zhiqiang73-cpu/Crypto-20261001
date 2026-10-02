@@ -24,18 +24,29 @@ from shadow.engine import (ATR_MULT_K, DISASTER_ATR, FEE_PER_SIDE, GATE_FEE_RATE
                            floor_step)
 from shadow.indicators import atr_wilder, boll, kdj
 from shadow.reporting import BAR_COLS, TRADE_COLS
+from config.market_endpoints import resolve_for_account
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 OUT = os.path.join(ROOT, "runtime", "shadow")
 STATE = os.path.join(OUT, "live_state.json")
 BAR_LOG = os.path.join(OUT, "live_bar_log.csv")
 TRADE_LOG = os.path.join(OUT, "live_trade_log.csv")
-BASE = "https://fapi.binance.com/fapi/v1/klines"
+
+# ---------------------------------------------------------------------------
+# 行情地址 —— 必须跟着账户走, 不能硬编码。
+#
+# 2026-10-02 事故: 这里曾写死主网 K 线地址, 而下单走测试网,
+# 导致 bot 用主网 K 线算 KDJ、在测试网下单, 信号错位 2 根 K 线(30 分钟)。
+# 现在地址由 config.market_endpoints 依据账户 base_url 反推, 两者不可能分叉。
+# ---------------------------------------------------------------------------
+ENDPOINTS = resolve_for_account()
+MARKET = ENDPOINTS.market
+BASE = ENDPOINTS.rest + "/fapi/v1/klines"
 UA = {"User-Agent": "crypto-quant-shadow/1.0"}
 
 
 def fetch(interval: str, limit: int) -> dict:
-    url = f"{BASE}?symbol=BTCUSDT&interval={interval}&limit={limit}"
+    url = ENDPOINTS.klines_url(interval=interval, limit=limit)
     req = urllib.request.Request(url, headers=UA)
     rows = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
     ts = np.array([r[0] for r in rows], dtype=np.int64)

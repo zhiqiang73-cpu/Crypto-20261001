@@ -2,6 +2,8 @@
 
 from typing import List, Tuple
 
+from config.market_endpoints import SENTIMENT_REST, resolve_for_account
+
 # ---------------------------------------------------------------------------
 # 采集常数
 # ---------------------------------------------------------------------------
@@ -29,9 +31,15 @@ COINGLASS_BASE_URL = "https://open-api-v4.coinglass.com"
 COINGLASS_POLL_INTERVAL_SEC = 30
 COINGLASS_TIMEOUT_SEC = 15
 
-# Binance
-BINANCE_FUTURES_WS = "wss://fstream.binance.com/stream"
-BINANCE_FUTURES_REST = "https://fapi.binance.com"
+# Binance —— 地址跟着账户市场走, 不硬编码。
+# 2026-10-02 事故: 采集层与下单层若各自写死地址, 会出现「主网 K 线 + 测试网下单」
+# 的错位。详见 config/market_endpoints.py 顶部说明。
+_MARKET = resolve_for_account()
+BINANCE_FUTURES_WS = _MARKET.ws + "/stream"
+BINANCE_FUTURES_REST = _MARKET.rest
+# 外部情绪数据（/futures/data/*）只有主网提供, 测试网返回 301。
+# 恒为主网是**有意的**: 它不参与下单决策, 只作面板情绪参考。
+BINANCE_SENTIMENT_REST = SENTIMENT_REST
 BINANCE_SYMBOL = "BTCUSDT"
 BINANCE_DEPTH_LIMIT = 1000
 BINANCE_RECONNECT_BASE_SEC = 1.0

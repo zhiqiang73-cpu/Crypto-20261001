@@ -175,6 +175,10 @@ def create_app(
         snap = live.loop_short.binance.get_snapshot()
         if snap.mark_price is None:
             return web.json_response({"ok": False, "error": "market_warming_up"}, status=503)
+        # 市场标识随行情一起下发 —— 前端据此连 WS, 不再硬编码主网地址。
+        from config.market_endpoints import market_report
+
+        mk = market_report()
         return web.json_response({
             "ok": True,
             "symbol": "BTCUSDT",
@@ -185,6 +189,11 @@ def create_app(
             "best_bid": snap.best_bid,
             "best_ask": snap.best_ask,
             "source": "binance_futures_websocket",
+            "market": mk["market"],
+            "market_label": mk["market_label"],
+            "market_ws": mk["ws"] + "/stream",
+            "market_rest": mk["rest"],
+            "account_base_url": mk["account_base_url"],
         })
 
     async def api_health(_request):
