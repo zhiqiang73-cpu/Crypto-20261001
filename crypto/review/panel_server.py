@@ -860,7 +860,14 @@ def create_app(
             })
 
     async def api_account_summary(_request):
-        """账户汇总: 余额 + 已实现/未实现盈亏 + 手续费 + 胜率与盈亏比."""
+        """账户汇总: 余额 + 已实现/未实现盈亏 + 手续费 + 胜率与盈亏比.
+
+        ⚠ 同时返回**两套口径**, 因为页面上历史成交表是全量的:
+          * 顶层字段   = 自 STATS_START_DATE 起算 (用户指定的「赚了多少」口径)
+          * all_time  = 该账户的全部历史
+        只给一套会让页面自相矛盾 —— 历史成交表净亏 31.53, 而「赚了多少」说
+        净亏 1.97, 用户会以为哪边算错了。两套都摆出来才对得上。
+        """
         client = review.executor.client
         if not client.configured:
             return web.json_response(
@@ -869,20 +876,39 @@ def create_app(
         try:
             bal = await client.get_balance()
             pos = await client.get_position()
-            trades = []
+            all_trades = []
             try:
-                trades = await client.user_trades(
-                    limit=200, start_time=stats_start_ms()
-                )
+                all_trades = await client.user_trades(limit=200)
             except Exception:
-                trades = []
-            pnls = [float(t.get("realizedPnl", 0) or 0) for t in trades]
-            realized = sum(pnls)
-            commission = sum(float(t.get("commission", 0) or 0) for t in trades)
-            wins = sum(1 for p in pnls if p > 0)
-            losses = sum(1 for p in pnls if p < 0)
-            gross_win = sum(p for p in pnls if p > 0)
-            gross_loss = -sum(p for p in pnls if p < 0)
+                all_trades = []
+
+            def bucket(rows):
+                pnls = [float(t.get("realizedPnl", 0) or 0) for t in rows]
+                realized = sum(pnls)
+                commission = sum(float(t.get("commission", 0) or 0) for t in rows)
+                wins = sum(1 for p in pnls if p > 0)
+                losses = sum(1 for p in pnls if p < 0)
+                gross_win = sum(p for p in pnls if p > 0)
+                gross_loss = -sum(p for p in pnls if p < 0)
+                return {
+                    "trade_count": len(rows),
+                    "realized_pnl": realized,
+                    "commission": commission,
+                    "net_pnl": realized - commission,
+                    "closed_trades": wins + losses,
+                    "wins": wins,
+                    "losses": losses,
+                    "win_rate": (wins / (wins + losses)) if (wins + losses) else 0.0,
+                    "profit_factor": (
+                        (gross_win / gross_loss) if gross_loss > 0 else None
+                    ),
+                }
+
+            start = stats_start_ms()
+            scoped = bucket(
+                [t for t in all_trades if int(t.get("time", 0) or 0) >= start]
+            ) if start else bucket(all_trades)
+            every = bucket(all_trades)
             return web.json_response({
                 "connected": True,
                 "stats_start": STATS_START_DATE,
@@ -893,18 +919,10 @@ def create_app(
                     getattr(bal, "available_balance", 0) or 0
                 ),
                 "unrealized_pnl": float(getattr(pos, "unrealized_pnl", 0) or 0),
-                "realized_pnl": realized,
-                "commission": commission,
-                "net_pnl": realized - commission,
-                "trade_count": len(trades),
-                "closed_trades": wins + losses,
-                "wins": wins,
-                "losses": losses,
-                "win_rate": (wins / (wins + losses)) if (wins + losses) else 0.0,
-                # 无亏损时盈亏比无定义, 返回 null 让前端显示「—」而不是 0。
-                "profit_factor": (
-                    (gross_win / gross_loss) if gross_loss > 0 else None
-                ),
+                # 起算日口径（用户指定的「赚了多少」）
+                **scoped,
+                # 全部历史口径 —— 与页面上全量的历史成交表对齐
+                "all_time": every,
                 "position": {
                     "side": str(getattr(pos, "side", "FLAT") or "FLAT"),
                     "quantity": float(getattr(pos, "quantity", 0) or 0),
