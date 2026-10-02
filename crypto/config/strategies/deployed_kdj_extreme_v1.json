@@ -1,0 +1,54 @@
+{
+  "strategy_id": "deployed_kdj_extreme_v1",
+  "name": "KDJ 极值反转 (BTCUSDT 15m)",
+  "kind": "mean_reversion",
+  "timeframe": "15m",
+  "risk_timeframe": "1h",
+  "symbol": "BTCUSDT",
+  "market": "Binance USDⓈ-M 永续",
+  "side": "both",
+  "entry": {
+    "golden_cross": "K[t-1] <= D[t-1] and K[t] > D[t]",
+    "dead_cross": "K[t-1] >= D[t-1] and K[t] < D[t]",
+    "long": "金叉 且 K[t] < 30",
+    "short": "死叉 且 K[t] > 70",
+    "execution": "t 收盘判定, t+1 开盘执行 (限价追价成交)",
+    "loose_long": "金叉 且 最近3根内 min(K) < 30  (仅记录, 不执行)",
+    "loose_short": "死叉 且 最近3根内 max(K) > 70 (仅记录, 不执行)"
+  },
+  "exit": {
+    "mode_a": "对侧完整信号 → 平仓并反手 (默认执行)",
+    "mode_b": "对侧裸交叉即平 (仅并行记录, 不执行)"
+  },
+  "indicators": {
+    "KDJ": "(9,3,3) 15m; RSV=(C-LLV(L,9))/(HHV(H,9)-LLV(L,9))*100, 分母为0时取50; K=(2K'+RSV)/3; D=(2D'+K)/3; 初值 K0=D0=50; 不用 J",
+    "ATR": "(14) 1h Wilder; TR=max(H-L,|H-C'|,|L-C'|); ATR=(13ATR'+TR)/14; 初值前14根TR简单平均",
+    "BOLL": "(20,2) 15m —— 闸门已按用户指令移除, 仅记录不参与开仓"
+  },
+  "position_sizing": {
+    "formula": "qty = 权益_USDT × r ÷ (k × ATR_1H)",
+    "r": 0.01,
+    "k": 2,
+    "step": 0.001,
+    "note": "按交易所最小变动单位向下取整; 不足最小名义金额则跳过"
+  },
+  "risk": {
+    "leverage": 10,
+    "margin": "isolated",
+    "max_concurrent": 1,
+    "daily_loss_stop": 0.03,
+    "max_drawdown_stop": 0.10,
+    "disaster_stop": "浮亏 ≥ 3 × ATR_1H → 强制平仓"
+  },
+  "execution_style": {
+    "order_type": "LIMIT_CHASE",
+    "description": "被动限价挂单争取 maker 手续费, 未成交则逐档追价, 最后一档穿越盘口保证成交",
+    "initial_offset_bps": 2.0,
+    "max_steps": 6,
+    "order_timeout_sec": 120
+  },
+  "status": "live_testnet",
+  "enabled": true,
+  "source": "user_spec",
+  "note": "以 shadow/engine.py 常量为准; 本文件仅作展示与文档, 不覆盖代码"
+}

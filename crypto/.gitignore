@@ -18,3 +18,9 @@ inputs/
 outputs/
 *.tmp
 .manus-*
+
+# 回测与运行产物 (2026-10-02: 不进版本库, 只保留源码与配置)
+runtime/shadow/
+runtime/shadow_nogate/
+runtime/logs/
+*.log

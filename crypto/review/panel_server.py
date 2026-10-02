@@ -406,15 +406,9 @@ def create_app(
                     "position_before": {"side": before.side, "quantity": before.quantity},
                 }, status=409)
             mark = float(await client.mark_price())
-            # 买入价高于 mark 1%，作为吃单限价确保立即成交
-            entry = await client.place_limit_order(
-                "LONG", qty, mark * 1.01,
-                time_in_force="IOC",
-                fill_timeout_sec=6.0,
-                poll_interval_sec=0.5,
-                cancel_if_unfilled=True,
-            )
-            filled = float(entry.cum_filled_qty or entry.filled_qty or 0)
+            # 限价追价: 先被动挂单争取 maker 手续费, 未成交则逐档追价直至成交
+            entry = await client.place_limit_chase("LONG", qty)
+            filled = float(entry.cum_filled_qty or 0)
             if filled <= 0:
                 recon = await review.executor.reconcile(
                     reason="testnet_smoke_entry_unfilled"
@@ -431,7 +425,9 @@ def create_app(
                     },
                     "reconciliation": recon,
                 }, status=409)
-            close = await client.market_open("SHORT", filled, reduce_only=True)
+            close = await client.place_limit_chase(
+                "SHORT", filled, reduce_only=True
+            )
             after = await client.get_position()
             flat = abs(float(getattr(after, "quantity", 0) or 0)) <= 1e-12
             recon = await review.executor.reconcile(reason="testnet_smoke_done")
@@ -484,7 +480,7 @@ def create_app(
                     "position_after": {"side": "FLAT", "quantity": 0.0},
                     "reconciliation": recon,
                 })
-            close = await client.market_open(
+            close = await client.place_limit_chase(
                 "SHORT" if side == "LONG" else "LONG", qty, reduce_only=True
             )
             after = await client.get_position()
@@ -726,6 +722,126 @@ def create_app(
                     continue
         return web.json_response({"summaries": out})
 
+    async def api_strategies_active(_request):
+        """当前运行的策略定义 + 实时运行态 (数组结构, 为多策略并列预留).
+
+        定义取自 config/strategies/*.json; 运行态取自
+        runtime/shadow/deployed_state.json。仅 enabled 的策略附带运行态。
+        """
+        from pathlib import Path as _P
+        root = _P(__file__).resolve().parents[1]
+        strat_dir = root / "config" / "strategies"
+        state_path = root / "runtime" / "shadow" / "deployed_state.json"
+        live = {}
+        try:
+            if state_path.exists():
+                live = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            live = {}
+        out = []
+        try:
+            for f in sorted(strat_dir.glob("*.json")):
+                try:
+                    d = json.loads(f.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                out.append({**d, "runtime": live if d.get("enabled") else None})
+        except Exception:
+            pass
+        return web.json_response({"strategies": out})
+
+    async def api_binance_orders(request):
+        """币安历史委托 —— 以交易所为准, 非本地账本."""
+        client = review.executor.client
+        if not client.configured:
+            return web.json_response(
+                {"connected": False, "reason": "binance_keys_missing", "orders": []}
+            )
+        try:
+            limit = int(request.query.get("limit", 50))
+        except Exception:
+            limit = 50
+        try:
+            orders = await client.all_orders(limit=limit)
+            return web.json_response({"connected": True, "orders": orders})
+        except Exception as exc:
+            return web.json_response({
+                "connected": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "orders": [],
+            })
+
+    async def api_binance_trades(request):
+        """币安历史成交 —— 含 realizedPnl 与 commission, 是盈亏的唯一可信来源."""
+        client = review.executor.client
+        if not client.configured:
+            return web.json_response(
+                {"connected": False, "reason": "binance_keys_missing", "trades": []}
+            )
+        try:
+            limit = int(request.query.get("limit", 50))
+        except Exception:
+            limit = 50
+        try:
+            trades = await client.user_trades(limit=limit)
+            return web.json_response({"connected": True, "trades": trades})
+        except Exception as exc:
+            return web.json_response({
+                "connected": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "trades": [],
+            })
+
+    async def api_account_summary(_request):
+        """账户汇总: 余额 + 已实现/未实现盈亏 + 手续费 + 胜率与盈亏比."""
+        client = review.executor.client
+        if not client.configured:
+            return web.json_response(
+                {"connected": False, "reason": "binance_keys_missing"}
+            )
+        try:
+            bal = await client.get_balance()
+            pos = await client.get_position()
+            trades = []
+            try:
+                trades = await client.user_trades(limit=200)
+            except Exception:
+                trades = []
+            pnls = [float(t.get("realizedPnl", 0) or 0) for t in trades]
+            realized = sum(pnls)
+            commission = sum(float(t.get("commission", 0) or 0) for t in trades)
+            wins = sum(1 for p in pnls if p > 0)
+            losses = sum(1 for p in pnls if p < 0)
+            gross_win = sum(p for p in pnls if p > 0)
+            gross_loss = -sum(p for p in pnls if p < 0)
+            return web.json_response({
+                "connected": True,
+                "wallet_balance": float(
+                    getattr(bal, "total_wallet_balance", 0) or 0
+                ),
+                "available_balance": float(
+                    getattr(bal, "available_balance", 0) or 0
+                ),
+                "unrealized_pnl": float(getattr(pos, "unrealized_pnl", 0) or 0),
+                "realized_pnl": realized,
+                "commission": commission,
+                "net_pnl": realized - commission,
+                "trade_count": len(trades),
+                "wins": wins,
+                "losses": losses,
+                "win_rate": (wins / (wins + losses)) if (wins + losses) else 0.0,
+                "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else 0.0,
+                "position": {
+                    "side": str(getattr(pos, "side", "FLAT") or "FLAT"),
+                    "quantity": float(getattr(pos, "quantity", 0) or 0),
+                    "entry_price": float(getattr(pos, "entry_price", 0) or 0),
+                },
+            })
+        except Exception as exc:
+            return web.json_response({
+                "connected": False, "reason": f"{type(exc).__name__}: {exc}"
+            })
+
     # routes
     app.router.add_get("/", index)
     app.router.add_get("/api/live", api_live)
@@ -736,6 +852,10 @@ def create_app(
     app.router.add_get("/api/stats", api_stats)
     app.router.add_get("/api/config", api_config)
     app.router.add_get("/api/strategies", api_strategies)
+    app.router.add_get("/api/strategies/active", api_strategies_active)
+    app.router.add_get("/api/binance/orders", api_binance_orders)
+    app.router.add_get("/api/binance/trades", api_binance_trades)
+    app.router.add_get("/api/account/summary", api_account_summary)
     app.router.add_post("/api/strategies", api_strategy_add)
     app.router.add_post("/api/settle/run", api_settle_run)
     app.router.add_post("/api/review/run", api_review_run)

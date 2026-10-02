@@ -26,6 +26,22 @@ from trading.models import AccountBalance, ManagedOrder, OrderResult, OrderState
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# 限价追价参数 (改动 B)
+#
+# 设计目标: 先被动挂单争取 maker 手续费, 未成交则逐档朝市价推进,
+# 最后一档穿越盘口确保成交。绝不静默挂单不成交。
+# ---------------------------------------------------------------------------
+CHASE_INITIAL_OFFSET_BPS = 2.0     # 初始被动偏移 (万分之几), 且不小于 1 tick
+CHASE_POLL_INTERVAL = 3.0          # 每档轮询间隔 (秒)
+CHASE_REPRICE_INTERVAL = 5.0       # 每档等待多久后追价 (秒)
+CHASE_MAX_STEPS = 6                # 最大追价档数
+CHASE_ORDER_TIMEOUT = 120.0        # 整笔超时上限 (秒)
+
+# 每档价格 = mark ± frac × offset。负值=被动(赚 maker), 正值=朝市价推进,
+# 最后一档 2.0 倍偏移确保穿越盘口。
+_CHASE_FRACS = (-1.0, -0.5, 0.0, 0.5, 1.0, 2.0)
+
 
 def _new_client_order_id(prefix: str = "btc") -> str:
     """Binance clientOrderId ≤ 36 chars."""
@@ -885,6 +901,151 @@ class BinanceTestnetClient:
             ),
             raw=last.raw if isinstance(last.raw, dict) else {},
         )
+
+    async def place_limit_chase(
+        self,
+        side: str,
+        quantity: float,
+        symbol: Optional[str] = None,
+        *,
+        reduce_only: bool = False,
+        mark_price: Optional[float] = None,
+        max_steps: Optional[int] = None,
+    ) -> OrderResult:
+        """被动限价挂单 + 追价循环: 争取 maker 手续费, 同时保证成交.
+
+        价格阶梯 (做多为例, offset = 初始被动偏移, 不小于 1 tick):
+            档0  mark - offset      被动, 等价格下来 (maker)
+            档1  mark - offset/2
+            档2  mark               盘口
+            档3  mark + offset/2
+            档4  mark + offset
+            档5  mark + 2*offset    穿越盘口, 确保成交 (taker)
+
+        做空为对称反向。绝不静默挂单不成交: 追完所有档仍未成交则明确返回失败。
+
+        竞态处理: 每档撤单后必须复核订单状态 —— 撤单与成交可能同时发生,
+        撤单返回 -2011 (订单不存在/已成交) 同样按成交复核, 避免漏记成交。
+        """
+        symbol = symbol or self.symbol
+        lot_step = await self._lot_step(symbol)
+        qty = self._qty_precision(quantity, lot_step)
+        if qty <= 0:
+            return OrderResult(
+                ok=False, error=f"quantity too small: {quantity}", symbol=symbol
+            )
+        tick = await self.price_tick(symbol)
+        if mark_price is None or mark_price <= 0:
+            mark_price = await self.mark_price(symbol)
+        if not mark_price or mark_price <= 0:
+            return OrderResult(
+                ok=False, error="mark price unavailable", symbol=symbol
+            )
+
+        offset = max(tick, mark_price * CHASE_INITIAL_OFFSET_BPS / 10000.0)
+        is_long = side.upper() == "LONG"
+        steps = max(1, min(int(max_steps or CHASE_MAX_STEPS), len(_CHASE_FRACS)))
+        deadline = time.time() + CHASE_ORDER_TIMEOUT
+        attempts: List[Dict[str, Any]] = []
+
+        for idx in range(steps):
+            if time.time() >= deadline:
+                break
+            frac = _CHASE_FRACS[idx]
+            signed = frac if is_long else -frac
+            px = self._price_precision(mark_price + signed * offset, tick)
+            cid = _new_client_order_id(f"ch{idx}")
+            res = await self.place_limit_order(
+                side,
+                qty,
+                px,
+                symbol,
+                reduce_only=reduce_only,
+                client_order_id=cid,
+                fill_timeout_sec=CHASE_REPRICE_INTERVAL,
+                poll_interval_sec=CHASE_POLL_INTERVAL,
+                cancel_if_unfilled=True,
+            )
+            filled = float(res.cum_filled_qty or 0)
+            if filled > 0:
+                attempts.append({"step": idx, "price": px, "filled": filled})
+                return self._with_chase_meta(res, attempts, offset)
+
+            # 撤单后复核: 撤单与成交可能竞态
+            final = await self.query_order(client_order_id=cid, symbol=symbol)
+            final_filled = float(final.cum_filled_qty or final.filled_qty or 0)
+            if final.state == OrderState.FILLED or final_filled > 0:
+                attempts.append({"step": idx, "price": px, "filled": final_filled})
+                return self._with_chase_meta(
+                    final.to_order_result(), attempts, offset
+                )
+            attempts.append({"step": idx, "price": px, "filled": 0.0})
+
+        return OrderResult(
+            ok=False,
+            symbol=symbol,
+            side="BUY" if is_long else "SELL",
+            position_side=side.upper(),
+            quantity=0.0,
+            requested_qty=quantity,
+            submitted_qty=qty,
+            cum_filled_qty=0.0,
+            avg_price=0.0,
+            status=OrderState.CANCELED.value,
+            client_order_id="",
+            order_state=OrderState.CANCELED.value,
+            error=f"chase_exhausted: {steps} 档追价后仍未成交",
+            raw={"chase": {"attempts": attempts, "offset": offset, "steps": steps}},
+        )
+
+    @staticmethod
+    def _with_chase_meta(
+        res: OrderResult, attempts: List[Dict[str, Any]], offset: float
+    ) -> OrderResult:
+        """把追价过程写入 raw.chase, 供日志统计 maker/taker 与档数."""
+        meta = {
+            "attempts": attempts,
+            "steps_used": len(attempts),
+            "offset": offset,
+            "final_step": attempts[-1]["step"] if attempts else -1,
+            # 档 0 即成交 = 价格主动来找我们 = maker; 否则基本是 taker
+            "likely_maker": bool(attempts) and attempts[-1]["step"] == 0,
+        }
+        raw = res.raw if isinstance(res.raw, dict) else {}
+        res.raw = {**raw, "chase": meta}
+        return res
+
+    async def all_orders(
+        self, symbol: Optional[str] = None, *, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """历史委托 (GET /fapi/v1/allOrders) —— 币安侧真实记录, 非本地账本."""
+        symbol = symbol or self.symbol
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "limit": max(1, min(int(limit), 1000)),
+        }
+        raw = await self._request(
+            "GET", "/fapi/v1/allOrders", params, signed=True
+        )
+        return raw if isinstance(raw, list) else []
+
+    async def user_trades(
+        self, symbol: Optional[str] = None, *, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """历史成交 (GET /fapi/v1/userTrades) —— 含 realizedPnl 与 commission.
+
+        这是「赚了多少」的唯一可信来源: 逐笔已实现盈亏与手续费都取自交易所,
+        不由本地账本推算。
+        """
+        symbol = symbol or self.symbol
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "limit": max(1, min(int(limit), 1000)),
+        }
+        raw = await self._request(
+            "GET", "/fapi/v1/userTrades", params, signed=True
+        )
+        return raw if isinstance(raw, list) else []
 
     async def market_close(self, symbol: Optional[str] = None) -> OrderResult:
         """平掉当前全部仓位 (单向净仓或双向两边)."""

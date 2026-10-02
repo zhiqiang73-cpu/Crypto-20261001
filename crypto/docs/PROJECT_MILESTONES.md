@@ -486,3 +486,67 @@ client = review.executor.client
 | 2026-10-01 | **移除全部 LLM 依赖**：新增统计复盘引擎，删除 deepseek/prompt/prompts | 349 OK |
 | 2026-10-01 | 调度器与面板改为纯算法复盘，`/api/key` 等 LLM 密钥入口已删除 | 349 OK |
 | 2026-10-01 | 端到端验证：模拟 110 笔有效样本 → 产出建议，无 Key 无网络 | 349 OK |
+
+---
+
+## 变更记录 · 2026-10-02
+
+### 本次交付（按用户 2026-10-02 指令）
+
+**1. 下单方式：市价单 → 限价单 + 追价循环**
+
+用户要求：*"把市价单委托的方式改为限价单，并且要求能够成交"*，并选定
+*"B. 挂单 + 追价循环"*，目标是 **吃 maker 手续费同时保证成交**。
+
+- `trading/binance_client.py` 新增 `place_limit_chase()`
+  - 价格阶梯（做多）：`mark−off → mark−off/2 → mark → mark+off/2 → mark+off → mark+2off`
+  - 档 0 为被动挂单（maker）；最后一档穿越盘口确保成交
+  - **撤单/成交竞态处理**：每档撤单后必须复核订单状态，`-2011` 按已成交处理
+  - 追完所有档仍未成交 → **明确返回 `chase_exhausted` 失败**，绝不静默挂单
+  - 参数：初始偏移 2bps、3 秒轮询、5 秒追价、最多 6 档、整笔 120 秒超时
+- `shadow/deploy.py` 入场与反手平仓全部改走 `place_limit_chase`
+  - 日志新增 maker/taker、追价档数、实际成交价
+- `review/panel_server.py` 冒烟与平仓按钮改走追价
+- 顺带修复：冒烟接口中 `entry.filled_qty` 的属性错误（`OrderResult` 无此字段）
+
+**2. 前端：6 页 → 2 页**
+
+- **第 1 页 · 交易总览**：余额、当前仓位、当前委托、**当前策略**、
+  赚了多少（笔数/胜负/胜率/手续费）、**历史委托**、**历史成交**
+- **第 2 页 · 账户连接**：API Key 管理、连接状态、冒烟/平仓/对账按钮
+- 删除：策略中心页、"粘贴 Claude 结论"导入框、交易日志页、风控闸门页
+- 所有交易数据取自币安接口，不由本地账本推算
+
+**3. 新增后端能力**
+
+| 方法/路由 | 说明 |
+| --- | --- |
+| `client.all_orders()` → `GET /api/binance/orders` | 币安历史委托 |
+| `client.user_trades()` → `GET /api/binance/trades` | 币安历史成交（含 realizedPnl / commission） |
+| `GET /api/account/summary` | 余额、已实现/未实现、手续费、胜率、盈亏比 |
+| `GET /api/strategies/active` | 运行中策略定义 + 运行态（数组，为多策略预留） |
+
+**4. 策略单一事实来源**
+
+新增 `config/strategies/deployed_kdj_extreme_v1.json`，描述**实际运行**的策略：
+KDJ 极值反转，金叉且 K<30 做多 / 死叉且 K>70 做空，反手出场。
+
+> 说明：注册表中另有 `kdj_rsi_reversal_v1` 与 `trend_filter_long_v1`（均 `enabled: false`），
+> 是早期未启用的策略，UI 中以灰色"未启用"明确区分，不与运行中策略混淆。
+
+### 验证结果
+
+- 新增 `tests/test_limit_chase.py`（15 项）
+- **全量回归 364 项全部通过**（原 349 + 新增 15）
+- `node --check frontend/app.js` 通过
+- 接口实测（Testnet 真实数据）：
+  - `/api/strategies/active` 正确返回 3 个策略，运行中的标记 `enabled=True`
+  - `/api/account/summary`：余额 4951.29、已实现 −23.83、手续费 7.18、净 −31.01、9 笔成交、胜率 25%
+  - `/api/binance/orders` 返回 10 条真实委托
+  - `/api/binance/trades` 返回 9 条真实成交
+
+### 仍待解决
+
+- **24 小时不间断运行未实现**：会话服务存活上限约 2 小时，需 launchd 守护
+- 灾难止损与风控熔断尚未在真实行情中触发过
+- 追价的实际 maker 占比需累积样本后统计
