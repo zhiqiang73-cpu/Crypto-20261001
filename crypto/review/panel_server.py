@@ -752,6 +752,25 @@ def create_app(
                     continue
         return web.json_response({"summaries": out})
 
+    async def api_strategy_reading(_request):
+        """策略此刻的读数快照 —— 直接取自运行器落盘的 latest_reading.json。
+
+        这是核对信号的唯一正确入口: 它记录的是 bot 真正使用的那条行情序列
+        (市场、K 线地址、OHLC、K/D、ATR 全都在), 而不是某个图表显示的东西。
+        2026-10-02 的市场错位之所以难查, 正是因为当时没有这个快照。
+        """
+        path = os.path.join(ROOT, "runtime", "shadow", "latest_reading.json")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except Exception:
+            return web.json_response({
+                "available": False,
+                "reason": "runner_not_written_yet",
+            })
+        rec["available"] = True
+        return web.json_response(rec)
+
     async def api_strategies_active(_request):
         """当前运行的策略定义 + 实时运行态 (数组结构, 为多策略并列预留).
 
@@ -902,6 +921,7 @@ def create_app(
     app.router.add_get("/api/config", api_config)
     app.router.add_get("/api/strategies", api_strategies)
     app.router.add_get("/api/strategies/active", api_strategies_active)
+    app.router.add_get("/api/strategy/reading", api_strategy_reading)
     app.router.add_get("/api/binance/orders", api_binance_orders)
     app.router.add_get("/api/binance/trades", api_binance_trades)
     app.router.add_get("/api/account/summary", api_account_summary)

@@ -1,10 +1,11 @@
 """把 KDJ+RSI 策略部署到模拟账户 (Binance Futures Testnet) 并驱动真实下单.
 
 严格按规格执行, 不增删任何条件:
-    15m 收盘判定 → 下一根开盘市价成交
+    15m 收盘判定 → 下一根开盘下单
     做多 = 金叉 且 K < 30;  做空 = 死叉 且 K > 70
     出场 = 对侧完整信号, 平仓并反手
-    仓位 = 权益 × r_eff ÷ (2 × ATR_1H), r=0.01, 向下取整 0.001
+    仓位 = 权益 × r_eff ÷ (2 × ATR_1H), r=RISK_R, 向下取整 0.001
+    开仓/平仓一律限价: post-only 贴盘口挂单争取 maker, 窗口耗尽才穿盘口兜底
     布林闸门 / 日亏 3% / 回撤 10% / 灾难止损 3×ATR_1H / 10x 逐仓
 
 只允许 Testnet; live 被 runtime_mode 闸门硬阻断。
@@ -26,7 +27,7 @@ from shadow.engine import (ATR_MULT_K, BOLL_GATE_ENABLED, DISASTER_ATR, GATE_FEE
                            GATE_STRONG, GATE_WEAK, K_LONG_MAX, K_SHORT_MIN, LEVERAGE,
                            MIN_NOTIONAL, MIN_QTY, RISK_R, floor_step)
 from shadow.indicators import atr_wilder, boll, kdj
-from shadow.live import fetch
+from shadow.live import ENDPOINTS, MARKET, fetch
 from trading.binance_client import BinanceTestnetClient
 from trading.runtime_mode import current_mode, validate_exchange_target
 from config.market_endpoints import (MARKET_MAINNET, MarketMismatchError,
@@ -37,6 +38,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 OUT = os.path.join(ROOT, "runtime", "shadow")
 TRADE_LOG = os.path.join(OUT, "deployed_trades.csv")
 STATE = os.path.join(OUT, "deployed_state.json")
+# 策略「此刻的读数」快照 —— 供面板展示, 便于用户拿它和图表逐项核对。
+READING = os.path.join(OUT, "latest_reading.json")
 
 COLS = ["时间", "动作", "方向", "数量", "价格", "净盈亏", "K", "D", "ATR_1H",
         "倍数", "权益", "说明"]
@@ -47,16 +50,19 @@ def _fmt(ms: int) -> str:
 
 
 def _chase_note(r) -> str:
-    """把限价追价过程转成一行可读备注 (maker/taker + 档数 + 成交价).
+    """把被动挂单过程转成一行可读备注 (maker/taker + 挂单次数 + 成交价).
 
     用于事后核对「是否真的吃到了 maker 手续费」—— 不靠承诺, 靠日志。
+    maker 判定不是推断: 被动阶段用 post-only (期货 TIF=GTX, 会立即成交则
+    交易所直接拒单 -5022), 交易所层面保证成交即 maker; 兜底阶段穿盘口,
+    必为 taker。
     """
     meta = (r.raw or {}).get("chase") if isinstance(r.raw, dict) else None
     if not meta:
         return ""
     tag = "maker" if meta.get("likely_maker") else "taker"
-    return (f"{tag} 档{meta.get('final_step', -1)} "
-            f"成交价={r.avg_price:.2f} 档数={meta.get('steps_used', 0)}")
+    return (f"{tag} 被动{meta.get('passive_attempts', 0)}次 "
+            f"成交价={r.avg_price:.2f} 总单数={meta.get('steps_used', 0)}")
 
 
 def log_row(row: list) -> None:
@@ -82,6 +88,21 @@ def save_state(st: dict) -> None:
     with open(STATE + ".tmp", "w", encoding="utf-8") as fh:
         json.dump(st, fh, ensure_ascii=False, indent=2)
     os.replace(STATE + ".tmp", STATE)
+
+
+def save_reading(rec: dict) -> None:
+    """落盘最新一根已收盘 K 线的完整读数。
+
+    存在的意义: 用户核对信号时, 必须能确认「bot 读的是哪个市场、哪一根、
+    哪几个数」。2026-10-02 的市场错位之所以难查, 就是因为没有这个快照。
+    """
+    os.makedirs(OUT, exist_ok=True)
+    try:
+        with open(READING + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump(rec, fh, ensure_ascii=False, indent=2)
+        os.replace(READING + ".tmp", READING)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def step(client: BinanceTestnetClient, st: dict, execute: bool) -> None:
@@ -202,6 +223,26 @@ async def step(client: BinanceTestnetClient, st: dict, execute: bool) -> None:
 
     if action:
         print(f"[{_fmt(int(ts[i]))}] {action} | {note} | K={k[i]:.1f} 倍数={mult:.2f}")
+
+    # 读数快照: 面板据此展示「bot 此刻读的是哪个市场、哪一根、哪几个数」,
+    # 用户可以直接拿它和图表逐项核对。
+    save_reading({
+        "bar_utc": _fmt(int(ts[i])),
+        "bar_ms": int(ts[i]),
+        "open": float(o[i]), "high": float(h[i]),
+        "low": float(l[i]), "close": float(px),
+        "K": float(k[i]), "D": float(d[i]),
+        "ATR_1H": float(atr_al[i]),
+        "mult": float(mult),
+        "signal_long": sig_long, "signal_short": sig_short,
+        "position": "多" if ex_side > 0 else ("空" if ex_side < 0 else "空仓"),
+        "market": MARKET,
+        "symbol": "BTCUSDT", "interval": "15m",
+        "kline_url": ENDPOINTS.rest + "/fapi/v1/klines",
+        "ws": ENDPOINTS.ws,
+        "account_base_url": ENDPOINTS.account_base_url,
+        "updated_ms": now,
+    })
     st["last_ts"] = int(ts[i])
     save_state(st)
 
@@ -209,7 +250,9 @@ async def step(client: BinanceTestnetClient, st: dict, execute: bool) -> None:
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--execute", action="store_true", help="真正下单; 不加则只观察")
-    ap.add_argument("--interval", type=int, default=60)
+    # 轮询间隔从 60s 收紧到 15s: 被动挂单要靠"早"才吃得到 maker,
+    # 每根 15m K 线只判一次信号, 判到就应立刻挂到盘口。
+    ap.add_argument("--interval", type=int, default=15)
     ap.add_argument("--once", action="store_true")
     args = ap.parse_args()
 
