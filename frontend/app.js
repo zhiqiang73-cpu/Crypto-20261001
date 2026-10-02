@@ -291,6 +291,45 @@
     }
   }
 
+  // 策略此刻的读数 —— 核对信号请以此为准, 不要拿交易所图表比对。
+  async function loadReading() {
+    const box = $("readingBox");
+    if (!box) return;
+    try {
+      const d = await api("/api/strategy/reading");
+      if (!d.available) {
+        box.innerHTML = empty("运行器尚未写入读数", d.reason || "");
+        if ($("readingMarketTag")) $("readingMarketTag").textContent = "—";
+        return;
+      }
+      const mk =
+        d.market === "testnet" ? "测试网" : d.market === "mainnet" ? "主网" : d.market;
+      if ($("readingMarketTag")) {
+        $("readingMarketTag").textContent = `${mk} · ${d.interval || ""} · ${d.bar_utc || ""} UTC`;
+      }
+      const f = (v, n) => (v === null || v === undefined || Number.isNaN(Number(v)) ? "—" : Number(v).toFixed(n));
+      const cells = [
+        ["市场", mk],
+        ["K 线 OHLC", `${f(d.open, 2)} / ${f(d.high, 2)} / ${f(d.low, 2)} / ${f(d.close, 2)}`],
+        ["K", f(d.K, 2)],
+        ["D", f(d.D, 2)],
+        ["ATR_1H", f(d.ATR_1H, 2)],
+        ["持仓", d.position || "—"],
+        ["做多信号", d.signal_long ? "是" : "否"],
+        ["做空信号", d.signal_short ? "是" : "否"],
+        ["K 线数据源", d.kline_url || "—"],
+        ["账户地址", d.account_base_url || "—"],
+        ["行情 WS", d.ws || "—"],
+        ["更新于", d.updated_ms ? fmtTime(d.updated_ms) : "—"],
+      ];
+      box.innerHTML = cells
+        .map(([k, v]) => `<div class="kv-row"><span>${esc(k)}</span><b>${esc(String(v))}</b></div>`)
+        .join("");
+    } catch (e) {
+      box.innerHTML = empty("读数读取失败", String(e.message || e));
+    }
+  }
+
   async function loadStrategies() {
     const box = $("strategyList");
     if (!box) return;
@@ -434,6 +473,7 @@
       loadSummary(),
       loadOpenOrders(),
       loadStrategies(),
+      loadReading(),
       loadOrders(),
       loadTrades(),
     ]);

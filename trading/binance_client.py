@@ -27,20 +27,32 @@ from trading.models import AccountBalance, ManagedOrder, OrderResult, OrderState
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 限价追价参数 (改动 B)
+# 限价成交参数 (改动 C)
 #
-# 设计目标: 先被动挂单争取 maker 手续费, 未成交则逐档朝市价推进,
-# 最后一档穿越盘口确保成交。绝不静默挂单不成交。
+# 硬性要求 (2026-10-02 用户指令): 开仓和平仓一律走限价单, 不允许市价。
+#
+# 交易所规则决定了两个必须先讲清的事实, 整个设计围着它们转:
+#   (1) 穿盘口的限价单会立即成交并按 taker 收费 —— 和市价单同价。
+#       所以"走限价"本身不省手续费, "挂成 maker"才省。
+#   (2) post-only 是唯一能硬保证 maker 的订单类型 (币安期货写法:
+#       type=LIMIT + timeInForce=GTX): 若该单会立即成交, 交易所直接拒单
+#       (-5022), 永远不会变成 taker。
+#
+# 因此本实现: 被动阶段一律用 post-only 贴盘口挂单, 成交即必为 maker
+# (0.02%/边)。只有窗口耗尽后的兜底那一单才允许穿盘口 (= taker)。
 # ---------------------------------------------------------------------------
-CHASE_INITIAL_OFFSET_BPS = 2.0     # 初始被动偏移 (万分之几), 且不小于 1 tick
-CHASE_POLL_INTERVAL = 3.0          # 每档轮询间隔 (秒)
-CHASE_REPRICE_INTERVAL = 5.0       # 每档等待多久后追价 (秒)
-CHASE_MAX_STEPS = 6                # 最大追价档数
-CHASE_ORDER_TIMEOUT = 120.0        # 整笔超时上限 (秒)
+CHASE_POLL_INTERVAL = 3.0          # 订单状态轮询间隔 (秒)
 
-# 每档价格 = mark ± frac × offset。负值=被动(赚 maker), 正值=朝市价推进,
-# 最后一档 2.0 倍偏移确保穿越盘口。
-_CHASE_FRACS = (-1.0, -0.5, 0.0, 0.5, 1.0, 2.0)
+PASSIVE_REPRICE_SEC = 5.0      # 每个挂单挂多久, 未成交则撤单跟盘口重挂
+PASSIVE_WINDOW_SEC = 180.0     # 被动窗口总时长 (秒), 耗尽后走兜底
+PASSIVE_MAX_REPRICE = 60       # 最多重挂次数 (防止窗口内空转)
+PASSIVE_MAX_PAD = 5            # 被 post-only 拒单后最多退几个 tick
+PASSIVE_CROSS_TICKS = 5        # 兜底穿盘口时超出盘口几个 tick (=滑点上限)
+
+# 窗口耗尽后的行为:
+#   "cross"   = 穿盘口限价单成交 (仍是限价单, 但按 taker 收费, 与市价等价)
+#   "abandon" = 放弃本单, 不成交 (信号作废, 但手续费一分不付)
+PASSIVE_ON_TIMEOUT = "cross"
 
 
 def _new_client_order_id(prefix: str = "btc") -> str:
@@ -205,6 +217,18 @@ class BinanceTestnetClient:
             "GET", "/fapi/v1/premiumIndex", {"symbol": symbol or self.symbol}
         )
         return float(data.get("markPrice") or 0)
+
+    async def book_ticker(self, symbol: Optional[str] = None) -> Dict[str, float]:
+        """盘口最优买卖价 (公开接口, 无需签名).
+
+        被动挂单必须基于盘口而不是 mark price: mark 是标记价, 与真实最优
+        买卖价差一个点差, 用它算出来的"被动价"可能已经穿过盘口变成 taker。
+        """
+        data = await self._request(
+            "GET", "/fapi/v1/ticker/bookTicker", {"symbol": symbol or self.symbol}
+        )
+        return {"bid": float(data.get("bidPrice") or 0),
+                "ask": float(data.get("askPrice") or 0)}
 
     async def set_leverage(self, leverage: int, symbol: Optional[str] = None) -> dict:
         return await self._request(
@@ -769,6 +793,7 @@ class BinanceTestnetClient:
         fill_timeout_sec: float = 6.0,
         poll_interval_sec: float = 0.5,
         cancel_if_unfilled: bool = False,
+        post_only: bool = False,
     ) -> OrderResult:
         """限价单：提交后轮询确认成交，绝不把 NEW 当作失败。
 
@@ -777,6 +802,10 @@ class BinanceTestnetClient:
           * 网络异常时先查询订单；只有确认零成交才允许取消
           * 部分成交后即使被取消，也按实际成交量返回
           * 只有明确拒单（-2013 / -2015 / -1111）才标记 REJECTED
+
+        post_only=True 时改用 GTX (币安期货的 post-only TIF): 若该单会立即
+        成交, 交易所直接拒单 (-5022), 调用方应把价格让开重挂。
+        这是唯一能从交易所层面硬保证成交即 maker 的方式。
         """
         symbol = symbol or self.symbol
         step = await self._lot_step(symbol)
@@ -795,13 +824,17 @@ class BinanceTestnetClient:
         order_side = "BUY" if side_u == "LONG" else "SELL"
         cid = client_order_id or _new_client_order_id("lmt")
         tif = (time_in_force or "GTC").upper()
+        # post-only 在币安期货上不是订单类型, 而是 TIF:
+        #   现货 type=LIMIT_MAKER; 期货 type=LIMIT + timeInForce=GTX
+        #   (GTX = Good-Till-Crossing: 只做 maker, 会立即成交则交易所拒单)
+        # 用成 LIMIT_MAKER 会得到 -1116 Invalid orderType —— 2026-10-02 实测。
         params: Dict[str, Any] = {
             "symbol": symbol,
             "side": order_side,
             "type": "LIMIT",
-            "timeInForce": tif,
             "quantity": qty,
             "price": limit_price,
+            "timeInForce": "GTX" if post_only else tif,
             "newClientOrderId": cid,
         }
         hedge = False
@@ -835,6 +868,23 @@ class BinanceTestnetClient:
                     client_order_id=cid, fill_timeout_sec=fill_timeout_sec,
                     poll_interval_sec=poll_interval_sec,
                     cancel_if_unfilled=cancel_if_unfilled,
+                    post_only=post_only,
+                )
+            if post_only and (
+                # 期货实测拒单码: -5022 "could not be executed as maker"
+                # 现货/旧版文案是 "would immediately match", 两个都认。
+                "-5022" in submit_error
+                or "could not be executed as maker" in submit_error
+                or "would immediately match" in submit_error
+                or "IMMEDIATELY_MATCH" in submit_error
+            ):
+                # 挂单价格已经穿过盘口: 不是错误, 是"让开一档"的信号
+                return OrderResult(
+                    ok=False, error=f"POST_ONLY_REJECT: {submit_error[:120]}",
+                    symbol=symbol, side=order_side, position_side=side_u,
+                    client_order_id=cid, order_state=OrderState.REJECTED.value,
+                    requested_qty=quantity, submitted_qty=0.0,
+                    cum_filled_qty=0.0, quantity=0.0,
                 )
             if "-2013" in submit_error or "Order does not exist" in submit_error:
                 return OrderResult(
@@ -911,18 +961,25 @@ class BinanceTestnetClient:
         reduce_only: bool = False,
         mark_price: Optional[float] = None,
         max_steps: Optional[int] = None,
+        window_sec: Optional[float] = None,
     ) -> OrderResult:
-        """被动限价挂单 + 追价循环: 争取 maker 手续费, 同时保证成交.
+        """被动限价挂单 (post-only) + 跟盘口重挂, 超时兜底.
 
-        价格阶梯 (做多为例, offset = 初始被动偏移, 不小于 1 tick):
-            档0  mark - offset      被动, 等价格下来 (maker)
-            档1  mark - offset/2
-            档2  mark               盘口
-            档3  mark + offset/2
-            档4  mark + offset
-            档5  mark + 2*offset    穿越盘口, 确保成交 (taker)
+        订单类型: 被动阶段一律 post-only (type=LIMIT + timeInForce=GTX)。
+        该模式下交易所会直接拒掉任何会立即成交的单 (-5022), 所以只要成交,
+        手续费必定是 maker。这不是约定, 是规则。
 
-        做空为对称反向。绝不静默挂单不成交: 追完所有档仍未成交则明确返回失败。
+        挂价 (基于真实盘口, 不是 mark price):
+            做多: min(best_bid - pad*tick, best_ask - tick)   —— 绝不碰 best_ask
+            做空: max(best_ask + pad*tick, best_bid + tick)   —— 绝不碰 best_bid
+
+        跟随逻辑: 每 PASSIVE_REPRICE_SEC 秒撤单重读盘口重挂。
+            市场朝我有利走 → 挂价跟着走 → 一路贴住最优价
+            市场朝我不利走 → 挂价也跟着走 → 始终留在盘口第一档等对手方
+
+        兜底: 窗口 PASSIVE_WINDOW_SEC 用尽仍未成交, 按 PASSIVE_ON_TIMEOUT 处理:
+            "cross"   → 穿盘口限价单成交 (taker, 与市价等价, 但有滑点上限)
+            "abandon" → 放弃本单, 明确返回失败
 
         竞态处理: 每档撤单后必须复核订单状态 —— 撤单与成交可能同时发生,
         撤单返回 -2011 (订单不存在/已成交) 同样按成交复核, 避免漏记成交。
@@ -935,26 +992,26 @@ class BinanceTestnetClient:
                 ok=False, error=f"quantity too small: {quantity}", symbol=symbol
             )
         tick = await self.price_tick(symbol)
-        if mark_price is None or mark_price <= 0:
-            mark_price = await self.mark_price(symbol)
-        if not mark_price or mark_price <= 0:
-            return OrderResult(
-                ok=False, error="mark price unavailable", symbol=symbol
-            )
-
-        offset = max(tick, mark_price * CHASE_INITIAL_OFFSET_BPS / 10000.0)
         is_long = side.upper() == "LONG"
-        steps = max(1, min(int(max_steps or CHASE_MAX_STEPS), len(_CHASE_FRACS)))
-        deadline = time.time() + CHASE_ORDER_TIMEOUT
+        deadline = time.time() + (window_sec or PASSIVE_WINDOW_SEC)
         attempts: List[Dict[str, Any]] = []
+        pad = 0
 
-        for idx in range(steps):
-            if time.time() >= deadline:
-                break
-            frac = _CHASE_FRACS[idx]
-            signed = frac if is_long else -frac
-            px = self._price_precision(mark_price + signed * offset, tick)
-            cid = _new_client_order_id(f"ch{idx}")
+        while time.time() < deadline and len(attempts) < PASSIVE_MAX_REPRICE:
+            book = await self.book_ticker(symbol)
+            bid, ask = book["bid"], book["ask"]
+            if bid <= 0 or ask <= 0:
+                return OrderResult(
+                    ok=False, error="book ticker unavailable", symbol=symbol
+                )
+            if is_long:
+                px = min(bid - pad * tick, ask - tick)
+            else:
+                px = max(ask + pad * tick, bid + tick)
+            px = self._price_precision(px, tick)
+
+            idx = len(attempts)
+            cid = _new_client_order_id(f"ps{idx}")
             res = await self.place_limit_order(
                 side,
                 qty,
@@ -962,54 +1019,98 @@ class BinanceTestnetClient:
                 symbol,
                 reduce_only=reduce_only,
                 client_order_id=cid,
-                fill_timeout_sec=CHASE_REPRICE_INTERVAL,
+                fill_timeout_sec=PASSIVE_REPRICE_SEC,
                 poll_interval_sec=CHASE_POLL_INTERVAL,
                 cancel_if_unfilled=True,
+                post_only=True,
             )
             filled = float(res.cum_filled_qty or 0)
             if filled > 0:
-                attempts.append({"step": idx, "price": px, "filled": filled})
-                return self._with_chase_meta(res, attempts, offset)
+                attempts.append({"step": idx, "price": px, "filled": filled,
+                                 "bid": bid, "ask": ask, "maker": True})
+                return self._with_passive_meta(res, attempts, maker=True)
 
             # 撤单后复核: 撤单与成交可能竞态
             final = await self.query_order(client_order_id=cid, symbol=symbol)
             final_filled = float(final.cum_filled_qty or final.filled_qty or 0)
             if final.state == OrderState.FILLED or final_filled > 0:
-                attempts.append({"step": idx, "price": px, "filled": final_filled})
-                return self._with_chase_meta(
-                    final.to_order_result(), attempts, offset
+                attempts.append({"step": idx, "price": px, "filled": final_filled,
+                                 "bid": bid, "ask": ask, "maker": True})
+                return self._with_passive_meta(
+                    final.to_order_result(), attempts, maker=True
                 )
-            attempts.append({"step": idx, "price": px, "filled": 0.0})
 
+            if res.error and "POST_ONLY_REJECT" in res.error:
+                # 盘口在读取与提交之间动了, 价格已经站到对手方: 让开一档
+                pad = min(pad + 1, PASSIVE_MAX_PAD)
+                attempts.append({"step": idx, "price": px, "filled": 0.0,
+                                 "bid": bid, "ask": ask, "reject": "post_only"})
+                continue
+            pad = 0
+            attempts.append({"step": idx, "price": px, "filled": 0.0,
+                             "bid": bid, "ask": ask})
+
+        # ---- 兜底 --------------------------------------------------------
+        if PASSIVE_ON_TIMEOUT == "abandon":
+            return OrderResult(
+                ok=False, symbol=symbol,
+                side="BUY" if is_long else "SELL", position_side=side.upper(),
+                quantity=0.0, requested_qty=quantity, submitted_qty=qty,
+                cum_filled_qty=0.0, avg_price=0.0,
+                status=OrderState.CANCELED.value, client_order_id="",
+                order_state=OrderState.CANCELED.value,
+                error=f"passive_abandoned: {len(attempts)} 次被动挂单未成交, "
+                      f"按配置放弃 (未付任何手续费)",
+                raw={"chase": {"attempts": attempts, "likely_maker": False}},
+            )
+
+        book = await self.book_ticker(symbol)
+        bid, ask = book["bid"], book["ask"]
+        cross_px = self._price_precision(
+            (ask + PASSIVE_CROSS_TICKS * tick) if is_long
+            else (bid - PASSIVE_CROSS_TICKS * tick), tick
+        )
+        cid = _new_client_order_id("cx")
+        res = await self.place_limit_order(
+            side, qty, cross_px, symbol,
+            reduce_only=reduce_only, client_order_id=cid,
+            fill_timeout_sec=10.0, poll_interval_sec=CHASE_POLL_INTERVAL,
+            cancel_if_unfilled=False,
+        )
+        filled = float(res.cum_filled_qty or 0)
+        if filled > 0:
+            attempts.append({"step": len(attempts), "price": cross_px,
+                             "filled": filled, "bid": bid, "ask": ask,
+                             "maker": False, "cross": True})
+            return self._with_passive_meta(res, attempts, maker=False)
         return OrderResult(
-            ok=False,
-            symbol=symbol,
-            side="BUY" if is_long else "SELL",
-            position_side=side.upper(),
-            quantity=0.0,
-            requested_qty=quantity,
-            submitted_qty=qty,
-            cum_filled_qty=0.0,
-            avg_price=0.0,
-            status=OrderState.CANCELED.value,
-            client_order_id="",
+            ok=False, symbol=symbol,
+            side="BUY" if is_long else "SELL", position_side=side.upper(),
+            quantity=0.0, requested_qty=quantity, submitted_qty=qty,
+            cum_filled_qty=0.0, avg_price=0.0,
+            status=OrderState.CANCELED.value, client_order_id=cid,
             order_state=OrderState.CANCELED.value,
-            error=f"chase_exhausted: {steps} 档追价后仍未成交",
-            raw={"chase": {"attempts": attempts, "offset": offset, "steps": steps}},
+            error=f"passive_exhausted: 被动 {len(attempts)} 次 + 兜底穿盘口仍未成交",
+            raw={"chase": {"attempts": attempts, "likely_maker": False}},
         )
 
     @staticmethod
-    def _with_chase_meta(
-        res: OrderResult, attempts: List[Dict[str, Any]], offset: float
+    def _with_passive_meta(
+        res: OrderResult, attempts: List[Dict[str, Any]], *, maker: bool
     ) -> OrderResult:
-        """把追价过程写入 raw.chase, 供日志统计 maker/taker 与档数."""
+        """把挂单过程写入 raw.chase, 供日志统计 maker/taker 与档数.
+
+        maker 不再是推断: 被动阶段走 post-only, 成交必为 maker;
+        兜底阶段穿盘口, 必为 taker。
+        """
         meta = {
             "attempts": attempts,
             "steps_used": len(attempts),
-            "offset": offset,
             "final_step": attempts[-1]["step"] if attempts else -1,
-            # 档 0 即成交 = 价格主动来找我们 = maker; 否则基本是 taker
-            "likely_maker": bool(attempts) and attempts[-1]["step"] == 0,
+            "likely_maker": bool(maker),
+            "passive_attempts": sum(
+                1 for a in attempts if a.get("maker") or a.get("reject")
+            ),
         }
         raw = res.raw if isinstance(res.raw, dict) else {}
         res.raw = {**raw, "chase": meta}
