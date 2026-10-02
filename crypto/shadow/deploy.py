@@ -1,12 +1,11 @@
 """KDJ 交叉策略的币安合约测试网运行器。
-当前规则:
-    15m 收盘判定 → 下一根开盘下单
-    做多 = 金叉; 做空 = 死叉; 不使用 K 数值阈值
-    出场 = 对侧交叉, 先平仓，经交易所确认归零后再开反向仓
-    仓位 = 权益 × r_eff ÷ (2 × ATR_1H), r=RISK_R, 向下取整 0.001
+
+BTCUSDT 与 ETHUSDT 各跑两条策略，按标的各记虚拟仓、只下该标的净额：
+    15m: 金叉做多 / 死叉做空，无 K 阈值
+    5m:  金叉且 K<30 做多 / 死叉且 K>70 做空
+    仓位 = 权益 × r ÷ (2 × ATR_1H), r=RISK_R, 向下取整 0.001
     开仓/平仓一律限价: post-only 贴盘口挂单争取 maker, 窗口耗尽才穿盘口兜底
     布林带仅记录 / 日亏 3% / 回撤 10% / 10x 逐仓
-    注意：灾难止损仍未在本运行器中持续执行，不能当作已受保护。
 
 只允许 Testnet; live 被 runtime_mode 闸门硬阻断。
 """
@@ -24,12 +23,16 @@ from typing import Optional
 
 import numpy as np
 
-from shadow.engine import (ATR_MULT_K, BOLL_GATE_ENABLED, DISASTER_ATR, GATE_FEE_RATE,
-                           GATE_STRONG, GATE_WEAK, LEVERAGE,
-                           MIN_NOTIONAL, MIN_QTY, RISK_R, floor_step)
+from shadow.engine import (ATR_MULT_K, DISASTER_ATR, GATE_FEE_RATE,
+                           LEVERAGE, MIN_QTY, RISK_R, floor_step)
 from shadow.indicators import atr_wilder, boll, kdj
-from shadow.signals import crossing
+from shadow.signals import entry_signal
 from shadow.live import ENDPOINTS, MARKET, fetch
+from shadow.strategy_books import (SPEC_15M, SPEC_5M, SPECS, TRADE_SYMBOLS,
+                                   apply_virtual_signal, clear_symbol_books,
+                                   desired_net, migrate_state,
+                                   reduce_only_for_delta, signal_reason,
+                                   specs_for_symbol, symbol_short)
 from trading.binance_client import BinanceTestnetClient
 from trading.runtime_mode import current_mode, validate_exchange_target
 from config.market_endpoints import (MARKET_MAINNET, MarketMismatchError,
@@ -42,6 +45,15 @@ TRADE_LOG = os.path.join(OUT, "deployed_trades.csv")
 STATE = os.path.join(OUT, "deployed_state.json")
 # 策略「此刻的读数」快照 —— 供面板展示, 便于用户拿它和图表逐项核对。
 READING = os.path.join(OUT, "latest_reading.json")
+READING_5M = os.path.join(OUT, "latest_reading_5m.json")
+READING_ETH15 = os.path.join(OUT, "latest_reading_eth15.json")
+READING_ETH5 = os.path.join(OUT, "latest_reading_eth5.json")
+READING_BY_SPEC = {
+    "kdj15": lambda: READING,
+    "kdj5": lambda: READING_5M,
+    "eth15": lambda: READING_ETH15,
+    "eth5": lambda: READING_ETH5,
+}
 # 策略自己下过的委托号台账 —— 用于把「策略单」与「功能测试单」可靠分开。
 ORDER_LEDGER = os.path.join(OUT, "deployed_orders.jsonl")
 # 运行器心跳 —— 页面据此区分「最新读数」和「运行器确实仍在运行」。
@@ -133,6 +145,7 @@ def record_order(r, *, action: str) -> None:
         "avg_price": float(getattr(r, "avg_price", 0.0) or 0.0),
         "ts_ms": int(time.time() * 1000),
         "market": MARKET,
+        "symbol": str(getattr(r, "symbol", "") or ""),
     }
     os.makedirs(OUT, exist_ok=True)
     try:
@@ -145,9 +158,11 @@ def record_order(r, *, action: str) -> None:
 def load_state() -> dict:
     if os.path.exists(STATE):
         with open(STATE, encoding="utf-8") as fh:
-            return json.load(fh)
-    return {"last_ts": 0, "peak": 0.0, "day": None, "day_start_eq": 0.0,
-            "halted": False, "entry": None}
+            st = json.load(fh)
+    else:
+        st = {"last_ts": 0, "peak": 0.0, "day": None, "day_start_eq": 0.0,
+              "halted": False, "entry": None}
+    return migrate_state(st)
 
 
 def save_state(st: dict) -> None:
@@ -157,17 +172,18 @@ def save_state(st: dict) -> None:
     os.replace(STATE + ".tmp", STATE)
 
 
-def save_reading(rec: dict) -> None:
+def save_reading(rec: dict, path: Optional[str] = None) -> None:
     """落盘最新一根已收盘 K 线的完整读数。
 
     存在的意义: 用户核对信号时, 必须能确认「bot 读的是哪个市场、哪一根、
     哪几个数」。2026-10-02 的市场错位之所以难查, 就是因为没有这个快照。
     """
-    os.makedirs(OUT, exist_ok=True)
+    target = path or READING
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
     try:
-        with open(READING + ".tmp", "w", encoding="utf-8") as fh:
+        with open(target + ".tmp", "w", encoding="utf-8") as fh:
             json.dump(rec, fh, ensure_ascii=False, indent=2)
-        os.replace(READING + ".tmp", READING)
+        os.replace(target + ".tmp", target)
     except Exception:  # noqa: BLE001
         pass
 
@@ -182,7 +198,9 @@ def save_heartbeat(*, status: str, execute: bool, detail: str = "") -> None:
         "detail": detail,
         "market": MARKET,
         "symbol": "BTCUSDT",
+        "symbols": list(TRADE_SYMBOLS),
         "interval_sec": 15,
+        "strategies": [spec.id for spec in SPECS],
     }
     try:
         with open(HEARTBEAT + ".tmp", "w", encoding="utf-8") as fh:
@@ -193,16 +211,24 @@ def save_heartbeat(*, status: str, execute: bool, detail: str = "") -> None:
 
 
 def save_signal_reading(st: dict, *, i: int, ts, o, h, l, c, k, d, atr_al,
-                        up, lb, now: int, execute: bool, pos_side: str) -> None:
+                        up, lb, now: int, execute: bool, pos_side: str,
+                        interval: str = "15m",
+                        signal_rule: str = "金叉做多 / 死叉做空；不使用 K 极值过滤",
+                        k_long_max=None, k_short_min=None,
+                        path: Optional[str] = None,
+                        symbol: str = "BTCUSDT") -> None:
     """写入当前最新已收盘 K 线的读数，不依赖它是不是「新 K 线」。
 
     即使运行器重启时这根 K 线已经被处理过，也要刷新快照；否则进程崩溃在
     JSON 写入前会造成「日志是新的、页面读数却是旧的」的假象。
     """
     px = float(c[i])
-    sig_long = sig_short = False
+    sig_long = sig_short = gold = dead = False
     if i > 0:
-        sig_long, sig_short = crossing(k[i - 1], d[i - 1], k[i], d[i])
+        sig_long, sig_short, gold, dead = entry_signal(
+            k[i - 1], d[i - 1], k[i], d[i],
+            k_long_max=k_long_max, k_short_min=k_short_min,
+        )
     band_width = float(up[i] - lb[i])
     mult = (band_width / 2.0) / (GATE_FEE_RATE * px) if px > 0 else 0.0
 
@@ -210,7 +236,11 @@ def save_signal_reading(st: dict, *, i: int, ts, o, h, l, c, k, d, atr_al,
         value = float(v)
         return value if np.isfinite(value) else None
 
-    save_reading({
+    start = max(0, i + 1 - 36)
+    series_k = [finite(k[j]) for j in range(start, i + 1)]
+    series_d = [finite(d[j]) for j in range(start, i + 1)]
+
+    rec = {
         "bar_utc": _fmt(int(ts[i])),
         "bar_ms": int(ts[i]),
         "open": finite(o[i]), "high": finite(h[i]),
@@ -221,20 +251,25 @@ def save_signal_reading(st: dict, *, i: int, ts, o, h, l, c, k, d, atr_al,
         # `crossing()` 接收 NumPy 标量时会返回 numpy.bool_；json 不认识它。
         # 若不显式转换, save_reading 会静默失败、面板永远显示旧 K 线。
         "signal_long": bool(sig_long), "signal_short": bool(sig_short),
-        "signal_rule": "金叉做多 / 死叉做空；不使用 K 极值过滤",
-        "signal_needs_k_extreme": False,
+        "gold": bool(gold), "dead": bool(dead),
+        "signal_rule": signal_rule,
+        "signal_needs_k_extreme": k_long_max is not None or k_short_min is not None,
+        "k_long_max": k_long_max,
+        "k_short_min": k_short_min,
         "missed_bars": int(st.get("missed_bars", 0)),
         "missed_signals": int(st.get("missed_signals", 0)),
         "run_mode_at_snapshot": "testnet_orders" if execute else "observation_only",
         "position": "多" if pos_side == "LONG" else (
             "空" if pos_side == "SHORT" else "空仓"),
         "market": MARKET,
-        "symbol": "BTCUSDT", "interval": "15m",
+        "symbol": symbol, "interval": interval,
         "kline_url": ENDPOINTS.rest + "/fapi/v1/klines",
         "ws": ENDPOINTS.ws,
         "account_base_url": ENDPOINTS.account_base_url,
         "updated_ms": now,
-    })
+        "series": {"k": series_k, "d": series_d},
+    }
+    save_reading(rec, path)
 
 
 async def prepare_testnet_execution(client: BinanceTestnetClient) -> dict:
@@ -242,31 +277,41 @@ async def prepare_testnet_execution(client: BinanceTestnetClient) -> dict:
 
     检查顺序刻意保守：
 
-    1. 有外部挂单时拒绝启动，绝不擅自取消；
-    2. 需要改持仓模式 / 逐仓 / 杠杆但账户有仓时拒绝启动，绝不混改；
-    3. 空仓且没有挂单时才把账户设置成策略规格的「单向、10x、逐仓」；
+    1. 任一标的有外部挂单时拒绝启动，绝不擅自取消；
+    2. 需要改持仓模式 / 逐仓 / 杠杆但该标的有仓时拒绝启动，绝不混改；
+    3. 空仓且没有挂单时才把该标的设成策略规格的「单向、10x、逐仓」；
     4. 每个写入操作之后重新读取并验证，不是只相信接口没有报错。
 
     本函数只有 `--execute` 才调用。观察模式严格只读。
     """
-    orders = await client.get_open_orders()
-    pos = await client.get_position()
-    has_position = abs(float(getattr(pos, "quantity", 0.0) or 0.0)) > 1e-12
-    if orders:
+    leftover = []
+    for symbol in TRADE_SYMBOLS:
+        leftover.extend(await client.get_open_orders(symbol))
+    if leftover:
         raise RuntimeError(
-            f"检测到 {len(orders)} 笔 BTCUSDT 未完成委托；拒绝启动策略以免混单。"
+            f"检测到 {len(leftover)} 笔未完成委托；拒绝启动策略以免混单。"
             "请在交易所自行确认/处理后再启动。"
         )
 
     hedge = await client.get_position_mode()
-    settings = await client.get_position_settings()
-    needs_change = (hedge or not settings.get("isolated")
-                    or int(settings.get("leverage") or 0) != LEVERAGE)
-    if has_position and needs_change:
+    settings_by_symbol = {}
+    occupied = []
+    for symbol in TRADE_SYMBOLS:
+        pos = await client.get_position(symbol)
+        settings = await client.get_position_settings(symbol)
+        settings_by_symbol[symbol] = settings
+        has_position = abs(float(getattr(pos, "quantity", 0.0) or 0.0)) > 1e-12
+        needs_change = (hedge or not settings.get("isolated")
+                        or int(settings.get("leverage") or 0) != LEVERAGE)
+        if has_position and needs_change:
+            occupied.append(
+                f"{symbol}: hedge={hedge}, {settings.get('margin_type')}, "
+                f"{settings.get('leverage')}x"
+            )
+    if occupied:
         raise RuntimeError(
             "现有仓位与策略账户设置不一致；拒绝在有仓时切换单向/逐仓/杠杆。"
-            f"当前: hedge={hedge}, {settings.get('margin_type')}, "
-            f"{settings.get('leverage')}x；目标: 单向, ISOLATED, {LEVERAGE}x。"
+            f"当前: {'; '.join(occupied)}；目标: 单向, ISOLATED, {LEVERAGE}x。"
         )
 
     changes = []
@@ -276,34 +321,206 @@ async def prepare_testnet_execution(client: BinanceTestnetClient) -> dict:
             raise RuntimeError("无法确认账户已切换为单向持仓，拒绝启动策略。")
         changes.append("单向持仓")
 
-    if not settings.get("isolated"):
-        await client.set_margin_type_isolated()
-        settings = await client.get_position_settings()
+    last_settings = settings_by_symbol[TRADE_SYMBOLS[0]]
+    for symbol in TRADE_SYMBOLS:
+        settings = await client.get_position_settings(symbol)
         if not settings.get("isolated"):
-            raise RuntimeError("无法确认 BTCUSDT 已设为逐仓，拒绝启动策略。")
-        changes.append("ISOLATED")
-
-    if int(settings.get("leverage") or 0) != LEVERAGE:
-        await client.set_leverage(LEVERAGE)
-        settings = await client.get_position_settings()
+            await client.set_margin_type_isolated(symbol)
+            settings = await client.get_position_settings(symbol)
+            if not settings.get("isolated"):
+                raise RuntimeError(f"无法确认 {symbol} 已设为逐仓，拒绝启动策略。")
+            changes.append(f"{symbol} ISOLATED")
         if int(settings.get("leverage") or 0) != LEVERAGE:
-            raise RuntimeError(
-                f"无法确认 BTCUSDT 已设为 {LEVERAGE}x，拒绝启动策略。"
-            )
-        changes.append(f"{LEVERAGE}x")
+            await client.set_leverage(LEVERAGE, symbol)
+            settings = await client.get_position_settings(symbol)
+            if int(settings.get("leverage") or 0) != LEVERAGE:
+                raise RuntimeError(
+                    f"无法确认 {symbol} 已设为 {LEVERAGE}x，拒绝启动策略。"
+                )
+            changes.append(f"{symbol} {LEVERAGE}x")
+        settings_by_symbol[symbol] = settings
+        last_settings = settings
 
     return {
         "position_mode": "one_way",
-        "margin_type": settings.get("margin_type"),
-        "leverage": int(settings.get("leverage") or 0),
+        "margin_type": last_settings.get("margin_type"),
+        "leverage": int(last_settings.get("leverage") or 0),
         "changes": changes,
+        "symbols": list(TRADE_SYMBOLS),
     }
+
+
+def _closed_bars(bars: dict, interval_ms: int, now: int) -> dict:
+    mask = (bars["ts"] + interval_ms) <= now
+    return {key: value[mask] for key, value in bars.items()}
+
+
+def _align_atr(ts, interval_ms: int, bars1h: dict, atr1h):
+    idx = np.searchsorted(bars1h["ts"] + 60 * 60 * 1000,
+                          ts + interval_ms, side="right") - 1
+    out = np.full(len(ts), np.nan)
+    ok = idx >= 0
+    out[ok] = atr1h[idx[ok]]
+    return out
+
+
+def _virtual_side_label(book: dict) -> str:
+    qty = float(((book.get("entry") or {}).get("qty")) or 0.0)
+    side = (book.get("entry") or {}).get("side")
+    if qty <= 0 or side in (0, None, "FLAT"):
+        return "FLAT"
+    return "LONG" if float(side) > 0 else "SHORT"
+
+
+async def sync_net(client: BinanceTestnetClient, st: dict, execute: bool, *,
+                   symbol: str, tag: str, force_cross: bool = False):
+    """把同一标的两条策略的虚拟仓合成净仓，只下差额。"""
+    pos = await client.get_position(symbol)
+    pos_side = (getattr(pos, "side", "FLAT") or "FLAT").upper()
+    ex = float(getattr(pos, "quantity", 0.0) or 0.0) * (
+        1.0 if pos_side == "LONG" else (-1.0 if pos_side == "SHORT" else 0.0))
+    desired = desired_net(st, symbol)
+    delta = desired - ex
+    if abs(delta) < MIN_QTY:
+        return None
+    if not execute:
+        print(f"[{symbol} 净仓观察] 应有 {desired:.4f} 实际 {ex:.4f} 差额 {delta:.4f}")
+        return None
+    side = "LONG" if delta > 0 else "SHORT"
+    reduce_only = reduce_only_for_delta(ex, desired, MIN_QTY)
+    result = await client.place_limit_chase(
+        side=side, quantity=abs(delta), reduce_only=reduce_only,
+        tag=tag, force_cross=force_cross, symbol=symbol,
+    )
+    record_order(result, action=f"{symbol_short(symbol)}净仓{side}")
+    after = await client.get_position(symbol)
+    after_side = (getattr(after, "side", "FLAT") or "FLAT").upper()
+    after_qty = float(getattr(after, "quantity", 0.0) or 0.0) * (
+        1.0 if after_side == "LONG" else (-1.0 if after_side == "SHORT" else 0.0))
+    print(f"[{symbol} 净仓] 目标 {desired:.4f} 原 {ex:.4f} → {after_qty:.4f} "
+          f"{_chase_note(result) or result.error}")
+    return result
+
+
+def process_strategy(spec, book: dict, bars: dict, atr_al, *,
+                     equity: float, block: bool, now: int, execute: bool) -> bool:
+    """处理一条策略的已收盘 K 线，只改虚拟账本。返回是否需要同步净仓。"""
+    ts = bars["ts"]
+    o, h, l, c = (bars[x] for x in ("open", "high", "low", "close"))
+    k, d, _j = kdj(h, l, c)
+    _mb, up, lb, _ = boll(c, 20, 2.0)
+    reading_path = READING_BY_SPEC.get(spec.id, lambda: READING)()
+    mark = f"{symbol_short(spec.symbol)} {spec.interval}"
+
+    if spec.cold_start and not book.get("armed"):
+        if len(ts):
+            book["last_ts"] = int(ts[-1])
+        book["armed"] = True
+        if len(ts):
+            save_signal_reading(
+                book, i=len(ts) - 1, ts=ts, o=o, h=h, l=l, c=c, k=k, d=d,
+                atr_al=atr_al, up=up, lb=lb, now=now, execute=execute,
+                pos_side=_virtual_side_label(book),
+                interval=spec.interval, signal_rule=spec.signal_rule,
+                k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
+                path=reading_path, symbol=spec.symbol,
+            )
+        print(f"[{mark}] 冷启动，从下一根已收盘 K 线开始交易")
+        return False
+
+    missed, i, dropped = plan_pending(ts, int(book.get("last_ts") or 0),
+                                      lookback=spec.lookback)
+    if i is None:
+        if len(ts):
+            save_signal_reading(
+                book, i=len(ts) - 1, ts=ts, o=o, h=h, l=l, c=c, k=k, d=d,
+                atr_al=atr_al, up=up, lb=lb, now=now, execute=execute,
+                pos_side=_virtual_side_label(book),
+                interval=spec.interval, signal_rule=spec.signal_rule,
+                k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
+                path=reading_path, symbol=spec.symbol,
+            )
+        return False
+
+    if missed:
+        sigs = 0
+        for j in missed:
+            gold = dead = False
+            if j > 0:
+                _lo, _sh, gold, dead = entry_signal(
+                    k[j - 1], d[j - 1], k[j], d[j],
+                    k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
+                )
+            if gold or dead:
+                sigs += 1
+            which = "金叉做多" if gold else ("死叉做空" if dead else "无交叉")
+            log_row([_fmt(int(ts[j])), f"{mark}错过",
+                     "空仓", "0.0000", f"{float(c[j]):.2f}", "",
+                     f"{k[j]:.2f}", f"{d[j]:.2f}", f"{atr_al[j]:.2f}",
+                     "", "", f"运行器未运行期间收盘; 该根 {which}, 未下单"])
+        book["missed_bars"] = int(book.get("missed_bars", 0)) + len(missed)
+        book["missed_signals"] = int(book.get("missed_signals", 0)) + sigs
+        print(f"[{mark} 补记] 停机期间收盘 {len(missed)} 根, "
+              f"其中 {sigs} 根有交叉"
+              + (f"; 另有 {dropped} 根超出回看窗口未补记" if dropped else ""))
+
+    if i <= 0 or np.isnan(atr_al[i]):
+        book["last_ts"] = int(ts[i])
+        return False
+
+    px = float(c[i])
+    sig_long, sig_short, gold, dead = entry_signal(
+        k[i - 1], d[i - 1], k[i], d[i],
+        k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
+    )
+    qty = 0.0
+    if not np.isnan(atr_al[i]) and atr_al[i] > 0:
+        qty = floor_step(equity * RISK_R / (ATR_MULT_K * float(atr_al[i])))
+    action, note, changed = apply_virtual_signal(
+        book, sig_long=sig_long, sig_short=sig_short, qty=qty,
+        px=px, atr=float(atr_al[i]), ms=int(ts[i]), block=block,
+        min_qty=MIN_QTY,
+        meta={
+            "interval": spec.interval,
+            "strategy_id": spec.id,
+            "reason": signal_reason(
+                spec, gold=gold, dead=dead, k=float(k[i]),
+            ),
+            "k": float(k[i]),
+            "d": float(d[i]),
+            "signal": "golden_cross" if gold else ("dead_cross" if dead else ""),
+            "symbol": spec.symbol,
+        },
+    )
+    if action is None and (gold or dead) and not (sig_long or sig_short):
+        note = f"交叉但不满足 K 阈值 (K={k[i]:.2f})"
+    log_row([_fmt(int(ts[i])), f"{mark}{action or '观察'}",
+             "多" if _virtual_side_label(book) == "LONG" else (
+                 "空" if _virtual_side_label(book) == "SHORT" else "空仓"),
+             f"{abs(float(((book.get('entry') or {}).get('qty')) or 0)):.4f}",
+             f"{px:.2f}", "", f"{k[i]:.2f}", f"{d[i]:.2f}",
+             f"{atr_al[i]:.2f}", "", f"{equity:.2f}", note])
+    if action:
+        print(f"[{mark} {_fmt(int(ts[i]))}] {action} | {note} | "
+              f"K={k[i]:.1f}")
+    save_signal_reading(
+        book, i=i, ts=ts, o=o, h=h, l=l, c=c, k=k, d=d, atr_al=atr_al,
+        up=up, lb=lb, now=now, execute=execute,
+        pos_side=_virtual_side_label(book),
+        interval=spec.interval, signal_rule=spec.signal_rule,
+        k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
+        path=reading_path, symbol=spec.symbol,
+    )
+    book["last_ts"] = int(ts[i])
+    return changed
 
 
 async def disaster_limit_stop(client: BinanceTestnetClient, st: dict, *,
                               ex_side: float, entry_px: float,
-                              atr_1h: float, execute: bool) -> Optional[dict]:
-    """在浮亏达到 3×ATR 时立即平仓。
+                              atr_1h: float, execute: bool,
+                              symbol: str = "BTCUSDT",
+                              tag: str = ORDER_TAG) -> Optional[dict]:
+    """在该标的浮亏达到 3×ATR 时立即平仓。
 
     原始规格要求灾难止损强制退出；后续用户要求所有委托使用限价单。因此这里
     使用 `force_cross=True` 的穿盘口 **LIMIT** 单：不等待普通订单的 180 秒
@@ -316,7 +533,7 @@ async def disaster_limit_stop(client: BinanceTestnetClient, st: dict, *,
         return None
     if entry_px <= 0 or atr_1h <= 0:
         return None
-    mark = float(await client.mark_price())
+    mark = float(await client.mark_price(symbol))
     if mark <= 0:
         return None
     loss_points = (entry_px - mark) if ex_side > 0 else (mark - entry_px)
@@ -327,17 +544,18 @@ async def disaster_limit_stop(client: BinanceTestnetClient, st: dict, *,
     close_side = "SHORT" if ex_side > 0 else "LONG"
     result = await client.place_limit_chase(
         side=close_side, quantity=abs(ex_side), reduce_only=True,
-        tag=ORDER_TAG, force_cross=True,
+        tag=tag, force_cross=True, symbol=symbol,
     )
-    record_order(result, action="灾难止损平仓")
-    after = await client.get_position()
+    record_order(result, action=f"{symbol_short(symbol)}灾难止损平仓")
+    after = await client.get_position(symbol)
     remaining = abs(float(getattr(after, "quantity", 0.0) or 0.0))
     flat = remaining < MIN_QTY
-    if flat:
+    if flat and symbol == "BTCUSDT":
         st["entry"] = None
+    unit = symbol_short(symbol)
     detail = (
-        f"浮亏 {loss_points:.2f} ≥ {DISASTER_ATR:.0f}×ATR {stop_points:.2f}; "
-        f"LIMIT 强平 {_chase_note(result)}; 剩余 {remaining:.4f} BTC"
+        f"{symbol} 浮亏 {loss_points:.2f} ≥ {DISASTER_ATR:.0f}×ATR {stop_points:.2f}; "
+        f"LIMIT 强平 {_chase_note(result)}; 剩余 {remaining:.4f} {unit}"
     )
     return {
         "action": "灾难止损平仓" if flat else "灾难止损部分平仓",
@@ -346,217 +564,111 @@ async def disaster_limit_stop(client: BinanceTestnetClient, st: dict, *,
         "flat": flat,
         "remaining": remaining,
         "result": result,
+        "symbol": symbol,
+    }
+
+
+def _signed_qty(pos) -> float:
+    pos_side = (getattr(pos, "side", "FLAT") or "FLAT").upper()
+    qty = float(getattr(pos, "quantity", 0.0) or 0.0)
+    if pos_side == "LONG":
+        return qty
+    if pos_side == "SHORT":
+        return -qty
+    return 0.0
+
+
+def _fetch_symbol_bars(symbol: str, now: int):
+    try:
+        b15 = _closed_bars(fetch("15m", 400, symbol), SPEC_15M.interval_ms, now)
+        b5 = _closed_bars(fetch("5m", 600, symbol), SPEC_5M.interval_ms, now)
+        b1h = _closed_bars(fetch("1h", 300, symbol), 60 * 60 * 1000, now)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{symbol}] 拉 K 线失败: {exc}")
+        return None
+    atr1h = atr_wilder(b1h["high"], b1h["low"], b1h["close"], 14)
+    return {
+        "15m": (b15, _align_atr(b15["ts"], SPEC_15M.interval_ms, b1h, atr1h)),
+        "5m": (b5, _align_atr(b5["ts"], SPEC_5M.interval_ms, b1h, atr1h)),
     }
 
 
 async def step(client: BinanceTestnetClient, st: dict, execute: bool) -> None:
+    migrate_state(st)
     bal = await client.get_balance()
-    pos = await client.get_position()
-    pos_side = (getattr(pos, "side", "FLAT") or "FLAT").upper()
-    ex_side = float(getattr(pos, "quantity", 0.0) or 0.0) * (
-        1.0 if pos_side == "LONG" else (-1.0 if pos_side == "SHORT" else 0.0))
-    equity = float(bal.total_wallet_balance) + float(getattr(pos, "unrealized_pnl", 0.0) or 0.0)
-    entry_px = float(getattr(pos, "entry_price", 0.0) or 0.0)
-
-    b15 = fetch("15m", 400)
-    b1h = fetch("1h", 300)
     now = int(time.time() * 1000)
-    b15 = {k: v[(b15["ts"] + 15 * 60 * 1000) <= now] for k, v in b15.items()}
-    b1h = {k: v[(b1h["ts"] + 60 * 60 * 1000) <= now] for k, v in b1h.items()}
+    upnl = float(getattr(bal, "total_unrealized_pnl", 0.0) or 0.0)
+    equity = float(bal.total_wallet_balance) + upnl
 
-    ts = b15["ts"]
-    o, h, l, c = (b15[x] for x in ("open", "high", "low", "close"))
-    k, d, _j = kdj(h, l, c)
-    mb, up, lb, _ = boll(c, 20, 2.0)
-    atr1h = atr_wilder(b1h["high"], b1h["low"], b1h["close"], 14)
-    idx = np.searchsorted(b1h["ts"] + 60 * 60 * 1000, ts + 15 * 60 * 1000,
-                          side="right") - 1
-    atr_al = np.full(len(ts), np.nan)
-    ok = idx >= 0
-    atr_al[ok] = atr1h[idx[ok]]
-
-    # 灾难止损每 15 秒检查一次，不等下一根 K 线，也不等反向信号。
-    # 触发后本轮不再反手，避免止损和新开仓在同一个价格区间互相打架。
-    latest_i = len(ts) - 1
-    emergency = await disaster_limit_stop(
-        client, st, ex_side=ex_side, entry_px=entry_px,
-        atr_1h=float(atr_al[latest_i]), execute=execute,
-    )
-    if emergency:
-        log_row([_fmt(int(ts[latest_i])), emergency["action"],
-                 "多" if ex_side > 0 else "空", f"{abs(ex_side):.4f}",
-                 f"{emergency['mark']:.2f}", "", f"{k[latest_i]:.2f}",
-                 f"{d[latest_i]:.2f}", f"{atr_al[latest_i]:.2f}", "",
-                 f"{equity:.2f}", emergency["note"]])
-        save_signal_reading(
-            st, i=latest_i, ts=ts, o=o, h=h, l=l, c=c, k=k, d=d,
-            atr_al=atr_al, up=up, lb=lb, now=now, execute=execute,
-            pos_side="FLAT" if emergency["flat"] else pos_side,
-        )
-        st["last_ts"] = int(ts[latest_i])
-        save_state(st)
-        return
-
-    # 取最新一根已收盘 K 线; 停机期间收盘的先逐根补记, 绝不静默丢弃。
-    missed, i, dropped = plan_pending(ts, st["last_ts"])
-    if i is None:
-        # 没有新 K 线也刷新读数。读数是面板核对入口，不应因同一根 K 线
-        # 已被处理过而停在旧版本。
-        save_signal_reading(
-            st, i=len(ts) - 1, ts=ts, o=o, h=h, l=l, c=c, k=k, d=d,
-            atr_al=atr_al, up=up, lb=lb, now=now, execute=execute,
-            pos_side=pos_side,
-        )
-        return
-    if missed:
-        sigs = 0
-        for j in missed:
-            gold = dead = False
-            if j > 0:
-                gold, dead = crossing(k[j - 1], d[j - 1], k[j], d[j])
-            if gold or dead:
-                sigs += 1
-            which = "金叉做多" if gold else ("死叉做空" if dead else "无交叉")
-            log_row([_fmt(int(ts[j])), "错过",
-                     "多" if ex_side > 0 else ("空" if ex_side < 0 else "空仓"),
-                     f"{abs(ex_side):.4f}", f"{float(c[j]):.2f}", "",
-                     f"{k[j]:.2f}", f"{d[j]:.2f}", f"{atr_al[j]:.2f}",
-                     "", "", f"运行器未运行期间收盘; 该根 {which}, 未下单"])
-        st["missed_bars"] = int(st.get("missed_bars", 0)) + len(missed)
-        st["missed_signals"] = int(st.get("missed_signals", 0)) + sigs
-        print(f"[补记] 停机期间收盘 {len(missed)} 根, 其中 {sigs} 根有交叉信号"
-              + (f"; 另有 {dropped} 根超出回看窗口未补记" if dropped else ""))
-    if np.isnan(up[i]) or np.isnan(atr_al[i]):
-        st["last_ts"] = int(ts[i])
-        save_state(st)
-        return
-
-    px = float(c[i])
-    sig_long, sig_short = crossing(k[i - 1], d[i - 1], k[i], d[i])
-
-    bw = float(up[i] - lb[i])
-    fp = GATE_FEE_RATE * px
-    mult = (bw / 2.0) / fp if fp > 0 else 0.0
-    if not BOLL_GATE_ENABLED:
-        r_eff = RISK_R
-    else:
-        r_eff = (RISK_R if mult >= GATE_STRONG
-                 else (RISK_R / 2.0 if mult >= GATE_WEAK else None))
-
-    day = int(ts[i]) // 86_400_000
+    day = now // 86_400_000
     mtm = equity
-    st["peak"] = max(st.get("peak", 0.0), mtm)
-    if st["day"] != day:
+    st["peak"] = max(st.get("peak", 0.0) or 0.0, mtm)
+    if st.get("day") != day:
         st["day"], st["day_start_eq"] = day, mtm
-    dl = (st["day_start_eq"] - mtm) / st["day_start_eq"] if st["day_start_eq"] else 0.0
-    dd = (st["peak"] - mtm) / st["peak"] if st["peak"] else 0.0
-    if dd >= 0.10 and not st["halted"]:
+    dl = ((st.get("day_start_eq") or mtm) - mtm) / st["day_start_eq"] if st.get("day_start_eq") else 0.0
+    dd = ((st.get("peak") or mtm) - mtm) / st["peak"] if st.get("peak") else 0.0
+    if dd >= 0.10 and not st.get("halted"):
         st["halted"] = True
         print(f"[熔断] 累计回撤 {dd:.1%} ≥ 10% —— 停止开新仓, 等待人工指令")
-        log_row([_fmt(int(ts[i])), "熔断", "", "", f"{px:.2f}", "", f"{k[i]:.2f}",
-                 f"{d[i]:.2f}", f"{atr_al[i]:.2f}", f"{mult:.2f}", f"{equity:.2f}",
-                 f"回撤 {dd:.1%}"])
-    block = st["halted"] or dl >= 0.03
+    block = bool(st.get("halted")) or dl >= 0.03
 
-    action = None
-    note = ""
-    if ex_side == 0.0:
-        want = "LONG" if sig_long else ("SHORT" if sig_short else None)
-        if want:
-            if block:
-                note = "风控闸门: 不开新仓"
-            elif r_eff is None:
-                note = "布林闸门: 倍数 < 2"
-            else:
-                qty = floor_step(equity * r_eff / (ATR_MULT_K * float(atr_al[i])))
-                if qty < MIN_QTY or qty * px < MIN_NOTIONAL:
-                    note = f"数量不足 qty={qty:.4f}"
-                elif execute:
-                    # 启动阶段 `prepare_testnet_execution()` 已经读回验证单向、
-                    # 逐仓和 10x。信号发生时不重复改账户设置，避免把下单路径
-                    # 与账户配置写操作混在一起。
-                    # 限价追价: 先被动挂单争取 maker 手续费, 未成交则逐档追价
-                    r = await client.place_limit_chase(
-                        side=want, quantity=qty, tag=ORDER_TAG)
-                    record_order(r, action=f"开{want}")
-                    if r.ok and r.cum_filled_qty > 0:
-                        action = f"开{want}"
-                        filled = r.cum_filled_qty
-                        fill_px = r.avg_price or px
-                        st["entry"] = {"side": 1 if want == "LONG" else -1,
-                                       "px": fill_px, "qty": filled,
-                                       "atr": float(atr_al[i]),
-                                       "ms": int(ts[i])}
-                        note = f"qty={filled:.4f} r_eff={r_eff:.4f} {_chase_note(r)}"
-                    else:
-                        note = f"下单失败: {r.error}"
-    else:
-        cur = 1 if ex_side > 0 else -1
-        opposite = (cur == 1 and sig_short) or (cur == -1 and sig_long)
-        if opposite:
-            if execute:
-                # 反手平仓同样走限价追价, 方向取对侧并 reduceOnly
-                r = await client.place_limit_chase(
-                    side="SHORT" if cur == 1 else "LONG",
-                    quantity=abs(ex_side),
-                    reduce_only=True,
-                    tag=ORDER_TAG,
-                )
-                record_order(r, action="反手平仓")
-                # 只能在交易所确认旧仓**完全归零**后才尝试新方向。
-                # 部分成交、撤单竞态、外部手动订单均不得被当成已平仓。
-                after = await client.get_position()
-                remaining = abs(float(getattr(after, "quantity", 0.0) or 0.0))
-                if (not r.ok or r.cum_filled_qty <= 0 or remaining >= MIN_QTY):
-                    note = (f"反向平仓未确认: 剩余 {remaining:.4f} BTC; "
-                            f"本单已成交 {r.cum_filled_qty:.4f}; {r.error}")
-                    action = "部分平仓" if r.cum_filled_qty > 0 else None
-                else:
-                    st["entry"] = None
-                    action = "平仓"
-                    note = f"原 {cur} 已归零 {_chase_note(r)}"
-                    # 先完成平仓再判断风控，绝不因不允许开新仓而阻止平旧仓。
-                    if block or r_eff is None:
-                        note += "; 风控阻止反手开新仓"
-                    else:
-                        fresh_bal = await client.get_balance()
-                        fresh_equity = float(fresh_bal.total_wallet_balance)
-                        qty = floor_step(fresh_equity * r_eff /
-                                         (ATR_MULT_K * float(atr_al[i])))
-                        if qty < MIN_QTY or qty * px < MIN_NOTIONAL:
-                            note += f"; 反手数量不足 {qty:.4f}"
-                        else:
-                            want = "SHORT" if cur == 1 else "LONG"
-                            opened = await client.place_limit_chase(
-                                side=want, quantity=qty, tag=ORDER_TAG)
-                            record_order(opened, action=f"反手开{want}")
-                            actual = await client.get_position()
-                            if (getattr(actual, "side", "FLAT") or "FLAT").upper() == want \
-                                    and float(getattr(actual, "quantity", 0) or 0) > 0:
-                                filled = float(actual.quantity)
-                                st["entry"] = {"side": -cur,
-                                               "px": float(actual.entry_price),
-                                               "qty": filled, "atr": float(atr_al[i]),
-                                               "ms": int(ts[i])}
-                                action = f"平仓并开{want}"
-                                note += f"; 反手 {filled:.4f} {_chase_note(opened)}"
-                            else:
-                                note += f"; 反手未建立: {opened.error}"
+    for symbol in TRADE_SYMBOLS:
+        pos = await client.get_position(symbol)
+        ex_side = _signed_qty(pos)
+        entry_px = float(getattr(pos, "entry_price", 0.0) or 0.0)
+        pack = _fetch_symbol_bars(symbol, now)
+        if not pack:
+            continue
+        b15, atr15 = pack["15m"]
+        latest15 = len(b15["ts"]) - 1
+        tag15 = next((spec.tag for spec in specs_for_symbol(symbol)
+                      if spec.interval == "15m"), ORDER_TAG)
+        emergency = await disaster_limit_stop(
+            client, st, ex_side=ex_side, entry_px=entry_px,
+            atr_1h=float(atr15[latest15]) if latest15 >= 0 else float("nan"),
+            execute=execute, symbol=symbol, tag=tag15,
+        )
+        if emergency:
+            clear_symbol_books(st, symbol)
+            if symbol == "BTCUSDT":
+                st["entry"] = None
+            if latest15 >= 0:
+                log_row([_fmt(int(b15["ts"][latest15])),
+                         f"{symbol_short(symbol)} {emergency['action']}",
+                         "多" if ex_side > 0 else "空", f"{abs(ex_side):.4f}",
+                         f"{emergency['mark']:.2f}", "", "", "",
+                         f"{atr15[latest15]:.2f}", "", f"{equity:.2f}",
+                         emergency["note"]])
+            continue
 
-    log_row([_fmt(int(ts[i])), action or "观察", "多" if ex_side > 0 else ("空" if ex_side < 0 else "空仓"),
-             f"{abs(ex_side):.4f}", f"{px:.2f}", "", f"{k[i]:.2f}", f"{d[i]:.2f}",
-             f"{atr_al[i]:.2f}", f"{mult:.2f}", f"{equity:.2f}", note])
+        changed = False
+        tag = tag15
+        for spec in specs_for_symbol(symbol):
+            book = st["strategies"][spec.id]
+            bars, atr_al = pack[spec.interval]
+            if len(bars["ts"]) == 0:
+                continue
+            before = json.dumps(book.get("entry"), sort_keys=True)
+            did = process_strategy(
+                spec, book, bars, atr_al,
+                equity=equity, block=block, now=now, execute=execute,
+            )
+            after = json.dumps(book.get("entry"), sort_keys=True)
+            if did or before != after:
+                changed = True
+                tag = spec.tag
 
-    if action:
-        print(f"[{_fmt(int(ts[i]))}] {action} | {note} | K={k[i]:.1f} 倍数={mult:.2f}")
+        if changed or abs(desired_net(st, symbol) - ex_side) >= MIN_QTY:
+            await sync_net(client, st, execute, symbol=symbol, tag=tag)
 
-    # 读数快照: 面板据此展示「bot 此刻读的是哪个市场、哪一根、哪几个数」。
-    save_signal_reading(
-        st, i=i, ts=ts, o=o, h=h, l=l, c=c, k=k, d=d, atr_al=atr_al,
-        up=up, lb=lb, now=now, execute=execute, pos_side=pos_side,
-    )
-    st["last_ts"] = int(ts[i])
+    # 旧面板仍读顶层 last_ts / entry，与 BTC 15m 账本对齐。
+    s15 = st["strategies"]["kdj15"]
+    st["last_ts"] = s15.get("last_ts")
+    st["entry"] = s15.get("entry")
+    st["missed_bars"] = s15.get("missed_bars", 0)
+    st["missed_signals"] = s15.get("missed_signals", 0)
     save_state(st)
+
 
 
 async def main() -> int:

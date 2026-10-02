@@ -17,7 +17,7 @@
 | 优先级 | 依据 | 判定 |
 | --- | --- | --- |
 | 1 | 委托号出现在策略台账 `runtime/shadow/deployed_orders.jsonl` | strategy |
-| 2 | `clientOrderId` 以 `kdj` 开头 | strategy |
+| 2 | `clientOrderId` 以 `kdj` / `kd5` / `e15` / `e5` 开头 | strategy |
 | 3 | `clientOrderId` 以 `web_` 开头 | manual_web |
 | 4 | `clientOrderId` 以 `smk` / `smoke` 开头 | function_test |
 | 5 | `clientOrderId` 以 `usr` 开头 | user_action |
@@ -55,7 +55,7 @@ SOURCE_LABELS = {
 HIDDEN_BY_DEFAULT = (SOURCE_FUNCTION_TEST,)
 
 # 本系统自己生成的下单前缀（见 trading/binance_client.py）。
-OWN_PREFIXES = ("ps", "cx", "lmt", "mkt", "sl", "kdj", "smk", "usr")
+OWN_PREFIXES = ("ps", "cx", "lmt", "mkt", "sl", "kdj", "kd5", "e15", "e5", "smk", "usr")
 
 # 已记录的测试窗口（北京时间 UTC+8，闭区间）。
 # 每一个窗口都有对应的事故记录或验证记录，不是事后猜测：
@@ -139,7 +139,7 @@ def classify(
         return SOURCE_STRATEGY
 
     lowered = client_id.lower()
-    if lowered.startswith("kdj"):
+    if lowered.startswith(("kdj", "kd5", "e15", "e5")):
         return SOURCE_STRATEGY
     if lowered.startswith("web_"):
         return SOURCE_MANUAL_WEB

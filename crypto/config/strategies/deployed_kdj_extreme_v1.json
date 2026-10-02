@@ -1,5 +1,6 @@
 {
   "strategy_id": "deployed_kdj_extreme_v1",
+  "runtime_key": "kdj15",
   "name": "KDJ 交叉反手 (BTCUSDT 15m)",
   "kind": "mean_reversion",
   "timeframe": "15m",

@@ -855,3 +855,9 @@ post-only 拒单退档、竞态成交、兜底穿盘口、滑点上限、重挂�
 **本机持续运行**：新增 `scripts/install_testnet_services.sh`（显式 `ENABLE_TESTNET_EXECUTION=YES` 才会安装），用 macOS `launchd KeepAlive` 启动 trader/panel/frontend/monitor 四项服务，绕过会话进程约 2 小时回收；配套 `scripts/uninstall_testnet_services.sh` 与 `scripts/run_testnet_monitor_loop.sh`。安装需用户在其本机终端自行执行，脚本不含密钥。
 
 **验证**：新增 `test_execution_preflight.py`（8）、`test_runner_snapshots.py`（3）、`test_disaster_limit_stop.py`（6），扩展限价追价灾难穿盘口测试 1 项。全量测试 **454 项通过**；`bash -n` 三个脚本、`node --check frontend/app.js` 通过；前端实测显示「运行中 · 仅观察」且无 console error。当前仅观察运行器在会话内运行，未发送委托。
+
+### 2026-10-02 12:40 · 第二条 5m 策略并入同一测试网运行器
+
+用户拍板：不要 MA/OBV；5m 以 KD 金叉死叉为大前提，金叉且 K<30 做多、死叉且 K>70 做空；与 15m 共用一个 BTCUSDT 单向账户。
+
+实现：`shadow/strategy_books.py` 各记虚拟仓，交易所只下净额；5m 冷启动不追溯旧 K 线；委托前缀 `kd5` 也算策略单；面板按 `runtime_key` 挂运行态，读数接口同时返回 15m/5m。`r` 仍为 0.03，未改。全量测试 **475 项通过**。仍是测试网限价，不宣称能赚钱、不能当实盘。

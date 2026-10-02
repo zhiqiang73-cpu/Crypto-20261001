@@ -28,11 +28,11 @@ class FakeClient:
         self.apply_changes = apply_changes
         self.calls = []
 
-    async def get_open_orders(self):
+    async def get_open_orders(self, symbol=None):
         self.calls.append("get_open_orders")
         return self.orders
 
-    async def get_position(self):
+    async def get_position(self, symbol=None):
         self.calls.append("get_position")
         return SimpleNamespace(quantity=self.quantity)
 
@@ -40,10 +40,10 @@ class FakeClient:
         self.calls.append("get_position_mode")
         return self.hedge
 
-    async def get_position_settings(self):
+    async def get_position_settings(self, symbol=None):
         self.calls.append("get_position_settings")
         return {
-            "symbol": "BTCUSDT",
+            "symbol": symbol or "BTCUSDT",
             "isolated": self.isolated,
             "margin_type": "ISOLATED" if self.isolated else "CROSSED",
             "leverage": self.leverage,
@@ -54,12 +54,12 @@ class FakeClient:
         if self.apply_changes:
             self.hedge = False
 
-    async def set_margin_type_isolated(self):
+    async def set_margin_type_isolated(self, symbol=None):
         self.calls.append("set_margin_type_isolated")
         if self.apply_changes:
             self.isolated = True
 
-    async def set_leverage(self, leverage):
+    async def set_leverage(self, leverage, symbol=None):
         self.calls.append(("set_leverage", leverage))
         if self.apply_changes:
             self.leverage = leverage
@@ -80,7 +80,9 @@ class TestExecutionPreflight(unittest.TestCase):
     def test_flat_mismatch_is_reconfigured_and_verified(self):
         client = FakeClient(hedge=True, isolated=False, leverage=1)
         out = run(prepare_testnet_execution(client))
-        self.assertEqual(out["changes"], ["单向持仓", "ISOLATED", "10x"])
+        self.assertIn("单向持仓", out["changes"])
+        self.assertTrue(any("ISOLATED" in item for item in out["changes"]))
+        self.assertTrue(any("10x" in item for item in out["changes"]))
         self.assertIn("set_one_way_mode", client.calls)
         self.assertIn("set_margin_type_isolated", client.calls)
         self.assertIn(("set_leverage", LEVERAGE), client.calls)

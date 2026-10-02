@@ -68,6 +68,8 @@ from models.signals import DimensionScores, StrategyHorizon
 from review import meta_review, overrides, review_loop
 from review.order_sources import (SOURCE_LABELS, annotate_orders, annotate_trades,
                                   load_strategy_order_ids, summarize)
+from shadow.strategy_books import (TRADE_SYMBOLS, desired_net, desired_nets,
+                                   position_sources, runtime_view)
 from review.journal import TradeJournal, new_trade_id
 from review.settle import settle_pending
 from review.stats import compute_stats
@@ -78,6 +80,40 @@ from trading.executor import TradeExecutor
 from trading.runtime_mode import startup_status
 
 logger = logging.getLogger(__name__)
+
+
+async def _rows_for_symbols(client, method: str, limit: int) -> list:
+    """按标的分别拉历史，再拼成一张表。某一个失败不影响另一个。"""
+    rows = []
+    for symbol in TRADE_SYMBOLS:
+        try:
+            part = await getattr(client, method)(symbol=symbol, limit=limit)
+            if part:
+                rows.extend(part)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s %s: %s", method, symbol, exc)
+    return rows
+
+
+def _with_reading_series(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """读数图需要 K/D 序列。快照里没有时，用与运行器相同的测试网 K 线补上。"""
+    series = rec.get("series") or {}
+    if series.get("k") and series.get("d"):
+        return rec
+    try:
+        from shadow.live import closed_kdj_series
+        extra = closed_kdj_series(
+            rec.get("interval") or "15m",
+            symbol=rec.get("symbol") or "BTCUSDT",
+        )
+        rec["series"] = {"k": extra.get("k") or [], "d": extra.get("d") or []}
+        if rec.get("gold") is None:
+            rec["gold"] = extra.get("gold")
+        if rec.get("dead") is None:
+            rec["dead"] = extra.get("dead")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("reading series: %s", exc)
+    return rec
 
 
 class ReviewPanelState:
@@ -408,6 +444,40 @@ def create_app(
             status["positions"] = {"short_term": None, "long_term": None}
         elif os.getenv("TRADING_MODE", "paper").lower() == "paper" and paper_account["position"]:
             status["exchange_position"] = dict(paper_account["position"])
+        state_path = os.path.join(ROOT, "runtime", "shadow", "deployed_state.json")
+        trade_log = os.path.join(ROOT, "runtime", "shadow", "deployed_trades.csv")
+        live = {}
+        try:
+            if os.path.exists(state_path):
+                with open(state_path, encoding="utf-8") as fh:
+                    live = json.load(fh)
+        except Exception:
+            live = {}
+        status["position_sources"] = position_sources(live, trade_log_path=trade_log)
+        status["desired_net"] = desired_net(live) if live else 0.0
+        status["desired_nets"] = desired_nets(live) if live else {}
+        exchange_positions = {}
+        open_orders = []
+        if client.configured:
+            for symbol in TRADE_SYMBOLS:
+                try:
+                    pos = await client.get_position(symbol)
+                    payload = pos.to_dict() if hasattr(pos, "to_dict") else {
+                        "symbol": symbol,
+                        "side": getattr(pos, "side", "FLAT"),
+                        "quantity": float(getattr(pos, "quantity", 0) or 0),
+                    }
+                    exchange_positions[symbol] = payload
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("position %s: %s", symbol, exc)
+                try:
+                    open_orders.extend(await client.get_open_orders(symbol) or [])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("open orders %s: %s", symbol, exc)
+            if "BTCUSDT" in exchange_positions and not status.get("exchange_position"):
+                status["exchange_position"] = exchange_positions["BTCUSDT"]
+        status["exchange_positions"] = exchange_positions
+        status["open_orders"] = open_orders
         return web.json_response(status)
 
     async def api_trading_flatten_orphan(_request):
@@ -775,13 +845,18 @@ def create_app(
         return web.json_response({"summaries": out})
 
     async def api_strategy_reading(_request):
-        """策略此刻的读数快照 —— 直接取自运行器落盘的 latest_reading.json。
+        """策略此刻的读数快照 —— 直接取自运行器落盘的 latest_reading*.json。
 
         这是核对信号的唯一正确入口: 它记录的是 bot 真正使用的那条行情序列
         (市场、K 线地址、OHLC、K/D、ATR 全都在), 而不是某个图表显示的东西。
         2026-10-02 的市场错位之所以难查, 正是因为当时没有这个快照。
         """
-        path = os.path.join(ROOT, "runtime", "shadow", "latest_reading.json")
+        paths = [
+            os.path.join(ROOT, "runtime", "shadow", "latest_reading.json"),
+            os.path.join(ROOT, "runtime", "shadow", "latest_reading_5m.json"),
+            os.path.join(ROOT, "runtime", "shadow", "latest_reading_eth15.json"),
+            os.path.join(ROOT, "runtime", "shadow", "latest_reading_eth5.json"),
+        ]
         heartbeat_path = os.path.join(
             ROOT, "runtime", "shadow", "runner_heartbeat.json"
         )
@@ -791,24 +866,32 @@ def create_app(
                 heartbeat = json.load(fh)
         except Exception:
             pass
-        try:
-            with open(path, encoding="utf-8") as fh:
-                rec = json.load(fh)
-        except Exception:
+        readings = []
+        for path in paths:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    readings.append(_with_reading_series(json.load(fh)))
+            except Exception:
+                continue
+        if not readings:
             return web.json_response({
                 "available": False,
                 "reason": "runner_not_written_yet",
                 "runner": heartbeat,
+                "readings": [],
             })
+        rec = dict(readings[0])
         rec["available"] = True
         rec["runner"] = heartbeat
+        rec["readings"] = readings
         return web.json_response(rec)
 
     async def api_strategies_active(_request):
         """当前运行的策略定义 + 实时运行态 (数组结构, 为多策略并列预留).
 
         定义取自 config/strategies/*.json; 运行态取自
-        runtime/shadow/deployed_state.json。仅 enabled 的策略附带运行态。
+        runtime/shadow/deployed_state.json。仅 enabled 的策略按 runtime_key
+        挂自己的虚拟仓，不再两张卡共用整份顶层状态。
         """
         from pathlib import Path as _P
         root = _P(__file__).resolve().parents[1]
@@ -827,7 +910,17 @@ def create_app(
                     d = json.loads(f.read_text(encoding="utf-8"))
                 except Exception:
                     continue
-                out.append({**d, "runtime": live if d.get("enabled") else None})
+                view = runtime_view(
+                    live, d.get("strategy_id") or "",
+                    runtime_key=d.get("runtime_key"),
+                ) if d.get("enabled") else None
+                if d.get("enabled") and view is None and live:
+                    view = live
+                out.append({**d, "runtime": view})
+            out.sort(key=lambda row: (
+                str(row.get("symbol") or ""),
+                str(row.get("timeframe") or ""),
+            ))
         except Exception:
             pass
         return web.json_response({"strategies": out})
@@ -844,7 +937,7 @@ def create_app(
         except Exception:
             limit = 200
         try:
-            orders = await client.all_orders(limit=limit)
+            orders = await _rows_for_symbols(client, "all_orders", limit)
             # 来源标签: 策略单 / 网页手动 / 功能测试 / 面板手动 / 未判定。
             # 交易所记录不删不改, 只加可核验的标签 —— 见 review/order_sources.py。
             orders = annotate_orders(
@@ -878,11 +971,11 @@ def create_app(
         except Exception:
             limit = 200
         try:
-            trades = await client.user_trades(limit=limit)
+            trades = await _rows_for_symbols(client, "user_trades", limit)
             # 逐笔成交沿用其所属委托的来源, 避免同一笔单出现两个口径。
             try:
                 parents = annotate_orders(
-                    await client.all_orders(limit=limit),
+                    await _rows_for_symbols(client, "all_orders", limit),
                     strategy_order_ids=load_strategy_order_ids(),
                 )
             except Exception:  # noqa: BLE001
@@ -920,9 +1013,12 @@ def create_app(
         try:
             bal = await client.get_balance()
             pos = await client.get_position()
+            upnl = float(getattr(bal, "total_unrealized_pnl", 0) or 0)
+            if not upnl:
+                upnl = float(getattr(pos, "unrealized_pnl", 0) or 0)
             all_trades = []
             try:
-                all_trades = await client.user_trades(limit=200)
+                all_trades = await _rows_for_symbols(client, "user_trades", 200)
             except Exception as exc:
                 return web.json_response({"connected": False,
                                           "reason": f"成交查询失败: {type(exc).__name__}: {exc}"})
@@ -965,7 +1061,7 @@ def create_app(
                 "available_balance": float(
                     getattr(bal, "available_balance", 0) or 0
                 ),
-                "unrealized_pnl": float(getattr(pos, "unrealized_pnl", 0) or 0),
+                "unrealized_pnl": upnl,
                 # 起算日口径（用户指定的「赚了多少」）
                 **scoped,
                 # 与最近七天、最多200笔的表格对齐，不提供假「全历史」。

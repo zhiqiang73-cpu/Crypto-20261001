@@ -19,7 +19,7 @@ class FakeClient:
         self.remaining = remaining
         self.calls = []
 
-    async def mark_price(self):
+    async def mark_price(self, symbol=None):
         self.calls.append("mark_price")
         return self.mark
 
@@ -30,7 +30,7 @@ class FakeClient:
             avg_price=self.mark, raw={}, error="",
         )
 
-    async def get_position(self):
+    async def get_position(self, symbol=None):
         self.calls.append("get_position")
         return SimpleNamespace(quantity=self.remaining)
 

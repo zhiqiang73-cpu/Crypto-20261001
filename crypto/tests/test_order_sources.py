@@ -50,6 +50,16 @@ class TestClassify(unittest.TestCase):
         row = {"orderId": 1, "clientOrderId": "kdj0abc", "time": IN_WINDOW}
         self.assertEqual(classify(row), SOURCE_STRATEGY)
 
+    def test_strategy_by_kd5_prefix(self):
+        row = {"orderId": 1, "clientOrderId": "kd50abc", "time": IN_WINDOW}
+        self.assertEqual(classify(row), SOURCE_STRATEGY)
+
+    def test_strategy_by_eth_prefixes(self):
+        for cid in ("e150abc", "e50abc"):
+            with self.subTest(cid=cid):
+                row = {"orderId": 1, "clientOrderId": cid, "time": IN_WINDOW}
+                self.assertEqual(classify(row), SOURCE_STRATEGY)
+
     def test_manual_web_by_prefix(self):
         row = {"orderId": 2, "clientOrderId": "web_abc123", "time": IN_WINDOW}
         self.assertEqual(classify(row), SOURCE_MANUAL_WEB)

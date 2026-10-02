@@ -1026,6 +1026,9 @@ class BinanceTestnetClient:
             return OrderResult(
                 ok=False, error=f"quantity too small: {quantity}", symbol=symbol
             )
+        # 追价会多次重挂，提示音只在本轮委托开始时响一次。
+        from utils.alert_sound import play_alert
+        play_alert("order")
         tick = await self.price_tick(symbol)
         is_long = side.upper() == "LONG"
         deadline = time.time() if force_cross else time.time() + (
@@ -1065,7 +1068,8 @@ class BinanceTestnetClient:
             if filled > 0:
                 attempts.append({"step": idx, "price": px, "filled": filled,
                                  "bid": bid, "ask": ask, "maker": True})
-                return self._with_passive_meta(res, attempts, maker=True)
+                return self._finish_passive(res, attempts, maker=True,
+                                            reduce_only=reduce_only)
 
             # 撤单后复核: 撤单与成交可能竞态
             final = await self.query_order(client_order_id=cid, symbol=symbol)
@@ -1073,8 +1077,9 @@ class BinanceTestnetClient:
             if final.state == OrderState.FILLED or final_filled > 0:
                 attempts.append({"step": idx, "price": px, "filled": final_filled,
                                  "bid": bid, "ask": ask, "maker": True})
-                return self._with_passive_meta(
-                    final.to_order_result(), attempts, maker=True
+                return self._finish_passive(
+                    final.to_order_result(), attempts, maker=True,
+                    reduce_only=reduce_only,
                 )
 
             if res.error and "POST_ONLY_REJECT" in res.error:
@@ -1110,26 +1115,38 @@ class BinanceTestnetClient:
         cid = _new_client_order_id(f"{tag}x")
         res = await self.place_limit_order(
             side, qty, cross_px, symbol,
+            # IOC 仍然是 LIMIT：立即成交可成交部分，余量由交易所取消。
+            # 不留下 GTC 挂单，避免运行器认为失败后该单又延迟成交。
+            time_in_force="IOC",
             reduce_only=reduce_only, client_order_id=cid,
             fill_timeout_sec=10.0, poll_interval_sec=CHASE_POLL_INTERVAL,
             cancel_if_unfilled=False,
         )
         filled = float(res.cum_filled_qty or 0)
         if filled > 0:
+            res.ok = True  # IOC 余量取消不抹掉已经确认的部分成交。
             attempts.append({"step": len(attempts), "price": cross_px,
                              "filled": filled, "bid": bid, "ask": ask,
                              "maker": False, "cross": True})
-            return self._with_passive_meta(res, attempts, maker=False)
-        return OrderResult(
-            ok=False, symbol=symbol,
-            side="BUY" if is_long else "SELL", position_side=side.upper(),
-            quantity=0.0, requested_qty=quantity, submitted_qty=qty,
-            cum_filled_qty=0.0, avg_price=0.0,
-            status=OrderState.CANCELED.value, client_order_id=cid,
-            order_state=OrderState.CANCELED.value,
-            error=f"passive_exhausted: 被动 {len(attempts)} 次 + 兜底穿盘口仍未成交",
-            raw={"chase": {"attempts": attempts, "likely_maker": False}},
-        )
+            return self._finish_passive(res, attempts, maker=False,
+                                        reduce_only=reduce_only)
+        # 保留交易所实际订单状态/ID；网络未知不能伪称已经撤销。
+        res.error = (f"passive_exhausted: 被动 {len(attempts)} 次 + IOC限价兜底未确认成交; "
+                     f"{res.error or res.order_state}")
+        res.raw = {**(res.raw or {}),
+                   "chase": {"attempts": attempts, "likely_maker": False}}
+        return res
+
+    @staticmethod
+    def _finish_passive(
+        res: OrderResult, attempts: List[Dict[str, Any]], *, maker: bool,
+        reduce_only: bool,
+    ) -> OrderResult:
+        out = BinanceTestnetClient._with_passive_meta(res, attempts, maker=maker)
+        if (not reduce_only) and float(out.cum_filled_qty or 0) > 0:
+            from utils.alert_sound import play_alert
+            play_alert("open")
+        return out
 
     @staticmethod
     def _with_passive_meta(

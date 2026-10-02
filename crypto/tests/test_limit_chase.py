@@ -139,6 +139,7 @@ class _PassiveStub(BinanceTestnetClient):
                 "cid": kw.get("client_order_id", ""),
                 "post_only": bool(kw.get("post_only")),
                 "cancel_if_unfilled": bool(kw.get("cancel_if_unfilled")),
+                "time_in_force": kw.get("time_in_force", "GTC"),
             }
         )
         if idx in self.reject_steps:
@@ -328,6 +329,32 @@ class TestTimeoutFallback(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertIn("passive_exhausted", res.error)
         self.assertEqual(res.cum_filled_qty, 0.0)
+
+    def test_fallback_cannot_leave_a_resting_gtc_order(self):
+        c = _PassiveStub(fill_crossing=False)
+        _run(c.place_limit_chase("LONG", 0.001, force_cross=True))
+        self.assertEqual(c.calls[-1]["time_in_force"], "IOC")
+
+    def test_unknown_fallback_is_not_reported_canceled(self):
+        class Unknown(_PassiveStub):
+            async def place_limit_order(self, *args, **kwargs):
+                return OrderResult(ok=False, client_order_id="pending-ioc",
+                                   order_state=OrderState.UNKNOWN.value,
+                                   status=OrderState.UNKNOWN.value,
+                                   error="query timeout")
+        res = _run(Unknown().place_limit_chase("LONG", 0.001, force_cross=True))
+        self.assertEqual(res.order_state, OrderState.UNKNOWN.value)
+        self.assertEqual(res.client_order_id, "pending-ioc")
+
+    def test_ioc_partial_fill_survives_remainder_expiry(self):
+        class Partial(_PassiveStub):
+            async def place_limit_order(self, *args, **kwargs):
+                return OrderResult(ok=False, cum_filled_qty=0.001,
+                                   quantity=0.001, avg_price=83000.5,
+                                   order_state=OrderState.CANCELED.value)
+        res = _run(Partial().place_limit_chase("LONG", 0.002, force_cross=True))
+        self.assertTrue(res.ok)
+        self.assertEqual(res.cum_filled_qty, 0.001)
 
     def test_reprice_attempts_are_capped(self):
         """窗口内重挂次数有上限, 不得空转。"""

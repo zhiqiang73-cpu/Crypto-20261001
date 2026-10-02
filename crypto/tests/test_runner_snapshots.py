@@ -44,6 +44,8 @@ class TestSignalReadingSnapshot(unittest.TestCase):
         self.assertEqual(out["bar_ms"], 2000)
         self.assertIs(out["signal_long"], True)
         self.assertIs(out["signal_short"], False)
+        self.assertIs(out["gold"], True)
+        self.assertEqual(out["series"]["k"], [49.0, 51.0])
         self.assertEqual(out["missed_bars"], 3)
         self.assertEqual(out["run_mode_at_snapshot"], "observation_only")
         self.assertEqual(out["position"], "空仓")
@@ -73,6 +75,8 @@ class TestSignalReadingSnapshot(unittest.TestCase):
         self.assertEqual(out["mode"], "observation_only")
         self.assertEqual(out["detail"], "unit test")
         self.assertEqual(out["symbol"], "BTCUSDT")
+        self.assertEqual(out["symbols"], ["BTCUSDT", "ETHUSDT"])
+        self.assertEqual(out["strategies"], ["kdj15", "kdj5", "eth15", "eth5"])
 
 
 if __name__ == "__main__":

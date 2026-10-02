@@ -45,8 +45,15 @@ BASE = ENDPOINTS.rest + "/fapi/v1/klines"
 UA = {"User-Agent": "crypto-quant-shadow/1.0"}
 
 
-def fetch(interval: str, limit: int) -> dict:
-    url = ENDPOINTS.klines_url(interval=interval, limit=limit)
+INTERVAL_MS = {
+    "5m": 5 * 60 * 1000,
+    "15m": 15 * 60 * 1000,
+    "1h": 60 * 60 * 1000,
+}
+
+
+def fetch(interval: str, limit: int, symbol: str = "BTCUSDT") -> dict:
+    url = ENDPOINTS.klines_url(interval=interval, symbol=symbol, limit=limit)
     req = urllib.request.Request(url, headers=UA)
     rows = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
     ts = np.array([r[0] for r in rows], dtype=np.int64)
@@ -58,6 +65,29 @@ def fetch(interval: str, limit: int) -> dict:
         "close": np.array([float(r[4]) for r in rows]),
         "volume": np.array([float(r[5]) for r in rows]),
     }
+
+
+def closed_kdj_series(interval: str, n: int = 36, symbol: str = "BTCUSDT") -> dict:
+    """已收盘 K/D 尾段，给读数图用。行情腿与运行器同一套 fetch。"""
+    now = int(time.time() * 1000)
+    step = INTERVAL_MS.get(interval, INTERVAL_MS["15m"])
+    bars = fetch(interval, max(80, n + 24), symbol)
+    mask = (bars["ts"] + step) <= now
+    high, low, close = bars["high"][mask], bars["low"][mask], bars["close"][mask]
+    k, d, _j = kdj(high, low, close)
+    k, d = k[-n:], d[-n:]
+
+    def py(arr):
+        out = []
+        for value in arr:
+            number = float(value)
+            out.append(number if np.isfinite(number) else None)
+        return out
+
+    gold = dead = False
+    if len(k) >= 2 and all(np.isfinite(float(x)) for x in (k[-2], d[-2], k[-1], d[-1])):
+        gold, dead = crossing(float(k[-2]), float(d[-2]), float(k[-1]), float(d[-1]))
+    return {"k": py(k), "d": py(d), "gold": bool(gold), "dead": bool(dead)}
 
 
 def _fmt(ms: int) -> str:
