@@ -26,9 +26,13 @@ sys.path.insert(0, ROOT)
 # ---------------------------------------------------------------------------
 # 统计起点
 #
-# 用户要求：「赚了多少」与胜率等指标从 2026-10-02 起算，历史委托与历史成交
-# 同样只显示该日期之后的记录。日期按本机时区的当日 00:00 解释，
-# 可用环境变量 STATS_START_DATE (YYYY-MM-DD) 覆盖。
+# 用户要求：「赚了多少」与胜率等**统计指标**从 2026-10-02 起算。
+#
+# ⚠ 起算日只作用于统计指标（/api/account/summary）。历史委托与历史成交
+# 必须返回**完整**历史 —— 它们曾经错误地复用了这个过滤，导致起算日之前的
+# 委托/成交在页面上凭空消失。不要再把它们接回来。
+#
+# 日期按本机时区的当日 00:00 解释，可用环境变量 STATS_START_DATE 覆盖。
 # ---------------------------------------------------------------------------
 STATS_START_DATE = os.getenv("STATS_START_DATE", "2026-10-02")
 
@@ -800,24 +804,26 @@ def create_app(
         return web.json_response({"strategies": out})
 
     async def api_binance_orders(request):
-        """币安历史委托 —— 以交易所为准, 非本地账本."""
+        """币安历史委托 —— 以交易所为准, 非本地账本.
+
+        ⚠ 这里**不得**按统计起算日过滤: 历史列表必须完整。曾经因为复用了
+        stats_start_ms() 而把起算日之前的委托全部藏掉, 用户看到的「记录不见了」
+        就是这个原因。起算日只作用于「赚了多少」那组统计指标。
+        """
         client = review.executor.client
         if not client.configured:
             return web.json_response(
                 {"connected": False, "reason": "binance_keys_missing", "orders": []}
             )
         try:
-            limit = int(request.query.get("limit", 50))
+            limit = int(request.query.get("limit", 200))
         except Exception:
-            limit = 50
+            limit = 200
         try:
-            orders = await client.all_orders(
-                limit=limit, start_time=stats_start_ms()
-            )
+            orders = await client.all_orders(limit=limit)
             return web.json_response({
                 "connected": True,
                 "orders": orders,
-                "stats_start": STATS_START_DATE,
             })
         except Exception as exc:
             return web.json_response({
@@ -827,24 +833,24 @@ def create_app(
             })
 
     async def api_binance_trades(request):
-        """币安历史成交 —— 含 realizedPnl 与 commission, 是盈亏的唯一可信来源."""
+        """币安历史成交 —— 含 realizedPnl 与 commission, 是盈亏的唯一可信来源.
+
+        同 api_binance_orders: 返回**完整**成交历史, 不按统计起算日过滤。
+        """
         client = review.executor.client
         if not client.configured:
             return web.json_response(
                 {"connected": False, "reason": "binance_keys_missing", "trades": []}
             )
         try:
-            limit = int(request.query.get("limit", 50))
+            limit = int(request.query.get("limit", 200))
         except Exception:
-            limit = 50
+            limit = 200
         try:
-            trades = await client.user_trades(
-                limit=limit, start_time=stats_start_ms()
-            )
+            trades = await client.user_trades(limit=limit)
             return web.json_response({
                 "connected": True,
                 "trades": trades,
-                "stats_start": STATS_START_DATE,
             })
         except Exception as exc:
             return web.json_response({

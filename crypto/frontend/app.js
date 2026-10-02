@@ -400,14 +400,13 @@
     const box = $("histOrdersBox");
     if (!box) return;
     try {
-      const d = await api("/api/binance/orders?limit=50");
+      const d = await api("/api/binance/orders?limit=200");
       if (!d.connected) {
         if ($("histOrdersTag")) $("histOrdersTag").textContent = "未连接";
         box.innerHTML = empty("币安未连接", d.reason || "请到账户连接页配置密钥");
         return;
       }
       const list = (d.orders || []).slice().reverse();
-      if ($("ordersStart")) $("ordersStart").textContent = d.stats_start || "—";
       if ($("histOrdersTag")) $("histOrdersTag").textContent = list.length + " 条";
       if (!list.length) {
         box.innerHTML = empty("暂无历史委托", "币安返回空列表");
@@ -435,14 +434,13 @@
     const box = $("histTradesBox");
     if (!box) return;
     try {
-      const d = await api("/api/binance/trades?limit=50");
+      const d = await api("/api/binance/trades?limit=200");
       if (!d.connected) {
         if ($("histTradesTag")) $("histTradesTag").textContent = "未连接";
         box.innerHTML = empty("币安未连接", d.reason || "请到账户连接页配置密钥");
         return;
       }
       const list = (d.trades || []).slice().reverse();
-      if ($("tradesStart")) $("tradesStart").textContent = d.stats_start || "—";
       if ($("histTradesTag")) $("histTradesTag").textContent = list.length + " 条";
       if (!list.length) {
         box.innerHTML = empty("暂无历史成交", "币安返回空列表");
