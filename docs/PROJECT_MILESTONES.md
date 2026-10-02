@@ -531,8 +531,13 @@ client = review.executor.client
 新增 `config/strategies/deployed_kdj_extreme_v1.json`，描述**实际运行**的策略：
 KDJ 极值反转，金叉且 K<30 做多 / 死叉且 K>70 做空，反手出场。
 
-> 说明：注册表中另有 `kdj_rsi_reversal_v1` 与 `trend_filter_long_v1`（均 `enabled: false`），
-> 是早期未启用的策略，UI 中以灰色"未启用"明确区分，不与运行中策略混淆。
+> 说明：注册表中另有 `trend_filter_long_v1`（`enabled: false`），是早期未启用的策略，
+> UI 中以灰色"未启用"明确区分，不与运行中策略混淆。
+
+**5. 清理废弃策略（2026-10-02）**
+
+`kdj_rsi_reversal_v1`（KDJ+RSI 双金叉反手）经用户确认已无用，从注册表删除。
+该策略从未启用（`enabled: false`），无代码依赖，删除不影响运行链路。
 
 ### 验证结果
 
