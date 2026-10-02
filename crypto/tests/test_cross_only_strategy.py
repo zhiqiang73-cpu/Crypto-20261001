@@ -1,4 +1,4 @@
-"""用户 2026-10-02 新规则：金叉/死叉即信号，不再要求 K<30/K>70。"""
+"""用户 2026-10-02 新规则：15m 用 MACD 能量柱方向做闸门，5m 用 K 极值。"""
 import json
 import pathlib
 import unittest
@@ -29,19 +29,25 @@ class CrossOnlyTests(unittest.TestCase):
         for name in ('engine.py', 'live.py'):
             source = (ROOT / 'shadow' / name).read_text(encoding='utf-8')
             self.assertIn('crossing(', source, name)
+            self.assertIn('macd_gate(', source, name)
             self.assertNotIn('k[i] < K_LONG_MAX', source, name)
             self.assertNotIn('k[i] > K_SHORT_MIN', source, name)
         deploy_src = (ROOT / 'shadow' / 'deploy.py').read_text(encoding='utf-8')
         self.assertIn('entry_signal(', deploy_src)
         self.assertIn('confirmed_signal(', deploy_src)
+        self.assertIn('macd_gate(', deploy_src)
         self.assertNotIn('k[i] < K_LONG_MAX', deploy_src)
         self.assertNotIn('k[i] > K_SHORT_MIN', deploy_src)
 
     def test_strategy_card_matches_actual_rules(self):
         cfg = json.loads((ROOT / 'config/strategies/deployed_kdj_extreme_v1.json').read_text(encoding='utf-8'))
-        self.assertIn('涨破上一根最高', cfg['entry']['long'])
-        self.assertIn('跌破上一根最低', cfg['entry']['short'])
+        self.assertIn('MACD 能量柱为正', cfg['entry']['long'])
+        self.assertIn('MACD 能量柱为负', cfg['entry']['short'])
+        self.assertNotIn('涨破上一根最高', cfg['entry']['long'])
+        self.assertNotIn('跌破上一根最低', cfg['entry']['short'])
+        self.assertIn('背离', cfg['entry']['divergence'])
         self.assertIn('下一根开盘', cfg['entry']['long'])
+        self.assertIn('MACD', cfg['indicators'])
         self.assertEqual(cfg['position_sizing']['r'], 0.03)
         self.assertEqual(cfg['runtime_key'], 'kdj15')
         self.assertIn('GTX', cfg['execution_style']['description'])
@@ -59,9 +65,10 @@ class CrossOnlyTests(unittest.TestCase):
         eth5 = json.loads((ROOT / 'config/strategies/deployed_kdj_eth_5m_extreme_v1.json').read_text(encoding='utf-8'))
         self.assertEqual(eth15['runtime_key'], 'eth15')
         self.assertEqual(eth15['symbol'], 'ETHUSDT')
-        self.assertIn('涨破上一根最高', eth15['entry']['long'])
+        self.assertIn('MACD 能量柱为正', eth15['entry']['long'])
         self.assertIn('下一根开盘', eth15['entry']['long'])
         self.assertNotIn('K<30', eth15['entry']['long'])
+        self.assertIn('MACD', eth15['indicators'])
         self.assertEqual(eth15['position_sizing']['r'], 0.03)
         self.assertEqual(eth5['runtime_key'], 'eth5')
         self.assertEqual(eth5['symbol'], 'ETHUSDT')

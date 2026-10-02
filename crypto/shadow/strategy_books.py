@@ -28,6 +28,7 @@ class StrategySpec:
     label: str
     confirm_next: bool = False
     require_break: bool = False
+    require_macd: bool = False
 
 
 SPEC_15M = StrategySpec(
@@ -39,11 +40,13 @@ SPEC_15M = StrategySpec(
     k_long_max=None,
     k_short_min=None,
     lookback=96,
-    signal_rule="当根收盘交叉且价格突破上一根高低点，下一根开盘下限价单；不使用 K 极值过滤",
+    signal_rule="当根收盘金叉且 MACD 能量柱为正 → 做多；死叉且能量柱为负 → 做空；"
+                "方向背离的交叉丢弃不操作；不使用 K 极值过滤",
     cold_start=False,
     label="BTC 15m",
     confirm_next=False,
-    require_break=True,
+    require_break=False,
+    require_macd=True,
 )
 SPEC_5M = StrategySpec(
     id="kdj5",
@@ -67,11 +70,13 @@ SPEC_ETH_15M = StrategySpec(
     k_long_max=None,
     k_short_min=None,
     lookback=96,
-    signal_rule="当根收盘交叉且价格突破上一根高低点，下一根开盘下限价单；不使用 K 极值过滤",
+    signal_rule="当根收盘金叉且 MACD 能量柱为正 → 做多；死叉且能量柱为负 → 做空；"
+                "方向背离的交叉丢弃不操作；不使用 K 极值过滤",
     cold_start=True,
     label="ETH 15m",
     confirm_next=False,
-    require_break=True,
+    require_break=False,
+    require_macd=True,
 )
 SPEC_ETH_5M = StrategySpec(
     id="eth5",

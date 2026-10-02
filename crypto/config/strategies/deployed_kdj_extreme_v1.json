@@ -1,7 +1,7 @@
 {
   "strategy_id": "deployed_kdj_extreme_v1",
   "runtime_key": "kdj15",
-  "name": "KDJ 交叉反手 (BTCUSDT 15m)",
+  "name": "KDJ×MACD 双指标闸门 (BTCUSDT 15m)",
   "kind": "mean_reversion",
   "timeframe": "15m",
   "risk_timeframe": "1h",
@@ -11,20 +11,22 @@
   "entry": {
     "golden_cross": "K[t-1] <= D[t-1] and K[t] > D[t]",
     "dead_cross": "K[t-1] >= D[t-1] and K[t] < D[t]",
-    "long": "金叉且收盘涨破上一根最高（至少 0.15×ATR_1H）才做多；下一根开盘下限价单",
-    "short": "死叉且收盘跌破上一根最低（至少 0.15×ATR_1H）才做空；下一根开盘下限价单",
-    "execution": "当根收盘判定交叉+突破，下一根开盘限价追价。擦线（未真正突破）不做",
+    "long": "金叉且 MACD 能量柱为正（红柱）才做多；下一根开盘下限价单",
+    "short": "死叉且 MACD 能量柱为负（绿柱）才做空；下一根开盘下限价单",
+    "execution": "当根收盘同时判定交叉与能量柱方向，下一根开盘限价追价",
+    "divergence": "金叉遇绿柱 / 死叉遇红柱 → 方向背离，丢弃不操作：不开新仓、不平仓、不反手",
     "loose_long": "已废弃：无极值过滤",
     "loose_short": "已废弃：无极值过滤"
   },
   "exit": {
-    "mode_a": "对侧交叉同样要带价格突破，下一根开盘限价反手",
+    "mode_a": "对侧交叉同样要过能量柱方向闸门，下一根开盘限价反手；背离的交叉不动仓",
     "mode_b": "对侧交叉平仓 (仅并行记录, 不执行)"
   },
   "indicators": {
     "KDJ": "(9,3,3) 15m; RSV=(C-LLV(L,9))/(HHV(H,9)-LLV(L,9))*100, 分母为0时取50; K=(2K'+RSV)/3; D=(2D'+K)/3; 初值 K0=D0=50; 不用 J",
+    "MACD": "(12,26,9) 15m —— 只取能量柱正负作为方向闸门; EMA_t=αC_t+(1-α)EMA_{t-1}, α=2/(n+1), 初值取第一根收盘价; DIF=EMA12-EMA26; DEA=EMA9(DIF); 柱=DIF-DEA; 红柱>0, 绿柱<0",
     "ATR": "(14) 1h Wilder; TR=max(H-L,|H-C'|,|L-C'|); ATR=(13ATR'+TR)/14; 初值前14根TR简单平均",
-    "BOLL": "(20,2) 15m —— 闸门已按用户指令移除, 仅记录不参与开仓"
+    "BOLL": "(20,2) 15m —— 仅记录不参与开仓"
   },
   "position_sizing": {
     "formula": "qty = 权益_USDT × r ÷ (k × ATR_1H)",
@@ -52,5 +54,5 @@
   "status": "testnet_ready_manual_activation",
   "enabled": true,
   "source": "user_spec",
-  "note": "2026-10-02：15m 交叉必须带价格突破（0.15×ATR_1H）。下一根开盘下限价。r=0.03 未改。"
+  "note": "2026-10-02：15m 原「价格突破上一根高低点」过滤已按用户指令替换为 MACD(12,26,9) 能量柱方向闸门。背离丢弃。下一根开盘下限价。r=0.03 未改。"
 }

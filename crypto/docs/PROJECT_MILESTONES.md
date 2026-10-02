@@ -888,3 +888,84 @@ post-only 拒单退档、竞态成交、兜底穿盘口、滑点上限、重挂�
 **验证**：518 项测试通过；`node --check frontend/app.js` 通过；浏览器实测提示条文案
 「已跟随人工操作：BTC · ETH」与两张分标的卡片（BTC +124.35 / ETH −7.74）均正确渲染，
 控制台无错误。
+
+### 2026-10-02 21:50 · 15m 策略换成 KDJ×MACD 双指标闸门
+
+**用户指令**：把 MACD 加进技术指标后有了新想法 —— KDJ 交叉负责择时，MACD 能量柱负责
+方向。确认口径：**MACD 方向按红绿柱（能量柱）正负为准；做双向；背离类信号直接丢弃不
+操作；周期固定 15m**。这套思路**整条替换**原来的 15m 思路，**只改 BTCUSDT 与 ETHUSDT
+两条 15m 策略**，5m 两条不动。
+
+**规则（替换前 → 替换后，仅 15m）**
+
+| | 替换前 | 替换后 |
+| --- | --- | --- |
+| 做多 | 金叉 + 收盘涨破上一根最高（≥0.15×ATR_1H） | 金叉 + MACD 能量柱为正（红柱） |
+| 做空 | 死叉 + 收盘跌破上一根最低（≥0.15×ATR_1H） | 死叉 + MACD 能量柱为负（绿柱） |
+| 背离 | 不适用 | 金叉遇绿柱 / 死叉遇红柱 → **丢弃**：不开仓、不平仓、不反手 |
+
+**已完成**
+
+1. `shadow/indicators.py::macd` 新增 MACD(12,26,9)：EMA 自第一根收盘价递推
+   （α=2/(n+1)），DIF=EMA12−EMA26，DEA=EMA9(DIF)，柱=DIF−DEA，与 TradingView / 币安
+   同口径。闸门只取柱的正负号。
+2. `shadow/signals.py::macd_gate` / `macd_side`：闸门判定与「背离」文案的唯一来源；
+   柱为 0 或数值不可用同样丢弃。
+3. `shadow/strategy_books.py`：`StrategySpec` 增加 `require_macd`；`SPEC_15M` 与
+   `SPEC_ETH_15M` 改为 `require_macd=True` / `require_break=False`，规则原文同步。
+   5m 两条保持 `require_break=False` / `require_macd=False`。
+4. `shadow/deploy.py`：`process_strategy()` 与 `save_signal_reading()` 都过闸门；停机
+   补记的「错过」根数只统计过闸门的信号；读数快照新增 `MACD_DIF` / `MACD_DEA` /
+   `MACD_HIST` / `macd_side` / `require_macd` / `macd_note`，并新增 `series.hist`。
+5. `shadow/engine.py`（回测）+ `shadow/reporting.py`：同样过闸门，逐根日志新增
+   「MACD柱」列；「宽松」列保留为未经闸门的裸交叉，用于量化闸门挡掉了多少。
+   `shadow/live.py`（阶段 1 影子运行器）同步。
+6. 策略卡 `config/strategies/deployed_kdj_extreme_v1.json` 与
+   `deployed_kdj_eth_extreme_v1.json` 改写 entry/exit/indicators/note；5m 两张卡未动。
+7. 前端 `frontend/app.js::signalView` 增加闸门文案（「金叉且 MACD 红柱」/
+   「MACD 不是红柱」等）。
+8. 测试：新增 `tests/test_macd_gate_strategy.py`（20 项：EMA 口径、闸门矩阵、引擎信号
+   必须与能量柱同向、规格与策略卡一致性）；改写 `tests/test_dual_strategy_books.py`
+   的 15m 用例（改用 `patch(shadow.deploy.macd)` 控制柱方向）与
+   `tests/test_cross_only_strategy.py` 的策略卡断言。
+
+**验证**
+
+- 全量测试 **539 项通过**（含新增 20 项）。
+- 真实历史回放（`python3 -m shadow.run --tail 60`，BTCUSDT 15m 5,761 根）：裸交叉
+  1,020 个 → 过闸门 404 个，**闸门挡掉 616 个（60.4%）**；模式 A 9 笔成交、净
+  +25.92 USDT、盈亏比 2.51；模式 B 22 笔、净 −26.68 USDT。闸门确实在挡背离，不是空转。
+- `price_breaks()` / `BREAK_ATR_MULT` 保留但已无规格使用；5m 行为未受影响。
+- 未改：`r=0.03`、10x 逐仓、日亏 3%、回撤 10% 熔断、灾难止损 3×ATR_1H、限价追价与
+  maker 优先执行、委托前缀。`_IMPL_FILES` 不含 `shadow/`，**本次无需 reseal**。
+
+### 2026-10-02 22:13 · 追价下单「部分成交不撤单」缺陷（真实事故）
+
+**现象**：21:46 日志出现 `[ETHUSDT 净仓] 目标 5.0700 原 10.0100 → 5.0710`，
+持仓凭空多出 4.94 ETH，一分钟后被迫反向卖出纠正。
+
+**排查**：拉交易所逐笔委托核对，21:28 之后 ETH 只有一笔外部单（22:05 用户手动平仓
+`web_Atbiyv4NXd`），**加仓那 4.94 并不是人下的**：
+
+```
+21:46:30  策略 BUY 4.940 @2762.27  FILLED   ← 补差单
+21:46:30  策略 BUY 5.070 @2760.67  FILLED   ← 原单剩余部分
+```
+
+**根因**（`trading/binance_client.py` 的 `place_limit_order` 收尾）：
+
+```python
+filled = float(last.cum_filled_qty or last.filled_qty or 0)
+if filled > 0:
+    return last.to_order_result()      # ← 部分成交直接返回，跳过撤单
+```
+
+部分成交（0.13 / 5.070）后函数**不撤单就返回**，剩余 4.94 继续以 GTC post-only
+挂在盘口。运行器以为这单已结束，下一步净仓同步又下了 4.940 的补差单，两张单在同一秒
+全部成交 → 持仓正好翻倍，随后被迫反向纠正，白付一次价差与手续费。
+
+**修复**：只要不是完全成交，就必须撤掉剩余挂单；撤单回执缺成交量时用轮询值兜底；
+有真实成交时保持 `ok=True`（与改动前语义一致），`order_state` 仍如实记为 CANCELED。
+
+**验证**：新增 `tests/test_partial_fill_cancel.py`（4 项）；全量 **543 项通过**。
+**注意**：人工加仓检测逻辑本身没有问题 —— 本次并非人工下单，故未触发暂停。

@@ -1,7 +1,8 @@
 """影子模式实时运行器 (阶段 1).
 
 每 60 秒轮询一次币安公开行情, 只处理【已收盘】的 15m K 线,
-按规格判定信号、做虚拟成交、追加日志。不触碰任何下单接口。
+按规格判定信号 (金叉且 MACD 能量柱为正 → 多; 死叉且为负 → 空;
+背离的交叉丢弃不操作)、做虚拟成交、追加日志。不触碰任何下单接口。
 
 状态保存在 runtime/shadow/live_state.json, 中断后可续跑。
 """
@@ -22,7 +23,8 @@ from shadow.engine import (ATR_MULT_K, BOLL_GATE_ENABLED, DISASTER_ATR, FEE_PER_
                            GATE_STRONG, GATE_WEAK, MIN_NOTIONAL, MIN_QTY, RISK_R, STEP_SIZE,
                            floor_step)
 from shadow.indicators import atr_wilder, boll, kdj
-from shadow.signals import crossing
+from shadow.indicators import atr_wilder, boll, kdj, macd
+from shadow.signals import crossing, macd_gate
 from shadow.reporting import BAR_COLS, TRADE_COLS
 from config.market_endpoints import resolve_for_account
 
@@ -136,6 +138,7 @@ def cycle(st: dict) -> int:
     ts = b15["ts"]
     o, h, l, c, v = (b15[x] for x in ("open", "high", "low", "close", "volume"))
     k, d, j = kdj(h, l, c)
+    _dif, _dea, hist = macd(c)
     mb, up, lb, _ = boll(c, 20, 2.0)
 
     atr1h = atr_wilder(b1h["high"], b1h["low"], b1h["close"], 14)
@@ -197,8 +200,9 @@ def cycle(st: dict) -> int:
 
         # --- 信号 ---
         gold, dead = crossing(k[i - 1], d[i - 1], k[i], d[i])
-        sig_long, sig_short = gold, dead
-        loose_long, loose_short = gold, dead  # 兼容旧日志列名
+        # 15m 方向闸门: 交叉方向必须与 MACD 能量柱正负一致, 背离丢弃。
+        loose_long, loose_short = gold, dead  # 兼容旧日志列名 (裸交叉)
+        sig_long, sig_short, _macd_note = macd_gate(gold, dead, float(hist[i]))
 
         bw = float(up[i] - lb[i])
         target = bw / 2.0

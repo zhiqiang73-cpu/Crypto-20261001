@@ -1,4 +1,4 @@
-"""双策略虚拟账本：15m 纯交叉 + 5m 交叉且 K 极值，共用净仓。"""
+"""双策略虚拟账本：15m 交叉+MACD 能量柱闸门，5m 交叉+K 极值，共用净仓。"""
 from __future__ import annotations
 
 import json
@@ -216,9 +216,14 @@ class TestConfirmNextBar(unittest.TestCase):
     def test_15m_does_not_wait_for_next_close(self):
         self.assertFalse(SPEC_15M.confirm_next)
         self.assertFalse(SPEC_ETH_15M.confirm_next)
-        self.assertTrue(SPEC_15M.require_break)
-        self.assertTrue(SPEC_ETH_15M.require_break)
+        # 2026-10-02: 15m 方向过滤从「价格突破上一根高低点」换成「MACD 能量柱正负」。
+        self.assertFalse(SPEC_15M.require_break)
+        self.assertFalse(SPEC_ETH_15M.require_break)
+        self.assertTrue(SPEC_15M.require_macd)
+        self.assertTrue(SPEC_ETH_15M.require_macd)
         self.assertFalse(SPEC_5M.require_break)
+        self.assertFalse(SPEC_5M.require_macd)
+        self.assertFalse(SPEC_ETH_5M.require_macd)
 
 
 class TestPriceBreak(unittest.TestCase):
@@ -362,6 +367,13 @@ class TestProcessStrategyFourRules(unittest.TestCase):
         book["last_ts"] = int(bars["ts"][-2])
         return book
 
+    def _macd(self, bars, hist_value):
+        """把 MACD 能量柱固定成指定值, 单独验证闸门方向判定。"""
+        n = len(bars["ts"])
+        hist = np.full(n, float(hist_value))
+        zero = np.zeros(n)
+        return patch("shadow.deploy.macd", return_value=(zero, zero, hist))
+
     def test_eth5_opens_half_when_against_15m_short(self):
         tmp = tempfile.TemporaryDirectory()
         old = deploy.READING_ETH5
@@ -390,7 +402,8 @@ class TestProcessStrategyFourRules(unittest.TestCase):
             deploy.TRADE_LOG = old_log
             tmp.cleanup()
 
-    def test_btc15_skips_shallow_dead_cross(self):
+    def test_btc15_discards_dead_cross_when_hist_positive(self):
+        """死叉但 MACD 是红柱 → 方向背离, 丢弃不操作。"""
         tmp = tempfile.TemporaryDirectory()
         old = deploy.READING
         old_log = deploy.TRADE_LOG
@@ -399,14 +412,12 @@ class TestProcessStrategyFourRules(unittest.TestCase):
         bars, atr = self._bars(interval_ms=SPEC_15M.interval_ms, px=86150.0)
         n = len(bars["ts"])
         atr[:] = 407.2
-        bars["high"][-2], bars["low"][-2] = 86269.0, 86126.2
-        bars["close"][-1] = 86097.2
-        bars["high"][-1], bars["low"][-1] = 86212.8, 86092.2
         k = np.full(n, 70.0)
         d = np.full(n, 68.0)
         k[-1], d[-1] = 60.4, 61.2
         try:
-            with patch("shadow.deploy.kdj", return_value=(k, d, k)):
+            with patch("shadow.deploy.kdj", return_value=(k, d, k)), \
+                    self._macd(bars, 12.5):
                 book = self._armed(bars)
                 changed = process_strategy(
                     SPEC_15M, book, bars, atr, equity=5000.0,
@@ -419,13 +430,14 @@ class TestProcessStrategyFourRules(unittest.TestCase):
                 reading = json.load(fh)
             self.assertTrue(reading["dead"])
             self.assertFalse(reading["signal_short"])
-            self.assertIn("未向下突破", reading["break_note"])
+            self.assertTrue(reading["require_macd"])
+            self.assertIn("背离", reading["macd_note"])
         finally:
             deploy.READING = old
             deploy.TRADE_LOG = old_log
             tmp.cleanup()
 
-    def test_eth15_also_skips_shallow_dead_cross(self):
+    def test_eth15_discards_dead_cross_when_hist_positive(self):
         tmp = tempfile.TemporaryDirectory()
         old = deploy.READING_ETH15
         old_log = deploy.TRADE_LOG
@@ -434,14 +446,12 @@ class TestProcessStrategyFourRules(unittest.TestCase):
         bars, atr = self._bars(interval_ms=SPEC_ETH_15M.interval_ms, px=2750.0)
         n = len(bars["ts"])
         atr[:] = 16.409
-        bars["high"][-2], bars["low"][-2] = 2752.0, 2749.0
-        bars["close"][-1] = 2748.5
-        bars["high"][-1], bars["low"][-1] = 2751.0, 2748.0
         k = np.full(n, 70.0)
         d = np.full(n, 68.0)
         k[-1], d[-1] = 60.4, 61.2
         try:
-            with patch("shadow.deploy.kdj", return_value=(k, d, k)):
+            with patch("shadow.deploy.kdj", return_value=(k, d, k)), \
+                    self._macd(bars, 3.2):
                 book = self._armed(bars)
                 changed = process_strategy(
                     SPEC_ETH_15M, book, bars, atr, equity=5000.0,
@@ -450,12 +460,18 @@ class TestProcessStrategyFourRules(unittest.TestCase):
                 )
             self.assertFalse(changed)
             self.assertIsNone(book["entry"])
+            with open(deploy.READING_ETH15, encoding="utf-8") as fh:
+                reading = json.load(fh)
+            self.assertTrue(reading["dead"])
+            self.assertFalse(reading["signal_short"])
+            self.assertIn("背离", reading["macd_note"])
         finally:
             deploy.READING_ETH15 = old
             deploy.TRADE_LOG = old_log
             tmp.cleanup()
 
     def test_btc15_shorts_when_dead_breaks_prior_low(self):
+        """死叉且 MACD 是绿柱 → 正常做空。"""
         tmp = tempfile.TemporaryDirectory()
         old = deploy.READING
         old_log = deploy.TRADE_LOG
@@ -464,14 +480,12 @@ class TestProcessStrategyFourRules(unittest.TestCase):
         bars, atr = self._bars(interval_ms=SPEC_15M.interval_ms, px=86500.0)
         n = len(bars["ts"])
         atr[:] = 417.4
-        bars["high"][-2], bars["low"][-2] = 86624.6, 86525.8
-        bars["close"][-1] = 86299.9
-        bars["high"][-1], bars["low"][-1] = 86500.0, 86280.0
         k = np.full(n, 70.0)
         d = np.full(n, 68.0)
         k[-1], d[-1] = 89.3, 91.5
         try:
-            with patch("shadow.deploy.kdj", return_value=(k, d, k)):
+            with patch("shadow.deploy.kdj", return_value=(k, d, k)), \
+                    self._macd(bars, -8.0):
                 book = self._armed(bars)
                 process_strategy(
                     SPEC_15M, book, bars, atr, equity=5000.0,
@@ -479,6 +493,35 @@ class TestProcessStrategyFourRules(unittest.TestCase):
                     execute=False, trend=1,
                 )
             self.assertEqual(book["entry"]["side"], -1)
+            self.assertGreater(book["entry"]["qty"], 0)
+        finally:
+            deploy.READING = old
+            deploy.TRADE_LOG = old_log
+            tmp.cleanup()
+
+    def test_btc15_opens_long_when_gold_cross_with_red_hist(self):
+        """金叉且 MACD 是红柱 → 正常做多。"""
+        tmp = tempfile.TemporaryDirectory()
+        old = deploy.READING
+        old_log = deploy.TRADE_LOG
+        deploy.READING = os.path.join(tmp.name, "btc15.json")
+        deploy.TRADE_LOG = os.path.join(tmp.name, "trades.csv")
+        bars, atr = self._bars(interval_ms=SPEC_15M.interval_ms, px=86000.0)
+        n = len(bars["ts"])
+        atr[:] = 405.4
+        k = np.full(n, 28.0)
+        d = np.full(n, 30.0)
+        k[-1], d[-1] = 34.8, 30.1
+        try:
+            with patch("shadow.deploy.kdj", return_value=(k, d, k)), \
+                    self._macd(bars, 6.4):
+                book = self._armed(bars)
+                process_strategy(
+                    SPEC_15M, book, bars, atr, equity=5000.0,
+                    block=False, now=int(bars["ts"][-1] + SPEC_15M.interval_ms),
+                    execute=False, trend=1,
+                )
+            self.assertEqual(book["entry"]["side"], 1)
             self.assertGreater(book["entry"]["qty"], 0)
         finally:
             deploy.READING = old

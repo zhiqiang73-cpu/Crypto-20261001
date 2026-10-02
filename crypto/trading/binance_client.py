@@ -957,16 +957,38 @@ class BinanceTestnetClient:
                 break  # 查询本身失败：保持 UNKNOWN，不冒充失败
 
         filled = float(last.cum_filled_qty or last.filled_qty or 0)
-        if filled > 0:
-            return last.to_order_result()
 
-        if cancel_if_unfilled:
+        # 只要不是「完全成交」，就必须把剩余挂单撤掉。
+        #
+        # 2026-10-02 21:46 事故根因（务必保留这段说明）:
+        # 这里原本是 `if filled > 0: return last.to_order_result()` —— 只要
+        # 有一点部分成交就直接返回、**不撤单**，未成交的剩余量继续以 GTC
+        # post-only 挂在盘口。运行器以为这张单已经结束，下一步的净仓同步
+        # 又下了一张补差单，两张单在同一秒全部成交：
+        #   目标 5.070 → 实际 0.130（部分成交）→ 补差单 4.940
+        #   → 原单剩余 4.940 也成交 → 持仓 10.010（正好翻倍）
+        # 一分钟后被迫反向卖出 4.939 纠正，白付一次买卖价差与手续费。
+        if cancel_if_unfilled and last.state not in (
+            OrderState.REJECTED,
+        ):
             canceled = await self.cancel_order(client_order_id=cid, symbol=symbol)
-            canceled.cum_filled_qty = float(canceled.cum_filled_qty or 0)
-            canceled.filled_qty = canceled.cum_filled_qty
+            # 撤单回执可能不带成交量（-2011 等），此时用轮询到的值兜底，
+            # 绝不把已经成交的部分当成 0。
+            cum = float(canceled.cum_filled_qty or 0) or filled
+            canceled.cum_filled_qty = cum
+            canceled.filled_qty = cum
             if canceled.state == OrderState.UNKNOWN and not canceled.error:
                 canceled.state = OrderState.CANCELED
-            return canceled.to_order_result()
+            result = canceled.to_order_result()
+            if cum > 0:
+                # 有真实成交就是「成功的一部分」，与改动前
+                # （部分成交直接返回、ok=True）保持一致的语义；
+                # order_state 仍如实记为 CANCELED，不粉饰订单真实状态。
+                result.ok = True
+            return result
+
+        if filled > 0:
+            return last.to_order_result()
 
         return OrderResult(
             ok=False,

@@ -2,7 +2,8 @@
 
 规格要点 (全部硬编码为常量, 不对外暴露为可调项):
     信号周期 15m, 风险参数周期 1H; 只用已收盘 K 线。
-    做多 = 金叉；做空 = 死叉；不要求 K 值进入极值区。
+    做多 = 金叉且 MACD 能量柱为正；做空 = 死叉且能量柱为负。
+    方向背离的交叉丢弃（不平仓、不反手）；不要求 K 值进入极值区。
     出场 A: 对侧交叉平仓并反手；B: 对侧交叉只平仓。
     仓位: qty = 权益 × RISK_R ÷ (2 × ATR_1H), 向下取整到 stepSize。
     布林带仍计算并记日志，但不再过滤开仓。
@@ -25,12 +26,16 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from shadow.indicators import atr_wilder, boll, kdj
-from shadow.signals import crossing
+from shadow.indicators import atr_wilder, boll, kdj, macd
+from shadow.signals import crossing, macd_gate
 
 # --------------------------------------------------------------------------- 规格常量 (禁止修改)
 KDJ_N, KDJ_M1, KDJ_M2 = 9, 3, 3
 ATR_PERIOD = 14
 BOLL_N, BOLL_K = 20, 2.0
+# 2026-10-02 用户新增：15m 的方向过滤 = MACD(12,26,9) 能量柱正负。
+MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
+MACD_GATE_ENABLED = True
 
 # ---------------------------------------------------------------------------
 # 仓位拨盘 (用户 2026-10-02 指令: 可以增加仓位)
@@ -142,6 +147,7 @@ class BarRow:
     bandwidth: float
     target_dist: float
     multiple: float
+    macd_hist: float
     gold_cross: bool
     dead_cross: bool
     sig_long: bool
@@ -189,6 +195,7 @@ def run_shadow(bars15: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
     ts = bars15["ts"]
 
     k, d, j = kdj(h, l, c, KDJ_N, KDJ_M1, KDJ_M2)
+    _dif, _dea, hist = macd(c, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     mb, up, lb, _sd = boll(c, BOLL_N, BOLL_K)
     atr1h_aligned = align_atr_1h(ts, bars1h["ts"],
                                  atr_wilder(bars1h["high"], bars1h["low"],
@@ -281,9 +288,11 @@ def run_shadow(bars15: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
 
         # ---------- 4. 信号判定 (t 收盘) ----------
         gold, dead = crossing(k[i - 1], d[i - 1], k[i], d[i])
-        sig_long, sig_short = gold, dead
-        # 旧报表列名保留；去掉极值过滤后「宽松」与正式信号相同。
+        # 「宽松」列 = 未经方向闸门的裸交叉, 保留用于对比闸门挡掉了多少。
         loose_long, loose_short = gold, dead
+        sig_long, sig_short, _macd_note = macd_gate(
+            gold, dead, float(hist[i]), enabled=MACD_GATE_ENABLED,
+        )
 
         # 布林闸门
         if np.isnan(up[i]) or np.isnan(lb[i]):
@@ -390,6 +399,7 @@ def run_shadow(bars15: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
             lb=float(lb[i]), bandwidth=float(bandwidth) if not np.isnan(bandwidth) else 0.0,
             target_dist=float(target) if not np.isnan(target) else 0.0,
             multiple=float(mult) if not np.isnan(mult) else 0.0,
+            macd_hist=float(hist[i]),
             gold_cross=gold, dead_cross=dead, sig_long=sig_long, sig_short=sig_short,
             loose_long=loose_long, loose_short=loose_short,
             pos_side=pos_a.side if pos_a else 0,

@@ -1,7 +1,8 @@
 """KDJ 交叉策略的币安合约测试网运行器。
 
 BTCUSDT 与 ETHUSDT 各跑两条策略，按标的各记虚拟仓、只下该标的净额：
-    15m: 当根收盘交叉且突破上一根高低点，下一根开盘下限价单，无 K 阈值
+    15m: 当根收盘交叉且 MACD 能量柱方向一致（金叉+红柱做多 / 死叉+绿柱做空），
+         下一根开盘下限价单，无 K 阈值；背离的交叉丢弃，不平仓也不反手
     5m:  金叉且 K<30 做多 / 死叉且 K>70 做空，当根收盘即可
     5m 仓位：与同标的 15m 同向满仓，对着干则减半
     仓位 = 权益 × r ÷ (2 × ATR_1H), r=RISK_R, 向下取整 0.001
@@ -26,8 +27,9 @@ import numpy as np
 
 from shadow.engine import (ATR_MULT_K, DISASTER_ATR, GATE_FEE_RATE,
                            LEVERAGE, MIN_QTY, RISK_R, floor_step)
-from shadow.indicators import atr_wilder, boll, kdj
-from shadow.signals import confirmed_signal, entry_signal, price_breaks
+from shadow.indicators import atr_wilder, boll, kdj, macd
+from shadow.signals import (confirmed_signal, entry_signal, macd_gate,
+                            macd_side, price_breaks)
 from shadow.live import ENDPOINTS, MARKET, fetch
 from shadow.strategy_books import (SPEC_15M, SPEC_5M, SPECS, TRADE_SYMBOLS,
                                    apply_virtual_signal, clear_symbol_books,
@@ -223,7 +225,8 @@ def save_signal_reading(st: dict, *, i: int, ts, o, h, l, c, k, d, atr_al,
                         path: Optional[str] = None,
                         symbol: str = "BTCUSDT",
                         confirm_next: bool = False,
-                        require_break: bool = False) -> None:
+                        require_break: bool = False,
+                        require_macd: bool = False) -> None:
     """写入当前最新已收盘 K 线的读数，不依赖它是不是「新 K 线」。
 
     即使运行器重启时这根 K 线已经被处理过，也要刷新快照；否则进程崩溃在
@@ -233,6 +236,9 @@ def save_signal_reading(st: dict, *, i: int, ts, o, h, l, c, k, d, atr_al,
     sig_long = sig_short = gold = dead = False
     confirm_note = ""
     break_note = ""
+    macd_note = ""
+    dif_series, dea_series, hist_series = macd(c)
+    hist_now = float(hist_series[i]) if i < len(hist_series) else float("nan")
     if confirm_next and i >= 2:
         sig_long, sig_short, gold, dead, confirm_note = confirmed_signal(
             k[i - 2], d[i - 2], k[i - 1], d[i - 1], k[i], d[i],
@@ -253,6 +259,8 @@ def save_signal_reading(st: dict, *, i: int, ts, o, h, l, c, k, d, atr_al,
                     "死叉但未向下突破上一根低点" if dead
                     else "金叉但未向上突破上一根高点"
                 )
+    if require_macd:
+        sig_long, sig_short, macd_note = macd_gate(sig_long, sig_short, hist_now)
     band_width = float(up[i] - lb[i])
     mult = (band_width / 2.0) / (GATE_FEE_RATE * px) if px > 0 else 0.0
 
@@ -263,6 +271,7 @@ def save_signal_reading(st: dict, *, i: int, ts, o, h, l, c, k, d, atr_al,
     start = max(0, i + 1 - 36)
     series_k = [finite(k[j]) for j in range(start, i + 1)]
     series_d = [finite(d[j]) for j in range(start, i + 1)]
+    series_hist = [finite(hist_series[j]) for j in range(start, i + 1)]
 
     rec = {
         "bar_utc": _fmt(int(ts[i])),
@@ -272,6 +281,11 @@ def save_signal_reading(st: dict, *, i: int, ts, o, h, l, c, k, d, atr_al,
         "K": finite(k[i]), "D": finite(d[i]),
         "ATR_1H": finite(atr_al[i]),
         "mult": finite(mult),
+        # MACD(12,26,9): 闸门只认 HIST 正负, DIF/DEA 一并记录便于核对。
+        "MACD_DIF": finite(dif_series[i]) if i < len(dif_series) else None,
+        "MACD_DEA": finite(dea_series[i]) if i < len(dea_series) else None,
+        "MACD_HIST": finite(hist_now),
+        "macd_side": macd_side(hist_now),
         # `crossing()` 接收 NumPy 标量时会返回 numpy.bool_；json 不认识它。
         # 若不显式转换, save_reading 会静默失败、面板永远显示旧 K 线。
         "signal_long": bool(sig_long), "signal_short": bool(sig_short),
@@ -280,6 +294,8 @@ def save_signal_reading(st: dict, *, i: int, ts, o, h, l, c, k, d, atr_al,
         "confirm_note": confirm_note,
         "require_break": bool(require_break),
         "break_note": break_note,
+        "require_macd": bool(require_macd),
+        "macd_note": macd_note,
         "signal_rule": signal_rule,
         "signal_needs_k_extreme": k_long_max is not None or k_short_min is not None,
         "k_long_max": k_long_max,
@@ -295,7 +311,7 @@ def save_signal_reading(st: dict, *, i: int, ts, o, h, l, c, k, d, atr_al,
         "ws": ENDPOINTS.ws,
         "account_base_url": ENDPOINTS.account_base_url,
         "updated_ms": now,
-        "series": {"k": series_k, "d": series_d},
+        "series": {"k": series_k, "d": series_d, "hist": series_hist},
     }
     save_reading(rec, path)
 
@@ -437,6 +453,7 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
     ts = bars["ts"]
     o, h, l, c = (bars[x] for x in ("open", "high", "low", "close"))
     k, d, _j = kdj(h, l, c)
+    _dif, _dea, hist = macd(c)
     _mb, up, lb, _ = boll(c, 20, 2.0)
     reading_path = READING_BY_SPEC.get(spec.id, lambda: READING)()
     mark = f"{symbol_short(spec.symbol)} {spec.interval}"
@@ -455,6 +472,7 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
                 path=reading_path, symbol=spec.symbol,
                 confirm_next=spec.confirm_next,
                 require_break=spec.require_break,
+                require_macd=spec.require_macd,
             )
         print(f"[{mark}] 冷启动，从下一根已收盘 K 线开始交易")
         return False
@@ -472,6 +490,7 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
                 path=reading_path, symbol=spec.symbol,
                 confirm_next=spec.confirm_next,
                 require_break=spec.require_break,
+                require_macd=spec.require_macd,
             )
         return False
 
@@ -484,6 +503,11 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
                     k[j - 1], d[j - 1], k[j], d[j],
                     k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
                 )
+                if spec.require_macd:
+                    gold, dead, _ = macd_gate(
+                        gold, dead,
+                        float(hist[j]) if j < len(hist) else float("nan"),
+                    )
             if gold or dead:
                 sigs += 1
             which = "金叉做多" if gold else ("死叉做空" if dead else "无交叉")
@@ -525,6 +549,12 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
                 "死叉但未向下突破上一根低点" if dead
                 else "金叉但未向上突破上一根高点"
             )
+    macd_note = ""
+    if spec.require_macd:
+        sig_long, sig_short, macd_note = macd_gate(
+            sig_long, sig_short,
+            float(hist[i]) if i < len(hist) else float("nan"),
+        )
     qty = 0.0
     if not np.isnan(atr_al[i]) and atr_al[i] > 0:
         qty = floor_step(equity * RISK_R / (ATR_MULT_K * float(atr_al[i])))
@@ -556,6 +586,8 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
             note = confirm_note
         elif confirm_note not in (note or ""):
             note = f"{note}; {confirm_note}" if note else confirm_note
+    elif action is None and macd_note:
+        note = macd_note
     elif action is None and break_note:
         note = break_note
     elif action is None and (gold or dead) and not (sig_long or sig_short):
@@ -580,6 +612,7 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
         path=reading_path, symbol=spec.symbol,
         confirm_next=spec.confirm_next,
         require_break=spec.require_break,
+        require_macd=spec.require_macd,
     )
     book["last_ts"] = int(ts[i])
     return changed

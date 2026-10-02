@@ -533,28 +533,58 @@
       return {
         text: "开多",
         cls: "is-long",
-        sub: d.require_break ? "金叉且价格突破" : (d.signal_needs_k_extreme ? "金叉且 K<30" : "金叉"),
+        sub: d.require_macd
+          ? "金叉且 MACD 红柱"
+          : d.require_break
+            ? "金叉且价格突破"
+            : d.signal_needs_k_extreme
+              ? "金叉且 K<30"
+              : "金叉",
       };
     }
     if (d.signal_short) {
       return {
         text: "开空",
         cls: "is-short",
-        sub: d.require_break ? "死叉且价格突破" : (d.signal_needs_k_extreme ? "死叉且 K>70" : "死叉"),
+        sub: d.require_macd
+          ? "死叉且 MACD 绿柱"
+          : d.require_break
+            ? "死叉且价格突破"
+            : d.signal_needs_k_extreme
+              ? "死叉且 K>70"
+              : "死叉",
       };
     }
     if (cross.gold) {
       return {
         text: "金叉未开",
         cls: "is-wait",
-        sub: d.break_note || (d.require_break ? "未涨破上一根高点" : (d.signal_needs_k_extreme ? "K 还没到 30" : "观察")),
+        sub:
+          d.macd_note ||
+          d.break_note ||
+          (d.require_macd
+            ? "MACD 不是红柱"
+            : d.require_break
+              ? "未涨破上一根高点"
+              : d.signal_needs_k_extreme
+                ? "K 还没到 30"
+                : "观察"),
       };
     }
     if (cross.dead) {
       return {
         text: "死叉未开",
         cls: "is-wait",
-        sub: d.break_note || (d.require_break ? "未跌破上一根低点" : (d.signal_needs_k_extreme ? "K 还没到 70" : "观察")),
+        sub:
+          d.macd_note ||
+          d.break_note ||
+          (d.require_macd
+            ? "MACD 不是绿柱"
+            : d.require_break
+              ? "未跌破上一根低点"
+              : d.signal_needs_k_extreme
+                ? "K 还没到 70"
+                : "观察"),
       };
     }
     const above = Number(d.K) > Number(d.D);
