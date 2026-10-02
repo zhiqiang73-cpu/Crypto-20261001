@@ -226,3 +226,56 @@ body { background: radial-gradient(circle at 88% -20%,#192c30 0%,transparent 38%
 @media (max-width: 1180px) {
   .filter-bar { flex-direction: column; align-items: flex-start; }
 }
+
+/* ============================================================
+   BUILD 0.5 · 左侧已配置策略列表
+   策略清单留在全局视觉锚点，主工作区只展开详情和账户数据。
+   ============================================================ */
+.sidebar-strategies {
+  margin: 28px 2px 0;
+  padding: 18px 8px 0;
+  border-top: 1px solid var(--line);
+  min-height: 0;
+}
+.sidebar-section-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 8px; margin-bottom: 11px;
+}
+.sidebar-section-head p {
+  margin: 0 0 2px; color: #6f7d91; font: 9px var(--mono); letter-spacing: .14em;
+}
+.sidebar-section-head h2 { margin: 0; color: #d9e1ec; font-size: 12px; font-weight: 650; }
+.sidebar-count {
+  min-width: 20px; padding: 2px 6px; border: 1px solid #334152; border-radius: 99px;
+  color: var(--muted); text-align: center; font: 10px var(--mono);
+}
+.sidebar-strategy-list { display: grid; gap: 7px; max-height: 258px; overflow-y: auto; padding-right: 2px; }
+.sidebar-strategy-item {
+  padding: 10px 9px; border: 1px solid #263443; border-radius: 9px;
+  background: rgba(18, 26, 37, .78);
+}
+.sidebar-strategy-item.is-enabled {
+  border-color: rgba(98, 212, 154, .34);
+  background: linear-gradient(135deg, rgba(22,55,43,.56), rgba(16,26,35,.92));
+}
+.sidebar-strategy-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.sidebar-strategy-top b { min-width: 0; flex: 1; color: #e7edf5; font-size: 11px; line-height: 1.35; }
+.sidebar-strategy-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: #6c7888; }
+.sidebar-strategy-dot.online { background: var(--green); box-shadow: 0 0 9px rgba(98,212,154,.7); }
+.sidebar-strategy-dot.offline { background: var(--amber); }
+.sidebar-strategy-state { flex: none; color: #8e9aaa; font: 9px var(--mono); }
+.sidebar-strategy-state.on { color: #8fe3b8; }
+.sidebar-strategy-state.off { color: var(--amber); }
+.sidebar-strategy-item p {
+  margin: 6px 0 3px 12px; color: #8794a7; font: 9px var(--mono); letter-spacing: .01em;
+}
+.sidebar-strategy-item small {
+  display: -webkit-box; margin-left: 12px; overflow: hidden; color: #adb8c7;
+  font-size: 10px; line-height: 1.4; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+.sidebar-strategy-note { margin: 10px 2px 0; color: #69778b; font-size: 10px; line-height: 1.5; }
+.sidebar-strategy-loading { padding: 10px 3px; color: #778699; font-size: 11px; }
+
+@media (max-width: 760px) {
+  .sidebar-strategies { display: none; }
+}

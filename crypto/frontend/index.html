@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BTC Quant Console</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/styles.css?v=2" />
 </head>
 <body>
   <div class="app-shell">
@@ -15,6 +15,16 @@
         <button class="nav-item active" data-view="trading"><span>01</span>交易总览</button>
         <button class="nav-item" data-view="account"><span>02</span>账户连接</button>
       </nav>
+      <section class="sidebar-strategies" aria-label="已配置策略">
+        <div class="sidebar-section-head">
+          <div><p>CONFIGURED</p><h2>已配置策略</h2></div>
+          <span class="sidebar-count" id="sidebarStrategyCount">—</span>
+        </div>
+        <div class="sidebar-strategy-list" id="sidebarStrategyList">
+          <div class="sidebar-strategy-loading">正在读取策略…</div>
+        </div>
+        <p class="sidebar-strategy-note">名称、启用状态和入场规则以本机策略配置为准。</p>
+      </section>
       <div class="sidebar-bottom">
         <div class="server-state"><span class="dot green"></span><div><b>LOCAL ENGINE</b><small id="engineState">等待连接</small></div></div>
         <small class="build">BTCUSDT / USDⓈ-M<br>Local system · v0.3</small>
@@ -73,7 +83,7 @@
         </div>
 
         <div class="section-head">
-          <div><p class="eyebrow">STRATEGY / SIGNAL</p><h2>已配置的策略</h2><p class="subline">金叉做多、死叉做空；不使用 K 数值阈值。配置启用不等于自动下单运行中。</p></div>
+          <div><p class="eyebrow">STRATEGY / SIGNAL</p><h2>当前策略详情</h2><p class="subline">左侧列出全部已配置策略；这里展开规则与运行状态。金叉做多、死叉做空；不使用 K 数值阈值。</p></div>
         </div>
         <div class="strategy-grid" id="strategyList">
           <div class="empty-state"><span>○</span><div><b>加载中…</b></div></div>
@@ -164,6 +174,6 @@
       </section>
     </main>
   </div>
-  <script src="/app.js?v=17"></script>
+  <script src="/app.js?v=18"></script>
 </body>
 </html>

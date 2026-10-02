@@ -378,15 +378,40 @@
 
   async function loadStrategies() {
     const box = $("strategyList");
-    if (!box) return;
+    const sidebarBox = $("sidebarStrategyList");
+    const sidebarCount = $("sidebarStrategyCount");
+    if (!box && !sidebarBox) return;
     try {
       const d = await api("/api/strategies/active");
       const list = d.strategies || [];
       if (!list.length) {
-        box.innerHTML = empty("暂无策略", "config/strategies 为空");
+        if (box) box.innerHTML = empty("暂无策略", "config/strategies 为空");
+        if (sidebarBox) sidebarBox.innerHTML = `<div class="sidebar-strategy-loading">暂无策略</div>`;
+        if (sidebarCount) sidebarCount.textContent = "0";
         return;
       }
-      box.innerHTML = list
+      if (sidebarCount) sidebarCount.textContent = String(list.length);
+      if (sidebarBox) {
+        sidebarBox.innerHTML = list.map((s) => {
+          const on = !!s.enabled;
+          const e = s.entry || {};
+          const rt = s.runtime || {};
+          const state = on ? (rt.halted ? "已熔断" : "已启用") : "未启用";
+          const signal = on
+            ? `${e.long || "金叉做多"} / ${e.short || "死叉做空"}`
+            : (s.status || "等待启用");
+          return `<article class="sidebar-strategy-item${on ? " is-enabled" : ""}">
+            <div class="sidebar-strategy-top">
+              <span class="sidebar-strategy-dot ${on && !rt.halted ? "online" : "offline"}"></span>
+              <b>${esc(s.name || s.strategy_id)}</b>
+              <span class="sidebar-strategy-state ${on && !rt.halted ? "on" : "off"}">${esc(state)}</span>
+            </div>
+            <p>${esc(s.symbol || "BTCUSDT")} · ${esc(s.timeframe || "—")} · ${esc(s.kind || "策略")}</p>
+            <small>${esc(signal)}</small>
+          </article>`;
+        }).join("");
+      }
+      if (box) box.innerHTML = list
         .map((s) => {
           const on = !!s.enabled;
           const rt = s.runtime || {};
@@ -429,7 +454,9 @@
         })
         .join("");
     } catch (e) {
-      box.innerHTML = empty("策略读取失败", String(e.message || e));
+      if (box) box.innerHTML = empty("策略读取失败", String(e.message || e));
+      if (sidebarBox) sidebarBox.innerHTML = `<div class="sidebar-strategy-loading">策略读取失败</div>`;
+      if (sidebarCount) sidebarCount.textContent = "!";
     }
   }
 
