@@ -3,3 +3,70 @@
 
 /* dark terminal finish */
 :root{color-scheme:dark}body{background:radial-gradient(circle at 75% -15%,rgba(58,91,126,.18),transparent 34%),var(--canvas)}.sidebar{background:linear-gradient(180deg,#0d141d 0%,#0b1017 100%);box-shadow:14px 0 40px rgba(0,0,0,.18)}.brand-mark{box-shadow:0 0 24px rgba(240,139,91,.28)}.mode-pill{background:rgba(228,174,97,.08);border-color:rgba(228,174,97,.28)}.nav-item.active{background:linear-gradient(90deg,rgba(240,139,91,.16),rgba(240,139,91,.04));border:1px solid rgba(240,139,91,.18);box-shadow:inset 3px 0 0 var(--accent),0 8px 22px rgba(0,0,0,.18)}.hero-card,.metric-card,.strategy-card,.panel,.table-panel,.risk-overview,.account-form,.account-state{background:linear-gradient(145deg,rgba(21,29,40,.98),rgba(15,21,30,.98));box-shadow:0 16px 40px rgba(0,0,0,.2),inset 0 1px 0 rgba(255,255,255,.025)}.hero-card{border-color:rgba(240,139,91,.26)}.hero-card:after{content:"";position:absolute;inset:auto -15% -70% 35%;height:180px;background:radial-gradient(ellipse,rgba(240,139,91,.13),transparent 68%);pointer-events:none}.hero-price{color:#f4f7fb;text-shadow:0 0 28px rgba(240,139,91,.12)}.hero-spark i{box-shadow:0 0 10px rgba(240,139,91,.22)}.accent-card{background:linear-gradient(145deg,#1b222d,#131a24)}.progress{background:#202b38}.progress span{box-shadow:0 0 12px rgba(240,139,91,.38)}.add-strategy{border-color:#354252;background:rgba(15,21,30,.45)}.add-strategy:hover{background:rgba(240,139,91,.08)}.import-box{background:rgba(17,25,35,.72);border-color:#354252}.drop-icon{box-shadow:0 0 24px rgba(240,139,91,.12)}.empty-large{border-color:#354252;background:rgba(15,21,30,.35)}.account-form input,.account-form select{background:#0d141d;border-color:#2d3a4b;color:#e7edf5}.account-form input::placeholder{color:#586678}.account-form input:focus,.account-form select:focus{box-shadow:0 0 0 3px rgba(240,139,91,.16)}.ghost-btn,.primary-btn,.text-btn,.mini-btn{background:#131b26}.primary-btn{background:linear-gradient(135deg,#f08b5b,#d96b43);box-shadow:0 8px 20px rgba(240,139,91,.18)}.table-row:last-child{border-bottom-color:transparent}.section-head{border-bottom:0}.sync .dot.green{box-shadow:0 0 9px rgba(98,212,154,.7)}@media(max-width:720px){.sidebar{background:#0d141d}}
+
+
+/* ============================================================
+   两页改版新增 (BUILD 0.2.0)
+   第 1 页 交易总览 / 第 2 页 账户连接
+   ============================================================ */
+
+/* 键值列表: 仓位、委托、策略规则共用 */
+.kv-list { display: flex; flex-direction: column; gap: 9px; padding: 2px 0; }
+.kv-row {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 14px; font-size: 13px; line-height: 1.5;
+}
+.kv-row > span { color: var(--muted); flex: 0 0 auto; }
+.kv-row > b {
+  color: var(--ink); font-weight: 600; text-align: right;
+  word-break: break-word;
+}
+
+/* 盈亏正负色 */
+.negative { color: #ff5c72; }
+.metric-value.positive { color: var(--green); }
+.metric-value.negative { color: #ff5c72; }
+.table-row .positive { color: var(--green); }
+.table-row .negative { color: #ff5c72; }
+
+/* 历史委托 / 历史成交表格: 列数按内容定制 */
+.table-body { display: flex; flex-direction: column; }
+.table-body .table-row {
+  display: grid; align-items: center; gap: 8px;
+  padding: 9px 14px; font-size: 12.5px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+.table-body .table-row:hover { background: rgba(255, 255, 255, 0.025); }
+
+.table-head.cols-7, .table-body .table-row.cols-7 {
+  grid-template-columns: 150px 58px 88px 110px 100px 100px 88px;
+}
+.table-head.cols-6, .table-body .table-row.cols-6 {
+  grid-template-columns: 150px 58px 110px 100px 110px 92px;
+}
+.table-head.cols-7, .table-head.cols-6 {
+  display: grid; align-items: center; gap: 8px;
+  padding: 8px 14px; font-size: 11px; letter-spacing: 0.06em;
+  color: var(--muted); border-bottom: 1px solid var(--line);
+}
+
+/* 空状态在表格体内 */
+.table-body .empty-state { padding: 20px 14px; }
+
+/* 未启用策略淡化显示 */
+.strategy-card.dim { opacity: 0.55; }
+
+/* 四列指标行 (赚了多少) */
+.hero-grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+/* 策略卡片内的规则列表 */
+.strategy-card .kv-list { margin-top: 10px; }
+.strategy-card .kv-row > b { max-width: 62%; }
+
+@media (max-width: 1180px) {
+  .hero-grid.four { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .table-head.cols-7, .table-body .table-row.cols-7,
+  .table-head.cols-6, .table-body .table-row.cols-6 {
+    grid-template-columns: 120px 52px 84px 96px 90px 90px 84px;
+  }
+}
