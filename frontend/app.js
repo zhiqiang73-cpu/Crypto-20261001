@@ -243,6 +243,7 @@
       if ($("realHint")) $("realHint").textContent = `净盈亏 ${signed(s.net_pnl)} USDT`;
 
       if ($("statsStart")) $("statsStart").textContent = s.stats_start || "—";
+      if ($("statsStart2")) $("statsStart2").textContent = s.stats_start || "—";
       if ($("pCount")) $("pCount").textContent = String(s.closed_trades ?? "—");
       if ($("pCountHint")) {
         $("pCountHint").textContent =
@@ -256,6 +257,13 @@
           : Number(s.profit_factor).toFixed(2);
       }
       if ($("pFee")) $("pFee").textContent = num(s.commission, 4);
+
+      // 全部历史对账 —— 与下方全量的「历史成交」表对齐, 避免两块数字口径不同
+      const at = s.all_time || {};
+      if ($("atCount")) $("atCount").textContent = String(at.trade_count ?? "—");
+      if ($("atReal")) $("atReal").textContent = signed(at.realized_pnl);
+      if ($("atFee")) $("atFee").textContent = num(at.commission, 4);
+      if ($("atNet")) $("atNet").textContent = signed(at.net_pnl);
 
       if ($("posBox") && s.position && s.position.side && s.position.side !== "FLAT") {
         const p = s.position;
