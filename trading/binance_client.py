@@ -1016,32 +1016,49 @@ class BinanceTestnetClient:
         return res
 
     async def all_orders(
-        self, symbol: Optional[str] = None, *, limit: int = 50
+        self,
+        symbol: Optional[str] = None,
+        *,
+        limit: int = 50,
+        start_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """历史委托 (GET /fapi/v1/allOrders) —— 币安侧真实记录, 非本地账本."""
-        symbol = symbol or self.symbol
-        params: Dict[str, Any] = {
-            "symbol": symbol,
-            "limit": max(1, min(int(limit), 1000)),
-        }
-        raw = await self._request(
-            "GET", "/fapi/v1/allOrders", params, signed=True
-        )
-        return raw if isinstance(raw, list) else []
+        """历史委托 (GET /fapi/v1/allOrders) —— 币安侧真实记录, 非本地账本.
 
-    async def user_trades(
-        self, symbol: Optional[str] = None, *, limit: int = 50
-    ) -> List[Dict[str, Any]]:
-        """历史成交 (GET /fapi/v1/userTrades) —— 含 realizedPnl 与 commission.
-
-        这是「赚了多少」的唯一可信来源: 逐笔已实现盈亏与手续费都取自交易所,
-        不由本地账本推算。
+        start_time 为毫秒时间戳, 用于只取统计起点之后的委托。
         """
         symbol = symbol or self.symbol
         params: Dict[str, Any] = {
             "symbol": symbol,
             "limit": max(1, min(int(limit), 1000)),
         }
+        if start_time:
+            params["startTime"] = int(start_time)
+        raw = await self._request(
+            "GET", "/fapi/v1/allOrders", params, signed=True
+        )
+        return raw if isinstance(raw, list) else []
+
+    async def user_trades(
+        self,
+        symbol: Optional[str] = None,
+        *,
+        limit: int = 50,
+        start_time: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """历史成交 (GET /fapi/v1/userTrades) —— 含 realizedPnl 与 commission.
+
+        这是「赚了多少」的唯一可信来源: 逐笔已实现盈亏与手续费都取自交易所,
+        不由本地账本推算。
+
+        start_time 为毫秒时间戳, 用于只取统计起点之后的成交。
+        """
+        symbol = symbol or self.symbol
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "limit": max(1, min(int(limit), 1000)),
+        }
+        if start_time:
+            params["startTime"] = int(start_time)
         raw = await self._request(
             "GET", "/fapi/v1/userTrades", params, signed=True
         )

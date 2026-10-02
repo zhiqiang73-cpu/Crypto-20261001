@@ -79,18 +79,19 @@
         </div>
 
         <div class="section-head">
-          <div><p class="eyebrow">PERFORMANCE</p><h2>赚了多少</h2><p class="subline">逐笔已实现盈亏与手续费全部取自币安成交记录。</p></div>
+          <div><p class="eyebrow">PERFORMANCE</p><h2>赚了多少</h2><p class="subline">逐笔已实现盈亏与手续费全部取自币安成交记录。统计自 <b id="statsStart">—</b> 起算。</p></div>
         </div>
         <div class="hero-grid four">
-          <article class="metric-card"><div class="card-kicker">TRADES</div><div class="metric-value" id="pCount">—</div><div class="metric-foot">成交笔数</div></article>
+          <article class="metric-card"><div class="card-kicker">TRADES</div><div class="metric-value" id="pCount">—</div><div class="metric-foot" id="pCountHint">已平仓笔数</div></article>
           <article class="metric-card"><div class="card-kicker">WIN / LOSS</div><div class="metric-value" id="pWinLoss">—</div><div class="metric-foot">胜 / 负</div></article>
           <article class="metric-card"><div class="card-kicker">WIN RATE</div><div class="metric-value" id="pWinRate">—</div><div class="metric-foot">胜率</div></article>
-          <article class="metric-card"><div class="card-kicker">FEES</div><div class="metric-value" id="pFee">—</div><div class="metric-foot">累计手续费 USDT</div></article>
+          <article class="metric-card"><div class="card-kicker">PROFIT FACTOR</div><div class="metric-value" id="pPF">—</div><div class="metric-foot">盈亏比（总盈利 / 总亏损）</div></article>
         </div>
+        <p class="subline" id="perfNote">累计手续费 <b id="pFee">—</b> USDT</p>
 
         <div class="table-panel">
           <div class="panel-head">
-            <div><p class="eyebrow">ORDER HISTORY · BINANCE</p><h2>历史委托</h2></div>
+            <div><p class="eyebrow">ORDER HISTORY · BINANCE</p><h2>历史委托</h2><p class="subline">自 <b id="ordersStart">—</b> 起算，直接读取币安委托记录。</p></div>
             <span class="tag" id="histOrdersTag">—</span>
           </div>
           <div class="table-head cols-7"><span>时间</span><span>方向</span><span>类型</span><span>价格</span><span>数量</span><span>已成交</span><span>状态</span></div>
@@ -99,7 +100,7 @@
 
         <div class="table-panel">
           <div class="panel-head">
-            <div><p class="eyebrow">TRADE HISTORY · BINANCE</p><h2>历史成交</h2></div>
+            <div><p class="eyebrow">TRADE HISTORY · BINANCE</p><h2>历史成交</h2><p class="subline">自 <b id="tradesStart">—</b> 起算，含逐笔已实现盈亏与手续费。</p></div>
             <span class="tag" id="histTradesTag">—</span>
           </div>
           <div class="table-head cols-6"><span>时间</span><span>方向</span><span>价格</span><span>数量</span><span>已实现盈亏</span><span>手续费</span></div>
@@ -143,6 +144,6 @@
       </section>
     </main>
   </div>
-  <script src="/app.js?v=5"></script>
+  <script src="/app.js?v=6"></script>
 </body>
 </html>
