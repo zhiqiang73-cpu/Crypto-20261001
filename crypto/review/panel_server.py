@@ -70,6 +70,8 @@ from review.order_sources import (SOURCE_LABELS, annotate_orders, annotate_trade
                                   load_strategy_order_ids, summarize)
 from shadow.strategy_books import (TRADE_SYMBOLS, desired_net, desired_nets,
                                    position_sources, runtime_view)
+from shadow.external_watch import request_resume as request_external_resume
+from shadow.external_watch import summarize as external_summary
 from review.journal import TradeJournal, new_trade_id
 from review.settle import settle_pending
 from review.stats import compute_stats
@@ -154,6 +156,11 @@ def create_app(
             response = web.Response(status=204)
         else:
             response = await handler(request)
+        # 面板接口是实时账户状态，绝不能被浏览器缓存：
+        # 否则页面可能显示上一次请求的仓位/盈亏/干预状态（已实际踩到）。
+        if request.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
         origin = request.headers.get("Origin", "")
         if origin in {"http://127.0.0.1:8788", "http://localhost:8788"}:
             response.headers["Access-Control-Allow-Origin"] = origin
@@ -478,7 +485,24 @@ def create_app(
                 status["exchange_position"] = exchange_positions["BTCUSDT"]
         status["exchange_positions"] = exchange_positions
         status["open_orders"] = open_orders
+        # 人工干预状态：运行器检测到网页/面板手动下单后会写进状态文件。
+        # 页面据此显示「已暂停自动开仓」并提供人工确认恢复。
+        status["external_interventions"] = external_summary(live)
         return web.json_response(status)
+
+    async def api_external_resume(request):
+        """人工确认恢复：写入一次性请求，运行器下一轮消费。"""
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        symbol = str((body or {}).get("symbol") or "").strip().upper()
+        if symbol not in TRADE_SYMBOLS:
+            return web.json_response(
+                {"ok": False, "error": f"未知标的: {symbol or '(空)'}"}, status=400
+            )
+        at = request_external_resume(symbol, now=now_ms())
+        return web.json_response({"ok": True, "symbol": symbol, "requested_ms": at})
 
     async def api_trading_flatten_orphan(_request):
         out = await review.executor.flatten_orphan()
@@ -1050,6 +1074,43 @@ def create_app(
                 [t for t in all_trades if int(t.get("time", 0) or 0) >= start]
             ) if start else bucket(all_trades)
             every = bucket(all_trades)
+            # 分标的拆分：用户要求 BTCUSDT 与 ETHUSDT 各自统计，不混加。
+            scoped_rows = (
+                [t for t in all_trades if int(t.get("time", 0) or 0) >= start]
+                if start else list(all_trades)
+            )
+            pos_by_symbol: Dict[str, Any] = {}
+            for sym in TRADE_SYMBOLS:
+                try:
+                    p = await client.get_position(sym)
+                    pos_by_symbol[sym] = {
+                        "symbol": sym,
+                        "side": str(getattr(p, "side", "FLAT") or "FLAT"),
+                        "quantity": float(getattr(p, "quantity", 0) or 0),
+                        "entry_price": float(getattr(p, "entry_price", 0) or 0),
+                        "unrealized_pnl": float(
+                            getattr(p, "unrealized_pnl", 0) or 0
+                        ),
+                        "notional": float(getattr(p, "notional", 0) or 0),
+                        "margin": float(getattr(p, "margin", 0) or 0),
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("summary position %s: %s", sym, exc)
+            by_symbol: Dict[str, Any] = {}
+            extra = {
+                str(t.get("symbol") or "") for t in scoped_rows
+            } - set(TRADE_SYMBOLS)
+            for sym in list(TRADE_SYMBOLS) + sorted(s for s in extra if s):
+                rows = [
+                    t for t in scoped_rows
+                    if str(t.get("symbol") or "") == sym
+                ]
+                item = bucket(rows)
+                item["symbol"] = sym
+                item["unrealized_pnl"] = float(
+                    (pos_by_symbol.get(sym) or {}).get("unrealized_pnl", 0) or 0
+                )
+                by_symbol[sym] = item
             return web.json_response({
                 "connected": True,
                 "stats_start": STATS_START_DATE,
@@ -1064,6 +1125,9 @@ def create_app(
                 "unrealized_pnl": upnl,
                 # 起算日口径（用户指定的「赚了多少」）
                 **scoped,
+                # 分标的（BTC / ETH 各自统计，不混加）
+                "by_symbol": by_symbol,
+                "positions_by_symbol": pos_by_symbol,
                 # 与最近七天、最多200笔的表格对齐，不提供假「全历史」。
                 "available_history": every,
                 "position": {
@@ -1107,6 +1171,7 @@ def create_app(
     app.router.add_post("/api/testnet/smoke-limit-close", api_testnet_limit_then_close)
     app.router.add_post("/api/testnet/flatten-now", api_testnet_flatten_now)
     app.router.add_post("/api/trading/toggle", api_trading_toggle)
+    app.router.add_post("/api/external/resume", api_external_resume)
     app.router.add_get("/api/trading/history", api_trading_history)
     app.router.add_post("/api/paper/test-order", api_paper_test_order)
     app.router.add_post("/api/paper/test-close", api_paper_test_close)

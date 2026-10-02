@@ -352,14 +352,20 @@
           const mark = Number(pos.mark_price ?? pos.markPrice ?? 0);
           const upnl = Number(pos.unrealized_pnl ?? pos.unrealizedProfit ?? 0);
           const entry = Number(pos.entry_price ?? pos.entryPrice ?? 0);
+          const lev = Number(pos.leverage || 10) || 10;
           html += lots.map((src) => {
             const zh = src.side === "LONG" ? "多" : "空";
+            const lotSign = src.side === "LONG" ? 1 : -1;
             const est = lotPnl(mark, src.side, Number(src.qty), Number(src.px));
+            // 数量一律用币安网页端的 USDT 口径（名义价值），小字保留币数量。
+            const lotUsdt = mark ? Number(src.qty) * mark * lotSign : null;
+            const lotMargin = lotUsdt == null ? null : Math.abs(lotUsdt) / lev;
             return `<div class="table-row cols-pos">
               <span>${coinCell(src.symbol || sym)}</span>
               <span>${esc(src.name || src.interval)}</span>
               <span class="${src.side === "LONG" ? "positive" : "negative"}">${zh}</span>
-              <span>${num(src.qty, 4)}</span>
+              <span>${lotUsdt == null ? "—" : `${num(lotUsdt, 2)} <small>USDT</small>`}<br><small class="net-notional">${num(src.qty, 4)} ${coin(src.symbol || sym)}</small></span>
+              <span>${lotMargin == null ? "—" : `${num(lotMargin, 2)} <small>估算</small>`}</span>
               <span>${num(src.px, 2)}</span>
               <span>${fmtTime(src.bar_ms)}</span>
               <span>${esc(src.reason || "—")}</span>
@@ -367,11 +373,18 @@
             </div>`;
           }).join("");
           const netSide = side === "FLAT" || !qty ? "空仓" : (side === "LONG" ? "多" : "空");
+          // 净仓行直接用交易所返回的 notional / isolatedMargin，与币安网页端逐位一致。
+          const netSign = side === "LONG" ? 1 : side === "SHORT" ? -1 : 0;
+          const exNotional = Number(pos.notional ?? 0);
+          const netUsdt = exNotional !== 0 ? exNotional : (mark ? qty * mark * netSign : 0);
+          const exMargin = Number(pos.margin ?? 0);
+          const netMargin = exMargin > 0 ? exMargin : Math.abs(netUsdt) / lev;
           html += `<div class="table-row cols-pos is-net">
             <span>${coinCell(sym)}</span>
             <span>币安净仓</span>
             <span class="${!qty ? "" : side === "LONG" ? "positive" : "negative"}">${esc(netSide)}</span>
-            <span>${num(qty, 4)}</span>
+            <span>${qty ? `${num(netUsdt, 2)} <small>USDT</small><br><small class="net-notional">${num(qty, 4)} ${coin(sym)}</small>` : "—"}</span>
+            <span>${qty ? `${num(netMargin, 2)} <small>交易所</small>` : "—"}</span>
             <span>${entry ? num(entry, 2) : "—"}</span>
             <span>—</span>
             <span>${lots.length > 1 ? "同标的两条策略合成" : (lots[0] ? `${lots[0].name} 对应净仓` : "交易所账户")}</span>
@@ -379,12 +392,44 @@
           </div>`;
         });
         $("posBox").innerHTML = html || empty("空仓", "当前无持仓");
+        const totalMargin = symbols.reduce(
+          (acc, sym) => acc + (Number((nets[sym] || {}).margin) || 0),
+          0
+        );
+        if ($("posMarginTag")) {
+          $("posMarginTag").textContent = totalMargin > 0
+            ? `保证金 ${num(totalMargin, 2)} USDT`
+            : "保证金 —";
+        }
       }
 
       const recon = Boolean(s.reconciliation_needed);
+      renderExternal(s.external_interventions);
+      // 对账以「策略账本期望净额 vs 交易所真实净额」为准（每标的单独比）。
+      // 旧 V7 的 reconciliation_needed 来自已不参与交易的模块，只作附注，不再冒充对账结论。
+      const wantNets = s.desired_nets || {};
+      const signedEx = (sym) => {
+        const pos = nets[sym] || {};
+        const sd = String(pos.side || "FLAT").toUpperCase();
+        const q = Number(pos.quantity || 0);
+        return sd === "LONG" ? q : sd === "SHORT" ? -q : 0;
+      };
+      const netGaps = symbols
+        .map((sym) => ({ sym, want: Number(wantNets[sym] || 0), have: signedEx(sym) }))
+        .map((r) => ({ ...r, gap: Math.abs(r.want - r.have) }))
+        .filter((r) => r.gap >= 5e-4);
       if ($("reconcileState")) {
-        $("reconcileState").textContent = recon ? "需对账（已阻止开仓）" : "一致";
-        $("reconcileState").className = recon ? "blocked" : "positive";
+        if (!netGaps.length) {
+          $("reconcileState").textContent = recon
+            ? "一致（旧 V7 模块仍标记需对账，该模块已不参与交易）"
+            : "一致";
+          $("reconcileState").className = "positive";
+        } else {
+          $("reconcileState").textContent =
+            "不一致：" +
+            netGaps.map((r) => `${coin(r.sym)} 差 ${num(r.want - r.have, 4)}`).join(" · ");
+          $("reconcileState").className = "blocked";
+        }
       }
       if ($("accountPosition"))
         $("accountPosition").textContent = liveNets.length
@@ -416,40 +461,30 @@
       const s = await api("/api/account/summary");
       if (!s.connected) {
         if ($("mWallet")) $("mWallet").textContent = "未连接";
-        if ($("mUnreal")) $("mUnreal").textContent = "—";
-        if ($("mReal")) $("mReal").textContent = "—";
-        ["pCount", "pWinLoss", "pWinRate", "pPF", "pFee", "atCount", "atReal", "atFee", "atNet"].forEach(id => { if ($(id)) $(id).textContent = "—"; });
+        ["mUnrealBTC", "mUnrealETH", "mRealBTC", "mRealETH"].forEach((id) => {
+          if ($(id)) $(id).textContent = "—";
+        });
         if ($("realHint")) $("realHint").textContent = s.reason || "密钥未配置";
         return;
       }
       if ($("mWallet")) $("mWallet").textContent = num(s.wallet_balance, 2);
-      setPnl($("mUnreal"), s.unrealized_pnl);
-      setPnl($("mReal"), s.realized_pnl);
-      if ($("realHint")) $("realHint").textContent = `净盈亏 ${signed(s.net_pnl)} USDT`;
-
-      if ($("statsStart")) $("statsStart").textContent = s.stats_start || "—";
-      if ($("statsStart2")) $("statsStart2").textContent = s.stats_start || "—";
-      if ($("pCount")) $("pCount").textContent = String(s.closed_trades ?? "—");
-      if ($("pCountHint")) $("pCountHint").textContent = `非零盈亏 · 共 ${s.trade_count ?? 0} 笔逐笔成交`;
-      if ($("pWinLoss")) $("pWinLoss").textContent = `${s.wins ?? 0} / ${s.losses ?? 0}`;
-      if ($("pWinRate")) $("pWinRate").textContent = pct(s.win_rate);
-      if ($("pPF")) {
-        $("pPF").textContent = (s.profit_factor === null || s.profit_factor === undefined)
-          ? "—"
-          : Number(s.profit_factor).toFixed(2);
+      // 分标的显示：BTC 与 ETH 各自统计，绝不混加。
+      // 未实现 = 交易所逐标的未实现盈亏；已实现用净额（已实现 − 手续费）。
+      const posBy = s.positions_by_symbol || {};
+      const bySym = s.by_symbol || {};
+      setPnl($("mUnrealBTC"), (posBy.BTCUSDT || {}).unrealized_pnl ?? 0);
+      setPnl($("mUnrealETH"), (posBy.ETHUSDT || {}).unrealized_pnl ?? 0);
+      setPnl($("mRealBTC"), (bySym.BTCUSDT || {}).net_pnl ?? 0);
+      setPnl($("mRealETH"), (bySym.ETHUSDT || {}).net_pnl ?? 0);
+      if ($("realHint")) {
+        $("realHint").textContent =
+          `净 = 已实现 − 手续费 · 自 ${s.stats_start || "—"} 起`;
       }
-      if ($("pFee")) $("pFee").textContent = num(s.commission, 4);
-
-      // 与下方最近七天、最多200笔逐笔成交表对齐；不冒充账户全历史。
-      const at = s.available_history || {};
-      if ($("atCount")) $("atCount").textContent = String(at.trade_count ?? "—");
-      if ($("atReal")) $("atReal").textContent = signed(at.realized_pnl);
-      if ($("atFee")) $("atFee").textContent = num(at.commission, 4);
-      if ($("atNet")) $("atNet").textContent = signed(at.net_pnl);
-      if ($("scopeWarning")) $("scopeWarning").textContent = s.truncated ? " · 已达 200 笔上限，合计不完整" : " · 仅查询窗口内";
     } catch (e) {
       if ($("mWallet")) $("mWallet").textContent = "读取失败";
-      if ($("mReal")) $("mReal").textContent = "—";
+      ["mUnrealBTC", "mUnrealETH", "mRealBTC", "mRealETH"].forEach((id) => {
+        if ($(id)) $(id).textContent = "—";
+      });
     }
   }
 
@@ -495,13 +530,33 @@
   function signalView(d) {
     const cross = inferCross(d);
     if (d.signal_long) {
-      return { text: "开多", cls: "is-long", sub: d.signal_needs_k_extreme ? "金叉且 K<30" : "金叉" };
+      return {
+        text: "开多",
+        cls: "is-long",
+        sub: d.require_break ? "金叉且价格突破" : (d.signal_needs_k_extreme ? "金叉且 K<30" : "金叉"),
+      };
     }
     if (d.signal_short) {
-      return { text: "开空", cls: "is-short", sub: d.signal_needs_k_extreme ? "死叉且 K>70" : "死叉" };
+      return {
+        text: "开空",
+        cls: "is-short",
+        sub: d.require_break ? "死叉且价格突破" : (d.signal_needs_k_extreme ? "死叉且 K>70" : "死叉"),
+      };
     }
-    if (cross.gold) return { text: "金叉未开", cls: "is-wait", sub: "K 还没到 30" };
-    if (cross.dead) return { text: "死叉未开", cls: "is-wait", sub: "K 还没到 70" };
+    if (cross.gold) {
+      return {
+        text: "金叉未开",
+        cls: "is-wait",
+        sub: d.break_note || (d.require_break ? "未涨破上一根高点" : (d.signal_needs_k_extreme ? "K 还没到 30" : "观察")),
+      };
+    }
+    if (cross.dead) {
+      return {
+        text: "死叉未开",
+        cls: "is-wait",
+        sub: d.break_note || (d.require_break ? "未跌破上一根低点" : (d.signal_needs_k_extreme ? "K 还没到 70" : "观察")),
+      };
+    }
     const above = Number(d.K) > Number(d.D);
     return { text: "无新交叉", cls: "is-wait", sub: above ? "K 在 D 上方" : "K 在 D 下方" };
   }
@@ -538,51 +593,13 @@
     </svg>`;
   }
 
-  function readingBlock(d) {
-    const sig = signalView(d);
-    const f = (v, n) => (v === null || v === undefined || Number.isNaN(Number(v)) ? "—" : Number(v).toFixed(n));
-    const pos = d.position || "空仓";
-    return `<article class="reading-card">
-      <header class="reading-card-head">
-        <div>
-          <p>${esc(coin(d.symbol))} · ${esc(d.interval || "K 线")} · ${esc(fmtTime(d.bar_ms))}</p>
-          <strong class="reading-signal ${sig.cls}">${esc(sig.text)}</strong>
-          <small>${esc(sig.sub)}</small>
-        </div>
-        <span class="reading-pos">${esc(pos === "多" || pos === "空" ? `虚拟${pos}` : pos)}</span>
-      </header>
-      ${kdjChart(d)}
-      <footer class="reading-card-foot">
-        <span><i class="swatch k"></i>K ${f(d.K, 1)}</span>
-        <span><i class="swatch d"></i>D ${f(d.D, 1)}</span>
-        <span>收 ${f(d.close, 1)}</span>
-      </footer>
-    </article>`;
-  }
-
-  // 策略此刻的读数 —— 核对信号请以此为准, 不要拿交易所图表比对。
-  async function loadReading() {
-    const box = $("readingBox");
-    if (!box) return;
+  // 运行器心跳：只更新状态文字。「最近一根信号读数」板块已按用户要求移除。
+  async function loadRunner() {
     try {
       const d = await api("/api/strategy/reading");
-      if (!d.available) {
-        box.innerHTML = empty("运行器尚未写入读数", d.reason || "");
-        if ($("readingMarketTag")) $("readingMarketTag").textContent = "—";
-        if ($("runnerState")) $("runnerState").textContent = runnerStatusText(d.runner);
-        return;
-      }
-      const list = (d.readings && d.readings.length) ? d.readings : [d];
-      const mk =
-        d.market === "testnet" ? "测试网" : d.market === "mainnet" ? "主网" : d.market;
-      if ($("readingMarketTag")) {
-        $("readingMarketTag").textContent = `${mk} · ${list.map((x) => `${coin(x.symbol)} ${x.interval || ""}`.trim()).filter(Boolean).join(" + ")}`;
-      }
       if ($("runnerState")) $("runnerState").textContent = runnerStatusText(d.runner);
-      box.className = "reading-board";
-      box.innerHTML = list.map(readingBlock).join("");
     } catch (e) {
-      box.innerHTML = empty("读数读取失败", String(e.message || e));
+      if ($("runnerState")) $("runnerState").textContent = "运行器状态读取失败";
     }
   }
 
@@ -608,13 +625,14 @@
           const signal = on
             ? `${e.long || "金叉做多"} / ${e.short || "死叉做空"}`
             : (s.status || "等待启用");
+          const title = `${coin(s.symbol)} ${s.timeframe || ""}`.trim() || (s.name || s.strategy_id);
           return `<article class="sidebar-strategy-item${on ? " is-enabled" : ""}">
             <div class="sidebar-strategy-top">
               <span class="sidebar-strategy-dot ${on && !rt.halted ? "online" : "offline"}"></span>
-              <b>${esc(s.name || s.strategy_id)}</b>
+              <b>${esc(title)}</b>
               <span class="sidebar-strategy-state ${on && !rt.halted ? "on" : "off"}">${esc(state)}</span>
             </div>
-            <p>${esc(s.symbol || "BTCUSDT")} · ${esc(s.timeframe || "—")} · ${esc(s.kind || "策略")}</p>
+            <p>${esc(s.symbol || "BTCUSDT")} · ${esc(s.name || s.kind || "策略")}</p>
             <small>${esc(signal)}</small>
           </article>`;
         }).join("");
@@ -723,7 +741,7 @@
       loadSummary(),
       loadOpenOrders(),
       loadStrategies(),
-      loadReading(),
+      loadRunner(),
       loadHistory(),
     ]);
   }
@@ -857,6 +875,19 @@
           reason: "frontend_manual",
         })
       );
+    const extResume = $("externalResumeBtn");
+    if (extResume)
+      extResume.addEventListener("click", async () => {
+        const sym = extResume.dataset.symbol;
+        if (!sym) return;
+        const ok = window.confirm(
+          `确认恢复 ${coin(sym)} 的自动开仓？\n运行器下一轮会恢复净仓同步，可能按策略账本重新建仓。`
+        );
+        if (!ok) return;
+        await postAction("externalResumeBtn", "/api/external/resume",
+                         "人工确认恢复", { symbol: sym });
+        await loadStatus();
+      });
 
     if (location.hash) {
       const v = location.hash.slice(1);
@@ -870,4 +901,40 @@
   if (document.readyState === "loading")
     document.addEventListener("DOMContentLoaded", init);
   else init();
+
+  function renderExternal(map) {
+    const bar = $("externalBar");
+    if (!bar) return;
+    const entries = Object.entries(map || {});
+    if (!entries.length) {
+      bar.hidden = true;
+      return;
+    }
+    const paused = entries.filter(([, v]) => v && v.paused);
+    const holds = entries.filter(([, v]) => v && v.hold && !v.paused);
+    const lines = entries.map(([sym, v]) => {
+      const when = v.detected_ms ? fmtTime(v.detected_ms) : "—";
+      const what = v.last_kind === "increase" ? "人工加仓" : "人工减仓/平仓";
+      return `${coin(sym)} ${what} · ${when} · 交易所净额 ${num(v.ex_before, 4)} → ${num(v.ex_after, 4)}`;
+    });
+    if ($("externalTitle")) {
+      $("externalTitle").textContent = paused.length
+        ? `已暂停自动开仓：${paused.map(([s]) => coin(s)).join(" · ")}`
+        : `已跟随人工操作：${holds.map(([s]) => coin(s)).join(" · ")}`;
+    }
+    if ($("externalDetail")) {
+      $("externalDetail").textContent =
+        lines.join("；") +
+        (paused.length
+          ? "。确认后运行器会恢复该标的的自动开仓与净仓同步。"
+          : "。该标的策略账本已清零，等下一根信号再开仓。");
+    }
+    const btn = $("externalResumeBtn");
+    if (btn) {
+      btn.hidden = !paused.length;
+      btn.dataset.symbol = paused.length ? paused[0][0] : "";
+    }
+    bar.hidden = false;
+  }
+
 })();

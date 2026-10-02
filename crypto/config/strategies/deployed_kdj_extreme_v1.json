@@ -11,14 +11,14 @@
   "entry": {
     "golden_cross": "K[t-1] <= D[t-1] and K[t] > D[t]",
     "dead_cross": "K[t-1] >= D[t-1] and K[t] < D[t]",
-    "long": "金叉做多（无 K 数值阈值）",
-    "short": "死叉做空（无 K 数值阈值）",
-    "execution": "t 收盘判定, t+1 开盘执行 (限价追价成交)",
+    "long": "金叉且收盘涨破上一根最高（至少 0.15×ATR_1H）才做多；下一根开盘下限价单",
+    "short": "死叉且收盘跌破上一根最低（至少 0.15×ATR_1H）才做空；下一根开盘下限价单",
+    "execution": "当根收盘判定交叉+突破，下一根开盘限价追价。擦线（未真正突破）不做",
     "loose_long": "已废弃：无极值过滤",
     "loose_short": "已废弃：无极值过滤"
   },
   "exit": {
-    "mode_a": "对侧交叉 → 平旧仓，交易所确认归零后再开新方向",
+    "mode_a": "对侧交叉同样要带价格突破，下一根开盘限价反手",
     "mode_b": "对侧交叉平仓 (仅并行记录, 不执行)"
   },
   "indicators": {
@@ -52,5 +52,5 @@
   "status": "testnet_ready_manual_activation",
   "enabled": true,
   "source": "user_spec",
-  "note": "以 shadow/engine.py 常量为准; 本文件仅作展示与文档, 不覆盖代码。执行前会强制核对：测试网行情/账户同市场、无遗留挂单、单向、10x、逐仓。"
+  "note": "2026-10-02：15m 交叉必须带价格突破（0.15×ATR_1H）。下一根开盘下限价。r=0.03 未改。"
 }

@@ -310,6 +310,8 @@ class BinanceTestnetClient:
         upnl = 0.0
         mark = 0.0
         lev = 1
+        notional = 0.0
+        margin = 0.0
         for item in data or []:
             if item.get("symbol") != symbol:
                 continue
@@ -323,6 +325,15 @@ class BinanceTestnetClient:
             ep = float(item.get("entryPrice") or 0)
             entry_num += ep * abs(amt)
             entry_den += abs(amt)
+            # 交易所自己的口径, 直接透传给面板:
+            # notional = positionRisk.notional (名义价值, 按标记价, 与网页端一致)
+            # margin   = positionRisk.isolatedMargin (逐仓实际占用保证金)
+            notional += float(item.get("notional") or 0)
+            margin += float(
+                item.get("isolatedMargin")
+                or item.get("positionInitialMargin")
+                or 0
+            )
         if abs(net) < 1e-12:
             return info
         info.quantity = abs(net)
@@ -331,6 +342,8 @@ class BinanceTestnetClient:
         info.unrealized_pnl = upnl
         info.leverage = lev
         info.mark_price = mark
+        info.notional = notional if abs(notional) > 0 else net * mark
+        info.margin = margin if margin > 0 else abs(info.notional) / max(lev, 1)
         return info
 
     async def get_position_settings(self, symbol: Optional[str] = None) -> Dict[str, Any]:

@@ -49,6 +49,7 @@ button { cursor: pointer; }
   padding: 28px 20px 22px;
   background: #191816;
   border-right: 1px solid var(--line);
+  overflow-y: auto;
 }
 
 .brand {
@@ -138,6 +139,10 @@ button { cursor: pointer; }
 .nav-item.active span { color: var(--accent); }
 
 .sidebar-strategies {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
   margin: 26px 0 0;
   padding: 18px 2px 0;
   border-top: 1px solid var(--line);
@@ -170,9 +175,9 @@ button { cursor: pointer; }
   text-align: center;
   font: 12px var(--mono);
 }
-.sidebar-strategy-list { display: grid; gap: 8px; max-height: 280px; overflow-y: auto; }
+.sidebar-strategy-list { display: grid; gap: 8px; overflow: visible; }
 .sidebar-strategy-item {
-  padding: 12px 11px;
+  padding: 9px 10px;
   border: 1px solid var(--line);
   border-radius: 11px;
   background: var(--surface);
@@ -205,9 +210,9 @@ button { cursor: pointer; }
   margin-left: 15px;
   overflow: hidden;
   color: var(--ink);
-  font-size: 13px;
-  line-height: 1.45;
-  -webkit-line-clamp: 2;
+  font-size: 12.5px;
+  line-height: 1.4;
+  -webkit-line-clamp: 1;
   -webkit-box-orient: vertical;
 }
 .sidebar-strategy-note {
@@ -634,8 +639,8 @@ kbd {
   min-width: 1140px;
 }
 .table-head.cols-pos, .table-body .table-row.cols-pos {
-  grid-template-columns: 64px 110px 64px 96px 110px 176px minmax(180px, 1fr) 130px;
-  min-width: 1060px;
+  grid-template-columns: 64px 110px 64px 152px 116px 110px 176px minmax(180px, 1fr) 130px;
+  min-width: 1210px;
 }
 .table-head.cols-o10, .table-body .table-row.cols-o10 {
   grid-template-columns: 168px 56px minmax(110px, 1fr) 146px 104px 150px 86px 86px 126px 80px;
@@ -745,3 +750,99 @@ kbd {
   .notice-status { margin-left: 0; }
   .kv-list.cols-4 { grid-template-columns: 1fr; padding: 14px 16px 16px; }
 }
+
+/* 净仓行的名义价值（USDT）——与币安模拟盘显示的「数量/名义」口径对齐，
+   避免只看基础资产数量时误以为两边对不上。 */
+.table-body .table-row.cols-pos.is-net .net-notional {
+  color: var(--muted, #8a93a3);
+  font-weight: 400;
+}
+
+/* ============================================================
+   BUILD 0.5 · 人工干预提示
+   运行器检测到「不是它自己下的单」时显示。
+   减仓/平仓 → 账本清零、等下一根信号（只留痕，红色描边）；
+   加仓     → 已暂停该标的自动开仓，必须人工确认后才恢复。
+   ============================================================ */
+.notice-bar.is-alert {
+  border-color: rgba(227, 136, 136, 0.42);
+  border-left-color: var(--red);
+  background: linear-gradient(180deg, rgba(227, 136, 136, 0.10),
+                                      rgba(227, 136, 136, 0.02));
+}
+.notice-bar.is-alert .notice-icon { border-color: var(--red); color: var(--red); }
+.notice-bar.is-alert strong { color: var(--red); }
+.notice-bar.is-alert .mini-btn {
+  margin-left: auto;
+  flex: none;
+  white-space: nowrap;
+}
+
+/* ============================================================
+   BUILD 0.6 · 左侧已配置策略可读性 + 分标的盈亏
+   用户反馈：「详细情况看不清楚，有些字看不到」。
+   原因：名称 13.5px、规则 12.5px，且被 -webkit-line-clamp:1 截断，
+   侧栏只有 268px。这里放宽侧栏、放大字号、取消截断。
+   ============================================================ */
+.sidebar { width: 312px; }
+
+.sidebar-strategy-item {
+  padding: 12px 13px;
+  background: var(--surface-soft);
+}
+.sidebar-strategy-item.is-enabled {
+  background: #243028;
+  border-color: #3d5a46;
+}
+.sidebar-strategy-top b {
+  font-size: 14.5px;
+  line-height: 1.4;
+  color: var(--ink);
+}
+.sidebar-strategy-state { font-size: 12.5px; }
+.sidebar-strategy-item p {
+  margin: 8px 0 4px 15px;
+  font-size: 13px;
+  color: var(--muted);
+}
+/* 规则原文不再截断：完整换行显示，长单词也能断行。 */
+.sidebar-strategy-item small {
+  display: block;
+  margin-left: 15px;
+  overflow: visible;
+  color: var(--ink);
+  font-size: 13.5px;
+  line-height: 1.5;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  -webkit-line-clamp: unset;
+  -webkit-box-orient: initial;
+}
+.sidebar-strategy-note {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+/* ------------------------------------------------------------
+   分标的盈亏：BTC 与 ETH 各自一行，不混加。
+   ------------------------------------------------------------ */
+.sym-pnl-list { margin-top: 22px; display: grid; gap: 9px; }
+.sym-pnl-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.sym-pnl-row .sym-chip { font-size: 12px; }
+.sym-pnl-value {
+  font: 640 20px/1.2 var(--mono);
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.sym-pnl-value.positive { color: var(--green); }
+.sym-pnl-value.negative { color: var(--red); }
+
+/* hidden 属性必须真的隐藏：.notice-bar 的 display:flex 会覆盖 UA 的
+   [hidden]{display:none}，导致人工干预提示条在无干预时也一直显示。 */
+.notice-bar[hidden] { display: none !important; }

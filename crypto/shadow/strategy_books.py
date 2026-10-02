@@ -26,6 +26,8 @@ class StrategySpec:
     signal_rule: str
     cold_start: bool
     label: str
+    confirm_next: bool = False
+    require_break: bool = False
 
 
 SPEC_15M = StrategySpec(
@@ -37,9 +39,11 @@ SPEC_15M = StrategySpec(
     k_long_max=None,
     k_short_min=None,
     lookback=96,
-    signal_rule="金叉做多 / 死叉做空；不使用 K 极值过滤",
+    signal_rule="当根收盘交叉且价格突破上一根高低点，下一根开盘下限价单；不使用 K 极值过滤",
     cold_start=False,
     label="BTC 15m",
+    confirm_next=False,
+    require_break=True,
 )
 SPEC_5M = StrategySpec(
     id="kdj5",
@@ -63,9 +67,11 @@ SPEC_ETH_15M = StrategySpec(
     k_long_max=None,
     k_short_min=None,
     lookback=96,
-    signal_rule="金叉做多 / 死叉做空；不使用 K 极值过滤",
+    signal_rule="当根收盘交叉且价格突破上一根高低点，下一根开盘下限价单；不使用 K 极值过滤",
     cold_start=True,
     label="ETH 15m",
+    confirm_next=False,
+    require_break=True,
 )
 SPEC_ETH_5M = StrategySpec(
     id="eth5",
@@ -128,6 +134,9 @@ def migrate_state(st: Dict[str, Any]) -> Dict[str, Any]:
     return st
 
 
+CONTRA_5M_MULT = 0.5
+
+
 def book_signed_qty(book: Dict[str, Any]) -> float:
     entry = book.get("entry") or {}
     qty = float(entry.get("qty") or 0.0)
@@ -139,6 +148,34 @@ def book_signed_qty(book: Dict[str, Any]) -> float:
     if side in (-1, "SHORT", "short"):
         return -qty
     return 0.0
+
+
+def trend_side(st: Dict[str, Any], symbol: str) -> int:
+    """同标的 15m 虚拟仓方向：多=1，空=-1，空仓=0。"""
+    books = st.get("strategies") or {}
+    for spec in specs_for_symbol(symbol):
+        if spec.interval != "15m":
+            continue
+        qty = book_signed_qty(books.get(spec.id) or {})
+        if qty > 0:
+            return 1
+        if qty < 0:
+            return -1
+        return 0
+    return 0
+
+
+def contra_5m_qty(qty: float, *, interval: str, want: int, trend: int,
+                  step: float = 0.001) -> Tuple[float, str]:
+    """5m 逆着同标的 15m 时仓位减半。15m 自己不减；15m 空仓则 5m 满仓。"""
+    if qty <= 0 or interval != "5m" or want == 0 or trend == 0:
+        return qty, ""
+    if want * trend > 0:
+        return qty, ""
+    halved = math.floor((qty * CONTRA_5M_MULT) / step + 1e-12) * step
+    if halved <= 0:
+        return 0.0, "逆15m减半后数量不足"
+    return halved, "逆15m，仓位减半"
 
 
 def desired_net(st: Dict[str, Any], symbol: str = "BTCUSDT") -> float:

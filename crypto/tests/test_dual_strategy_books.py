@@ -1,6 +1,7 @@
 """双策略虚拟账本：15m 纯交叉 + 5m 交叉且 K 极值，共用净仓。"""
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -9,11 +10,18 @@ import numpy as np
 
 import shadow.deploy as deploy
 from shadow.deploy import process_strategy, save_signal_reading
-from shadow.signals import crossing, entry_signal
-from shadow.strategy_books import (SPEC_5M, SPEC_15M, apply_virtual_signal,
-                                   desired_net, empty_book, migrate_state,
-                                   position_sources, reduce_only_for_delta,
-                                   runtime_view, signal_reason)
+from shadow.signals import (BREAK_ATR_MULT, confirmed_signal, crossing,
+                            entry_signal, price_breaks)
+from unittest.mock import patch
+
+from shadow.engine import ATR_MULT_K, RISK_R, floor_step
+from shadow.strategy_books import (SPEC_5M, SPEC_15M, SPEC_ETH_5M,
+                                   SPEC_ETH_15M, apply_virtual_signal,
+                                   contra_5m_qty, desired_net, empty_book,
+                                   migrate_state, position_sources,
+                                   reduce_only_for_delta, runtime_view,
+                                   signal_reason, specs_for_symbol,
+                                   trend_side)
 
 
 class TestEntrySignal(unittest.TestCase):
@@ -144,8 +152,12 @@ class TestVirtualBooks(unittest.TestCase):
 
     def test_signal_reason_keeps_threshold_text(self):
         self.assertIn("金叉做多", signal_reason(SPEC_15M, gold=True, dead=False, k=34.8))
+        self.assertNotIn("确认", signal_reason(SPEC_15M, gold=True, dead=False, k=34.8))
         self.assertIn("K<30", signal_reason(SPEC_5M, gold=True, dead=False, k=14.9))
         self.assertIn("K>70", signal_reason(SPEC_5M, gold=False, dead=True, k=90.7))
+        self.assertIn("金叉做多", signal_reason(SPEC_ETH_15M, gold=True, dead=False, k=64.0))
+        self.assertNotIn("K<30", signal_reason(SPEC_ETH_15M, gold=True, dead=False, k=64.0))
+        self.assertIn("K<30", signal_reason(SPEC_ETH_5M, gold=True, dead=False, k=25.4))
 
     def test_position_sources_reads_reason_from_trade_log(self):
         tmp = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
@@ -170,6 +182,110 @@ class TestVirtualBooks(unittest.TestCase):
         self.assertEqual(src[0]["symbol"], "BTCUSDT")
         self.assertIn("金叉做多", src[0]["reason"])
         self.assertAlmostEqual(src[0]["k"], 34.77)
+
+
+class TestConfirmNextBar(unittest.TestCase):
+    def test_dead_cross_waits_then_shorts_if_still_below(self):
+        sig_long, sig_short, gold, dead, note = confirmed_signal(
+            70, 68, 60.4, 61.2, 58.0, 60.0,
+        )
+        self.assertFalse(sig_long)
+        self.assertTrue(sig_short)
+        self.assertFalse(gold)
+        self.assertFalse(dead)
+        self.assertIn("已确认", note)
+
+    def test_pierce_does_not_short(self):
+        sig_long, sig_short, gold, dead, note = confirmed_signal(
+            70, 68, 60.4, 61.2, 66.4, 63.0,
+        )
+        self.assertFalse(sig_long)
+        self.assertFalse(sig_short)
+        self.assertTrue(gold)
+        self.assertIn("未站稳", note)
+
+    def test_cross_bar_only_marks_pending(self):
+        sig_long, sig_short, gold, dead, note = confirmed_signal(
+            70, 68, 70, 68, 60.4, 61.2,
+        )
+        self.assertFalse(sig_long)
+        self.assertFalse(sig_short)
+        self.assertTrue(dead)
+        self.assertIn("待确认", note)
+
+    def test_15m_does_not_wait_for_next_close(self):
+        self.assertFalse(SPEC_15M.confirm_next)
+        self.assertFalse(SPEC_ETH_15M.confirm_next)
+        self.assertTrue(SPEC_15M.require_break)
+        self.assertTrue(SPEC_ETH_15M.require_break)
+        self.assertFalse(SPEC_5M.require_break)
+
+
+class TestPriceBreak(unittest.TestCase):
+    def test_shallow_dead_does_not_break(self):
+        # 17:15: 收盘只低于上根低点 29，ATR≈407，0.15×ATR≈61
+        self.assertFalse(price_breaks(86097.2, 86269.0, 86126.2, 407.2, want=-1))
+
+    def test_real_dead_breaks(self):
+        # 13:15: 跌破上根低点 226 > 61
+        self.assertTrue(price_breaks(86299.9, 86624.6, 86525.8, 417.4, want=-1))
+
+    def test_gold_needs_clear_up_break(self):
+        self.assertTrue(price_breaks(86034.0, 85965.6, 85753.2, 405.4, want=1))
+        self.assertFalse(price_breaks(85980.0, 85965.6, 85753.2, 405.4, want=1))
+        self.assertAlmostEqual(BREAK_ATR_MULT, 0.15)
+
+
+class TestContraHalfSize(unittest.TestCase):
+    def test_5m_halves_when_against_15m(self):
+        qty, note = contra_5m_qty(0.190, interval="5m", want=-1, trend=1)
+        self.assertAlmostEqual(qty, 0.095)
+        self.assertIn("减半", note)
+
+    def test_5m_full_when_with_15m_or_flat(self):
+        qty, note = contra_5m_qty(0.190, interval="5m", want=-1, trend=-1)
+        self.assertAlmostEqual(qty, 0.190)
+        self.assertEqual(note, "")
+        qty, note = contra_5m_qty(0.190, interval="5m", want=-1, trend=0)
+        self.assertAlmostEqual(qty, 0.190)
+        self.assertEqual(note, "")
+
+    def test_15m_never_halves(self):
+        qty, note = contra_5m_qty(0.187, interval="15m", want=1, trend=-1)
+        self.assertAlmostEqual(qty, 0.187)
+        self.assertEqual(note, "")
+
+    def test_trend_side_reads_15m_only(self):
+        st = {
+            "strategies": {
+                "kdj15": {"entry": {"side": 1, "qty": 0.187}},
+                "kdj5": {"entry": {"side": -1, "qty": 0.191}},
+                "eth15": {"entry": {"side": -1, "qty": 4.722}},
+                "eth5": {"entry": {"side": 1, "qty": 2.356}},
+            }
+        }
+        self.assertEqual(trend_side(st, "BTCUSDT"), 1)
+        self.assertEqual(trend_side(st, "ETHUSDT"), -1)
+
+    def test_eth5_also_halves_against_eth15(self):
+        qty, note = contra_5m_qty(4.712, interval=SPEC_ETH_5M.interval,
+                                  want=1, trend=-1)
+        self.assertAlmostEqual(qty, 2.356)
+        self.assertIn("减半", note)
+        qty, note = contra_5m_qty(4.722, interval=SPEC_ETH_15M.interval,
+                                  want=-1, trend=1)
+        self.assertAlmostEqual(qty, 4.722)
+        self.assertEqual(note, "")
+
+    def test_each_symbol_processes_15m_before_5m(self):
+        self.assertEqual(
+            [spec.interval for spec in specs_for_symbol("BTCUSDT")],
+            ["15m", "5m"],
+        )
+        self.assertEqual(
+            [spec.interval for spec in specs_for_symbol("ETHUSDT")],
+            ["15m", "5m"],
+        )
 
 
 class TestEthColdStart(unittest.TestCase):
@@ -226,6 +342,173 @@ class TestFiveMinuteColdStart(unittest.TestCase):
             self.assertIsNone(book["entry"])
         finally:
             deploy.READING_5M = old
+            tmp.cleanup()
+
+
+class TestProcessStrategyFourRules(unittest.TestCase):
+    """把四条策略的开仓规则接到 process_strategy 上核对。"""
+
+    def _bars(self, n=8, interval_ms=300_000, px=2700.0):
+        ts = np.arange(n, dtype=np.int64) * interval_ms + 1_800_000_000_000
+        price = np.full(n, px)
+        return {
+            "ts": ts, "open": price, "high": price + 1, "low": price - 1,
+            "close": price, "volume": np.ones(n),
+        }, np.full(n, 16.409)
+
+    def _armed(self, bars):
+        book = empty_book()
+        book["armed"] = True
+        book["last_ts"] = int(bars["ts"][-2])
+        return book
+
+    def test_eth5_opens_half_when_against_15m_short(self):
+        tmp = tempfile.TemporaryDirectory()
+        old = deploy.READING_ETH5
+        old_log = deploy.TRADE_LOG
+        deploy.READING_ETH5 = os.path.join(tmp.name, "eth5.json")
+        deploy.TRADE_LOG = os.path.join(tmp.name, "trades.csv")
+        bars, atr = self._bars()
+        n = len(bars["ts"])
+        k = np.full(n, 20.0)
+        d = np.full(n, 22.0)
+        k[-1], d[-1] = 25.38, 20.97
+        equity = 5155.61
+        try:
+            with patch("shadow.deploy.kdj", return_value=(k, d, k)):
+                book = self._armed(bars)
+                process_strategy(
+                    SPEC_ETH_5M, book, bars, atr, equity=equity,
+                    block=False, now=int(bars["ts"][-1] + 300_000),
+                    execute=False, trend=-1,
+                )
+            full = floor_step(equity * RISK_R / (ATR_MULT_K * 16.409))
+            self.assertEqual(book["entry"]["side"], 1)
+            self.assertAlmostEqual(book["entry"]["qty"], full * 0.5, places=3)
+        finally:
+            deploy.READING_ETH5 = old
+            deploy.TRADE_LOG = old_log
+            tmp.cleanup()
+
+    def test_btc15_skips_shallow_dead_cross(self):
+        tmp = tempfile.TemporaryDirectory()
+        old = deploy.READING
+        old_log = deploy.TRADE_LOG
+        deploy.READING = os.path.join(tmp.name, "btc15.json")
+        deploy.TRADE_LOG = os.path.join(tmp.name, "trades.csv")
+        bars, atr = self._bars(interval_ms=SPEC_15M.interval_ms, px=86150.0)
+        n = len(bars["ts"])
+        atr[:] = 407.2
+        bars["high"][-2], bars["low"][-2] = 86269.0, 86126.2
+        bars["close"][-1] = 86097.2
+        bars["high"][-1], bars["low"][-1] = 86212.8, 86092.2
+        k = np.full(n, 70.0)
+        d = np.full(n, 68.0)
+        k[-1], d[-1] = 60.4, 61.2
+        try:
+            with patch("shadow.deploy.kdj", return_value=(k, d, k)):
+                book = self._armed(bars)
+                changed = process_strategy(
+                    SPEC_15M, book, bars, atr, equity=5000.0,
+                    block=False, now=int(bars["ts"][-1] + SPEC_15M.interval_ms),
+                    execute=False, trend=1,
+                )
+            self.assertFalse(changed)
+            self.assertIsNone(book["entry"])
+            with open(deploy.READING, encoding="utf-8") as fh:
+                reading = json.load(fh)
+            self.assertTrue(reading["dead"])
+            self.assertFalse(reading["signal_short"])
+            self.assertIn("未向下突破", reading["break_note"])
+        finally:
+            deploy.READING = old
+            deploy.TRADE_LOG = old_log
+            tmp.cleanup()
+
+    def test_eth15_also_skips_shallow_dead_cross(self):
+        tmp = tempfile.TemporaryDirectory()
+        old = deploy.READING_ETH15
+        old_log = deploy.TRADE_LOG
+        deploy.READING_ETH15 = os.path.join(tmp.name, "eth15.json")
+        deploy.TRADE_LOG = os.path.join(tmp.name, "trades.csv")
+        bars, atr = self._bars(interval_ms=SPEC_ETH_15M.interval_ms, px=2750.0)
+        n = len(bars["ts"])
+        atr[:] = 16.409
+        bars["high"][-2], bars["low"][-2] = 2752.0, 2749.0
+        bars["close"][-1] = 2748.5
+        bars["high"][-1], bars["low"][-1] = 2751.0, 2748.0
+        k = np.full(n, 70.0)
+        d = np.full(n, 68.0)
+        k[-1], d[-1] = 60.4, 61.2
+        try:
+            with patch("shadow.deploy.kdj", return_value=(k, d, k)):
+                book = self._armed(bars)
+                changed = process_strategy(
+                    SPEC_ETH_15M, book, bars, atr, equity=5000.0,
+                    block=False, now=int(bars["ts"][-1] + SPEC_ETH_15M.interval_ms),
+                    execute=False,
+                )
+            self.assertFalse(changed)
+            self.assertIsNone(book["entry"])
+        finally:
+            deploy.READING_ETH15 = old
+            deploy.TRADE_LOG = old_log
+            tmp.cleanup()
+
+    def test_btc15_shorts_when_dead_breaks_prior_low(self):
+        tmp = tempfile.TemporaryDirectory()
+        old = deploy.READING
+        old_log = deploy.TRADE_LOG
+        deploy.READING = os.path.join(tmp.name, "btc15.json")
+        deploy.TRADE_LOG = os.path.join(tmp.name, "trades.csv")
+        bars, atr = self._bars(interval_ms=SPEC_15M.interval_ms, px=86500.0)
+        n = len(bars["ts"])
+        atr[:] = 417.4
+        bars["high"][-2], bars["low"][-2] = 86624.6, 86525.8
+        bars["close"][-1] = 86299.9
+        bars["high"][-1], bars["low"][-1] = 86500.0, 86280.0
+        k = np.full(n, 70.0)
+        d = np.full(n, 68.0)
+        k[-1], d[-1] = 89.3, 91.5
+        try:
+            with patch("shadow.deploy.kdj", return_value=(k, d, k)):
+                book = self._armed(bars)
+                process_strategy(
+                    SPEC_15M, book, bars, atr, equity=5000.0,
+                    block=False, now=int(bars["ts"][-1] + SPEC_15M.interval_ms),
+                    execute=False, trend=1,
+                )
+            self.assertEqual(book["entry"]["side"], -1)
+            self.assertGreater(book["entry"]["qty"], 0)
+        finally:
+            deploy.READING = old
+            deploy.TRADE_LOG = old_log
+            tmp.cleanup()
+
+    def test_btc5_ignores_gold_when_k_not_below_30(self):
+        tmp = tempfile.TemporaryDirectory()
+        old = deploy.READING_5M
+        old_log = deploy.TRADE_LOG
+        deploy.READING_5M = os.path.join(tmp.name, "btc5.json")
+        deploy.TRADE_LOG = os.path.join(tmp.name, "trades.csv")
+        bars, atr = self._bars(px=86000.0)
+        n = len(bars["ts"])
+        k = np.full(n, 28.0)
+        d = np.full(n, 30.0)
+        k[-1], d[-1] = 32.34, 28.13
+        try:
+            with patch("shadow.deploy.kdj", return_value=(k, d, k)):
+                book = self._armed(bars)
+                changed = process_strategy(
+                    SPEC_5M, book, bars, atr, equity=5000.0,
+                    block=False, now=int(bars["ts"][-1] + 300_000),
+                    execute=False, trend=-1,
+                )
+            self.assertFalse(changed)
+            self.assertIsNone(book["entry"])
+        finally:
+            deploy.READING_5M = old
+            deploy.TRADE_LOG = old_log
             tmp.cleanup()
 
 

@@ -1,8 +1,9 @@
 """KDJ 交叉策略的币安合约测试网运行器。
 
 BTCUSDT 与 ETHUSDT 各跑两条策略，按标的各记虚拟仓、只下该标的净额：
-    15m: 金叉做多 / 死叉做空，无 K 阈值
-    5m:  金叉且 K<30 做多 / 死叉且 K>70 做空
+    15m: 当根收盘交叉且突破上一根高低点，下一根开盘下限价单，无 K 阈值
+    5m:  金叉且 K<30 做多 / 死叉且 K>70 做空，当根收盘即可
+    5m 仓位：与同标的 15m 同向满仓，对着干则减半
     仓位 = 权益 × r ÷ (2 × ATR_1H), r=RISK_R, 向下取整 0.001
     开仓/平仓一律限价: post-only 贴盘口挂单争取 maker, 窗口耗尽才穿盘口兜底
     布林带仅记录 / 日亏 3% / 回撤 10% / 10x 逐仓
@@ -26,13 +27,17 @@ import numpy as np
 from shadow.engine import (ATR_MULT_K, DISASTER_ATR, GATE_FEE_RATE,
                            LEVERAGE, MIN_QTY, RISK_R, floor_step)
 from shadow.indicators import atr_wilder, boll, kdj
-from shadow.signals import entry_signal
+from shadow.signals import confirmed_signal, entry_signal, price_breaks
 from shadow.live import ENDPOINTS, MARKET, fetch
 from shadow.strategy_books import (SPEC_15M, SPEC_5M, SPECS, TRADE_SYMBOLS,
                                    apply_virtual_signal, clear_symbol_books,
-                                   desired_net, migrate_state,
+                                   contra_5m_qty, desired_net, migrate_state,
                                    reduce_only_for_delta, signal_reason,
-                                   specs_for_symbol, symbol_short)
+                                   specs_for_symbol, symbol_short, trend_side)
+from shadow.external_watch import (apply_external, classify_external,
+                                   clear_hold_on_new_signal,
+                                   consume_resume_requests, external_fills,
+                                   watch_for)
 from trading.binance_client import BinanceTestnetClient
 from trading.runtime_mode import current_mode, validate_exchange_target
 from config.market_endpoints import (MARKET_MAINNET, MarketMismatchError,
@@ -213,10 +218,12 @@ def save_heartbeat(*, status: str, execute: bool, detail: str = "") -> None:
 def save_signal_reading(st: dict, *, i: int, ts, o, h, l, c, k, d, atr_al,
                         up, lb, now: int, execute: bool, pos_side: str,
                         interval: str = "15m",
-                        signal_rule: str = "金叉做多 / 死叉做空；不使用 K 极值过滤",
+                        signal_rule: str = "当根收盘交叉，下一根开盘下限价单；不使用 K 极值过滤",
                         k_long_max=None, k_short_min=None,
                         path: Optional[str] = None,
-                        symbol: str = "BTCUSDT") -> None:
+                        symbol: str = "BTCUSDT",
+                        confirm_next: bool = False,
+                        require_break: bool = False) -> None:
     """写入当前最新已收盘 K 线的读数，不依赖它是不是「新 K 线」。
 
     即使运行器重启时这根 K 线已经被处理过，也要刷新快照；否则进程崩溃在
@@ -224,11 +231,28 @@ def save_signal_reading(st: dict, *, i: int, ts, o, h, l, c, k, d, atr_al,
     """
     px = float(c[i])
     sig_long = sig_short = gold = dead = False
-    if i > 0:
+    confirm_note = ""
+    break_note = ""
+    if confirm_next and i >= 2:
+        sig_long, sig_short, gold, dead, confirm_note = confirmed_signal(
+            k[i - 2], d[i - 2], k[i - 1], d[i - 1], k[i], d[i],
+            k_long_max=k_long_max, k_short_min=k_short_min,
+        )
+    elif i > 0:
         sig_long, sig_short, gold, dead = entry_signal(
             k[i - 1], d[i - 1], k[i], d[i],
             k_long_max=k_long_max, k_short_min=k_short_min,
         )
+        if require_break and (sig_long or sig_short):
+            if not price_breaks(
+                float(c[i]), float(h[i - 1]), float(l[i - 1]), float(atr_al[i]),
+                want=(1 if sig_long else -1),
+            ):
+                sig_long = sig_short = False
+                break_note = (
+                    "死叉但未向下突破上一根低点" if dead
+                    else "金叉但未向上突破上一根高点"
+                )
     band_width = float(up[i] - lb[i])
     mult = (band_width / 2.0) / (GATE_FEE_RATE * px) if px > 0 else 0.0
 
@@ -252,6 +276,10 @@ def save_signal_reading(st: dict, *, i: int, ts, o, h, l, c, k, d, atr_al,
         # 若不显式转换, save_reading 会静默失败、面板永远显示旧 K 线。
         "signal_long": bool(sig_long), "signal_short": bool(sig_short),
         "gold": bool(gold), "dead": bool(dead),
+        "confirm_next": bool(confirm_next),
+        "confirm_note": confirm_note,
+        "require_break": bool(require_break),
+        "break_note": break_note,
         "signal_rule": signal_rule,
         "signal_needs_k_extreme": k_long_max is not None or k_short_min is not None,
         "k_long_max": k_long_max,
@@ -403,7 +431,8 @@ async def sync_net(client: BinanceTestnetClient, st: dict, execute: bool, *,
 
 
 def process_strategy(spec, book: dict, bars: dict, atr_al, *,
-                     equity: float, block: bool, now: int, execute: bool) -> bool:
+                     equity: float, block: bool, now: int, execute: bool,
+                     trend: int = 0) -> bool:
     """处理一条策略的已收盘 K 线，只改虚拟账本。返回是否需要同步净仓。"""
     ts = bars["ts"]
     o, h, l, c = (bars[x] for x in ("open", "high", "low", "close"))
@@ -424,6 +453,8 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
                 interval=spec.interval, signal_rule=spec.signal_rule,
                 k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
                 path=reading_path, symbol=spec.symbol,
+                confirm_next=spec.confirm_next,
+                require_break=spec.require_break,
             )
         print(f"[{mark}] 冷启动，从下一根已收盘 K 线开始交易")
         return False
@@ -439,6 +470,8 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
                 interval=spec.interval, signal_rule=spec.signal_rule,
                 k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
                 path=reading_path, symbol=spec.symbol,
+                confirm_next=spec.confirm_next,
+                require_break=spec.require_break,
             )
         return False
 
@@ -464,18 +497,43 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
               f"其中 {sigs} 根有交叉"
               + (f"; 另有 {dropped} 根超出回看窗口未补记" if dropped else ""))
 
-    if i <= 0 or np.isnan(atr_al[i]):
+    if i <= 0 or np.isnan(atr_al[i]) or (spec.confirm_next and i < 2):
         book["last_ts"] = int(ts[i])
         return False
 
     px = float(c[i])
-    sig_long, sig_short, gold, dead = entry_signal(
-        k[i - 1], d[i - 1], k[i], d[i],
-        k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
-    )
+    confirm_note = ""
+    if spec.confirm_next:
+        sig_long, sig_short, gold, dead, confirm_note = confirmed_signal(
+            k[i - 2], d[i - 2], k[i - 1], d[i - 1], k[i], d[i],
+            k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
+        )
+    else:
+        sig_long, sig_short, gold, dead = entry_signal(
+            k[i - 1], d[i - 1], k[i], d[i],
+            k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
+        )
+    break_note = ""
+    if spec.require_break and (sig_long or sig_short):
+        want_brk = 1 if sig_long else -1
+        if not price_breaks(
+            float(c[i]), float(h[i - 1]), float(l[i - 1]), float(atr_al[i]),
+            want=want_brk,
+        ):
+            sig_long = sig_short = False
+            break_note = (
+                "死叉但未向下突破上一根低点" if dead
+                else "金叉但未向上突破上一根高点"
+            )
     qty = 0.0
     if not np.isnan(atr_al[i]) and atr_al[i] > 0:
         qty = floor_step(equity * RISK_R / (ATR_MULT_K * float(atr_al[i])))
+    want = 1 if sig_long else (-1 if sig_short else 0)
+    qty, size_note = contra_5m_qty(
+        qty, interval=spec.interval, want=want, trend=trend,
+    )
+    reason_gold = bool(sig_long) if spec.confirm_next else gold
+    reason_dead = bool(sig_short) if spec.confirm_next else dead
     action, note, changed = apply_virtual_signal(
         book, sig_long=sig_long, sig_short=sig_short, qty=qty,
         px=px, atr=float(atr_al[i]), ms=int(ts[i]), block=block,
@@ -484,16 +542,26 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
             "interval": spec.interval,
             "strategy_id": spec.id,
             "reason": signal_reason(
-                spec, gold=gold, dead=dead, k=float(k[i]),
+                spec, gold=reason_gold, dead=reason_dead, k=float(k[i]),
             ),
             "k": float(k[i]),
             "d": float(d[i]),
-            "signal": "golden_cross" if gold else ("dead_cross" if dead else ""),
+            "signal": "golden_cross" if reason_gold else (
+                "dead_cross" if reason_dead else ""),
             "symbol": spec.symbol,
         },
     )
-    if action is None and (gold or dead) and not (sig_long or sig_short):
+    if spec.confirm_next and confirm_note and confirm_note != "观察":
+        if action is None:
+            note = confirm_note
+        elif confirm_note not in (note or ""):
+            note = f"{note}; {confirm_note}" if note else confirm_note
+    elif action is None and break_note:
+        note = break_note
+    elif action is None and (gold or dead) and not (sig_long or sig_short):
         note = f"交叉但不满足 K 阈值 (K={k[i]:.2f})"
+    elif size_note:
+        note = f"{note}; {size_note}" if note else size_note
     log_row([_fmt(int(ts[i])), f"{mark}{action or '观察'}",
              "多" if _virtual_side_label(book) == "LONG" else (
                  "空" if _virtual_side_label(book) == "SHORT" else "空仓"),
@@ -510,6 +578,8 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
         interval=spec.interval, signal_rule=spec.signal_rule,
         k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
         path=reading_path, symbol=spec.symbol,
+        confirm_next=spec.confirm_next,
+        require_break=spec.require_break,
     )
     book["last_ts"] = int(ts[i])
     return changed
@@ -593,8 +663,59 @@ def _fetch_symbol_bars(symbol: str, now: int):
     }
 
 
+EXTERNAL_ORDER_SCAN_LIMIT = 500
+
+
+async def detect_external(
+    client: BinanceTestnetClient, symbol: str, *, ex_now: float, now: int,
+    watch: dict,
+):
+    """检测交易所侧是否发生了非本运行器造成的变化（人工下单）。
+
+    判定只认「不是本运行器的委托、且真的成交了」——委托号前缀是硬证据，
+    不靠净值反推。净值变化只用来定方向：敞口变大 = 加仓，否则 = 减仓。
+
+    第一次见到该标的只记基线不判定，这样运行器重启后不会把「重启前就存在
+    的仓位」误判成人工干预。
+    """
+    last_ms = int(watch.get("last_check_ms") or 0)
+    ex_before = watch.get("last_net")
+    watch["last_check_ms"] = int(now)
+    watch["last_net"] = float(ex_now)
+    if last_ms <= 0 or ex_before is None:
+        return None
+    try:
+        orders = await client.all_orders(
+            symbol, start_time=last_ms, limit=EXTERNAL_ORDER_SCAN_LIMIT
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{symbol}] 人工干预检测失败: {exc}")
+        return None
+    hits = external_fills(orders or [], since_ms=last_ms)
+    if not hits:
+        return None
+    kind = classify_external(float(ex_before), float(ex_now), min_qty=MIN_QTY)
+    if kind is None:
+        return None
+    parts = "；".join(
+        f"{o.get('side')} {o.get('executedQty')} @{o.get('avgPrice')} "
+        f"[{str(o.get('clientOrderId') or '')[:14]}]"
+        for o in hits[:4]
+    )
+    return {
+        "kind": kind,
+        "ex_before": float(ex_before),
+        "ex_after": float(ex_now),
+        "detail": (f"{symbol} 交易所净额 {float(ex_before):+.4f} → "
+                   f"{float(ex_now):+.4f}；{parts}"),
+    }
+
+
 async def step(client: BinanceTestnetClient, st: dict, execute: bool) -> None:
     migrate_state(st)
+    # 面板的「确认恢复」请求：一次性消费，只接受暂停之后发出的。
+    for _sym in consume_resume_requests(st):
+        print(f"[{_sym} 人工恢复] 已解除暂停，恢复自动开仓与净仓同步")
     bal = await client.get_balance()
     now = int(time.time() * 1000)
     upnl = float(getattr(bal, "total_unrealized_pnl", 0.0) or 0.0)
@@ -616,6 +737,25 @@ async def step(client: BinanceTestnetClient, st: dict, execute: bool) -> None:
         pos = await client.get_position(symbol)
         ex_side = _signed_qty(pos)
         entry_px = float(getattr(pos, "entry_price", 0.0) or 0.0)
+        # 人工干预检测：必须排在信号处理与净仓同步之前。
+        # 2026-10-02 19:47 用户在网页手动平仓, 11/35 秒后被运行器原样补回 ——
+        # 就是因为这里没有区分「谁动的仓」。
+        watch = watch_for(st, symbol)
+        hit = await detect_external(
+            client, symbol, ex_now=ex_side, now=now, watch=watch
+        )
+        if hit and execute:
+            watch = apply_external(
+                st, symbol, hit["kind"],
+                ex_before=hit["ex_before"], ex_after=hit["ex_after"],
+                now=now, detail=hit["detail"],
+            )
+            label = "人工减仓跟随" if hit["kind"] == "reduce" else "人工加仓暂停"
+            print(f"[{symbol} {label}] {hit['detail']}")
+            log_row([_fmt(now), f"{symbol_short(symbol)} {label}",
+                     "多" if hit["ex_after"] > 0 else "空",
+                     f"{abs(hit['ex_after']):.4f}", "", "", "", "", "", "",
+                     f"{equity:.2f}", hit["detail"]])
         pack = _fetch_symbol_bars(symbol, now)
         if not pack:
             continue
@@ -651,14 +791,21 @@ async def step(client: BinanceTestnetClient, st: dict, execute: bool) -> None:
             before = json.dumps(book.get("entry"), sort_keys=True)
             did = process_strategy(
                 spec, book, bars, atr_al,
-                equity=equity, block=block, now=now, execute=execute,
+                equity=equity, block=block or bool(watch.get("paused")),
+                now=now, execute=execute,
+                trend=trend_side(st, symbol),
             )
             after = json.dumps(book.get("entry"), sort_keys=True)
             if did or before != after:
                 changed = True
                 tag = spec.tag
 
-        if changed or abs(desired_net(st, symbol) - ex_side) >= MIN_QTY:
+        if changed:
+            # 人工平仓后「等下一根信号」：账本被新信号改动即解除持有。
+            clear_hold_on_new_signal(st, symbol)
+        allow_sync = not watch.get("paused") and not watch.get("hold")
+        if allow_sync and (changed or
+                           abs(desired_net(st, symbol) - ex_side) >= MIN_QTY):
             await sync_net(client, st, execute, symbol=symbol, tag=tag)
 
     # 旧面板仍读顶层 last_ts / entry，与 BTC 15m 账本对齐。

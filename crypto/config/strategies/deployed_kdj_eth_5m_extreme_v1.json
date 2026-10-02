@@ -28,7 +28,7 @@
     "r": 0.03,
     "k": 2,
     "step": 0.001,
-    "note": "与 15m 策略各记各的仓，ETHUSDT 只下净额；不与 BTC 混仓"
+    "note": "与 ETH 15m 同向时满仓；逆着 15m 时开一半。ETHUSDT 只下净额，不与 BTC 混仓"
   },
   "risk": {
     "leverage": 10,
