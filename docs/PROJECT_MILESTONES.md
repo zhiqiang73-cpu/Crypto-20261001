@@ -688,3 +688,90 @@ trading/binance_client.py:3  下单默认 https://testnet.binancefuture.com ← 
   收盘价 84863.80 与测试网一致
 - 后端 `/api/market` 返回 `market=testnet`、`market_ws=wss://fstream.binancefuture.com/stream`
 - 后端采集器日志确认连的是测试网 WS，`free_deriv 202` 错误消失
+
+---
+
+## 2026-10-02（第四次）· 下单路径改为 post-only 被动挂单
+
+### 用户指令
+
+> 「必须走限价单。」（同时把 `RISK_R` 从 0.01 提到 0.03，仓位放大 3 倍）
+
+### 挂价方向 —— 这是省手续费的全部要害
+
+**要付 maker 手续费，订单必须躺在盘口里等（提供流动性）。**
+
+| 方向 | 挂价 | 结果 |
+| --- | --- | --- |
+| 做多 | **最优买价之下** | 躺进盘口 → **maker 0.0200%** |
+| 做空 | **最优卖价之上** | 躺进盘口 → **maker 0.0200%** |
+| 做多 | 市价之上 | 立刻吃对手单 → taker 0.0400% |
+| 做空 | 市价之下 | 立刻吃对手单 → taker 0.0400% |
+
+> ⚠️ 方向写反不是「不省」，是**手续费翻倍**。曾出现过「做多挂高于市价、
+> 做空挂低于市价」的表述 —— 那恰好是保证成交但必然吃 taker 的方向。
+
+### 实现
+
+被动阶段一律 **post-only**：币安期货不是订单类型而是 TIF，
+`type=LIMIT` + `timeInForce=GTX`。该模式下交易所**直接拒单**任何会立即成交
+的订单（`-5022 could not be executed as maker`）—— 所以「成交即 maker」
+不是约定，是交易所规则。用 `LIMIT_MAKER` 会得到 `-1116 Invalid orderType`。
+
+```
+做多: px = min(best_bid − pad×tick, best_ask − tick)   # 严格低于 best_ask
+做空: px = max(best_ask + pad×tick, best_bid + tick)   # 严格高于 best_bid
+```
+
+挂价基于**真实盘口**（`/fapi/v1/ticker/bookTicker`）而非 mark price ——
+mark 与真实最优价差一个点差，用它算出的「被动价」可能已穿盘口。
+
+配套行为：
+
+- 被 post-only 拒单 → 让开一档重挂（上限 `PASSIVE_MAX_PAD=5`）
+- 每 `PASSIVE_REPRICE_SEC=5s` 撤单重读盘口重挂，最多 `PASSIVE_MAX_REPRICE=60` 次
+- 窗口 `PASSIVE_WINDOW_SEC=180s` 耗尽 → 兜底穿盘口限价单（taker），
+  滑点上限 `PASSIVE_CROSS_TICKS=5` 个 tick
+- 撤单后必须复核订单状态：撤单与成交存在竞态，`-2011` 同样按成交处理
+
+### 实测：确实吃到了 maker
+
+账户全部 18 笔成交按交易所返回的 `maker` 标记核对：
+
+```
+10-01 18:30:59  SELL 0.0470 @ 84776.70   1.5938   0.0400%  taker
+10-01 22:15:55  BUY  0.0470 @ 84739.70   1.5931   0.0400%  taker
+10-02 02:22:12  BUY  0.0010 @ 84902.00   0.0170   0.0200%  maker  ←
+10-02 02:22:14  BUY  0.0007 @ 84902.00   0.0119   0.0200%  maker  ←
+10-02 02:22:14  BUY  0.0003 @ 84902.00   0.0051   0.0200%  maker  ←
+10-02 02:22:20  BUY  0.0020 @ 84902.00   0.0340   0.0200%  maker  ←
+```
+
+4 笔 maker 全部来自新的被动挂单路径，费率精确落在 0.0200%。
+按策略仓位（0.047 BTC ≈ 3,984 USDT）算：一开一平 maker 约 1.59 USDT，
+taker 约 3.19 USDT，**每轮往返省约 1.6 USDT**。
+
+### 核对信号的正确入口
+
+新增 `GET /api/strategy/reading` + 第 1 页「策略当前读数」，直接展示运行器
+落盘的 `runtime/shadow/latest_reading.json`：市场、K 线地址、OHLC、K/D、ATR
+全都在。**核对信号以此为准，不要拿交易所图表比对** —— 币安测试网 UI 的图表
+显示的是主网行情，而执行引擎走测试网盘口，两者必然对不上。
+
+### 测试
+
+`tests/test_limit_chase.py` 原按已删除的 `CHASE_*` 常量导入，导致回归 374 项
+1 项错误。重写为被动挂单语义（22 项），覆盖：挂价方向、绝不穿盘口、
+post-only 拒单退档、竞态成交、兜底穿盘口、滑点上限、重挂次数上限。
+
+**全量回归 395 项全绿。**
+
+已知小瑕疵（未改源码）：`window_sec=0` 是 falsy，会被
+`window_sec or PASSIVE_WINDOW_SEC` 吃成默认 180 秒。调用方目前不传 0，暂无影响。
+
+### 并发编辑事故
+
+本轮发现**另一个 agent 在同一工作区并行修改** `trading/binance_client.py`
+与 `shadow/engine.py`（10:14–10:22），一度使回归为红。已与用户确认该改动为
+其授意。**多 agent 共用一个工作区时必须先确认归属再提交**，否则会把半成品
+打包进提交。
