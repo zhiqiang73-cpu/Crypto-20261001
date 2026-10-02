@@ -1,16 +1,11 @@
-"""影子模式引擎 —— 严格按用户规格逐字实现, 不增删任何条件或参数.
+"""影子回测引擎：与测试网执行器共用已收盘 KDJ 交叉信号。
 
 规格要点 (全部硬编码为常量, 不对外暴露为可调项):
     信号周期 15m, 风险参数周期 1H; 只用已收盘 K 线。
-    做多 = 金叉 且 K_t < 30
-    做空 = 死叉 且 K_t > 70
-    宽松做多 = 金叉 且 最近 3 根内 min(K) < 30   (仅记录)
-    宽松做空 = 死叉 且 最近 3 根内 max(K) > 70   (仅记录)
-    出场 A (执行): 对侧【完整信号】→ 平仓并反手
-    出场 B (并行记录, 不执行): 对侧【裸交叉】→ 平仓
-    仓位: qty = 权益 × r_eff ÷ (k × ATR_1H), r=0.01, k=2, 向下取整到 stepSize
-    布林闸门: fee_points = 0.001×现价; 目标距离 = (UP−LB)/2; 倍数 = 目标距离/fee_points
-              倍数≥3 → r_eff = r;  2≤倍数<3 → r_eff = r/2;  倍数<2 → 不开仓仅记录
+    做多 = 金叉；做空 = 死叉；不要求 K 值进入极值区。
+    出场 A: 对侧交叉平仓并反手；B: 对侧交叉只平仓。
+    仓位: qty = 权益 × RISK_R ÷ (2 × ATR_1H), 向下取整到 stepSize。
+    布林带仍计算并记日志，但不再过滤开仓。
     风控: 单方向单仓位; 10x 逐仓 (仅保证金占用); 日亏≥3% 停止当日开新仓;
           累计回撤≥10% 全部停止; 灾难止损 浮亏≥3×ATR_1H → 强制市价平仓
 
@@ -30,15 +25,12 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from shadow.indicators import atr_wilder, boll, kdj
+from shadow.signals import crossing
 
 # --------------------------------------------------------------------------- 规格常量 (禁止修改)
 KDJ_N, KDJ_M1, KDJ_M2 = 9, 3, 3
 ATR_PERIOD = 14
 BOLL_N, BOLL_K = 20, 2.0
-
-K_LONG_MAX = 30.0        # 做多要求 K_t < 30
-K_SHORT_MIN = 70.0       # 做空要求 K_t > 70
-LOOSE_LOOKBACK = 3       # 宽松版: 最近 3 根内
 
 # ---------------------------------------------------------------------------
 # 仓位拨盘 (用户 2026-10-02 指令: 可以增加仓位)
@@ -288,13 +280,10 @@ def run_shadow(bars15: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
         block_new_b = dd_b >= MAX_DRAWDOWN or daily_loss_b >= DAILY_LOSS_LIMIT
 
         # ---------- 4. 信号判定 (t 收盘) ----------
-        gold = bool(k[i] > d[i] and k[i - 1] <= d[i - 1])
-        dead = bool(k[i] < d[i] and k[i - 1] >= d[i - 1])
-        sig_long = bool(gold and k[i] < K_LONG_MAX)
-        sig_short = bool(dead and k[i] > K_SHORT_MIN)
-        w = k[max(0, i - LOOSE_LOOKBACK + 1):i + 1]
-        loose_long = bool(gold and float(np.min(w)) < K_LONG_MAX)
-        loose_short = bool(dead and float(np.max(w)) > K_SHORT_MIN)
+        gold, dead = crossing(k[i - 1], d[i - 1], k[i], d[i])
+        sig_long, sig_short = gold, dead
+        # 旧报表列名保留；去掉极值过滤后「宽松」与正式信号相同。
+        loose_long, loose_short = gold, dead
 
         # 布林闸门
         if np.isnan(up[i]) or np.isnan(lb[i]):

@@ -15,6 +15,38 @@
   let currentView = "trading";
   let timer = null;
   let markSocket = null;
+  // 默认只看真实交易；功能测试单可随时切回查看（交易所记录不删不改）。
+  let hideTests = true;
+
+  const SOURCE_ZH = {
+    strategy: "策略自动",
+    manual_web: "网页手动",
+    function_test: "功能测试",
+    user_action: "面板手动",
+    unknown: "未判定",
+  };
+
+  const sourceCell = (row) => {
+    const key = String(row.source || "unknown");
+    return `<span class="src src-${esc(key)}">${esc(
+      SOURCE_ZH[key] || row.source_label || key
+    )}</span>`;
+  };
+
+  const isTest = (row) => String(row.source || "") === "function_test";
+
+  const runnerStatusText = (runner) => {
+    if (!runner) return "无运行器心跳 · 当前未确认运行";
+    const age = Date.now() - Number(runner.updated_ms || 0);
+    const mode = runner.mode === "testnet_orders" ? "测试网自动下单"
+      : runner.mode === "observation_only" ? "仅观察" : runner.mode || "未知模式";
+    if (age > 60 * 1000) return `心跳过期 ${Math.floor(age / 1000)} 秒 · ${mode}`;
+    if (runner.status === "running") return `运行中 · ${mode}`;
+    if (runner.status === "starting") return `正在启动 · ${mode}`;
+    if (runner.status === "blocked") return `启动被拦截 · ${runner.detail || mode}`;
+    if (runner.status === "error") return `运行异常 · ${runner.detail || mode}`;
+    return `已停止 · ${runner.detail || mode}`;
+  };
 
   // ------------------------------------------------------------------ utils
   const num = (v, d = 2) =>
@@ -53,10 +85,12 @@
   const fmtTime = (ms) => {
     if (!ms) return "—";
     const d = new Date(Number(ms));
-    const p = (n) => String(n).padStart(2, "0");
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(
-      d.getHours()
-    )}:${p(d.getMinutes())}`;
+    if (Number.isNaN(d.getTime())) return "—";
+    return new Intl.DateTimeFormat("sv-SE", {
+      timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit",
+      day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hourCycle: "h23",
+    }).format(d);
   };
 
   const esc = (s) =>
@@ -218,9 +252,9 @@
           "connection-big " + (ok ? "positive" : "blocked");
       }
       if ($("accountMode"))
-        $("accountMode").textContent = s.enabled ? "testnet（真实下单）" : "paper";
+        $("accountMode").textContent = "测试网 API · 策略进程状态另查";
       if ($("modeLabel"))
-        $("modeLabel").textContent = s.enabled ? "TESTNET ENABLED" : "PAPER MODE";
+        $("modeLabel").textContent = s.connected ? "TESTNET · API CONNECTED" : "TESTNET · DISCONNECTED";
       if ($("engineState")) $("engineState").textContent = "后端已连接";
     } catch (e) {
       if ($("engineState")) $("engineState").textContent = "后端不可达";
@@ -234,6 +268,7 @@
         if ($("mWallet")) $("mWallet").textContent = "未连接";
         if ($("mUnreal")) $("mUnreal").textContent = "—";
         if ($("mReal")) $("mReal").textContent = "—";
+        ["pCount", "pWinLoss", "pWinRate", "pPF", "pFee", "atCount", "atReal", "atFee", "atNet"].forEach(id => { if ($(id)) $(id).textContent = "—"; });
         if ($("realHint")) $("realHint").textContent = s.reason || "密钥未配置";
         return;
       }
@@ -245,10 +280,7 @@
       if ($("statsStart")) $("statsStart").textContent = s.stats_start || "—";
       if ($("statsStart2")) $("statsStart2").textContent = s.stats_start || "—";
       if ($("pCount")) $("pCount").textContent = String(s.closed_trades ?? "—");
-      if ($("pCountHint")) {
-        $("pCountHint").textContent =
-          `已平仓笔数 · 成交 ${s.trade_count ?? 0} 笔`;
-      }
+      if ($("pCountHint")) $("pCountHint").textContent = `非零盈亏 · 共 ${s.trade_count ?? 0} 笔逐笔成交`;
       if ($("pWinLoss")) $("pWinLoss").textContent = `${s.wins ?? 0} / ${s.losses ?? 0}`;
       if ($("pWinRate")) $("pWinRate").textContent = pct(s.win_rate);
       if ($("pPF")) {
@@ -258,12 +290,13 @@
       }
       if ($("pFee")) $("pFee").textContent = num(s.commission, 4);
 
-      // 全部历史对账 —— 与下方全量的「历史成交」表对齐, 避免两块数字口径不同
-      const at = s.all_time || {};
+      // 与下方最近七天、最多200笔逐笔成交表对齐；不冒充账户全历史。
+      const at = s.available_history || {};
       if ($("atCount")) $("atCount").textContent = String(at.trade_count ?? "—");
       if ($("atReal")) $("atReal").textContent = signed(at.realized_pnl);
       if ($("atFee")) $("atFee").textContent = num(at.commission, 4);
       if ($("atNet")) $("atNet").textContent = signed(at.net_pnl);
+      if ($("scopeWarning")) $("scopeWarning").textContent = s.truncated ? " · 已达 200 笔上限，合计不完整" : " · 仅查询窗口内";
 
       if ($("posBox") && s.position && s.position.side && s.position.side !== "FLAT") {
         const p = s.position;
@@ -275,6 +308,7 @@
       }
     } catch (e) {
       if ($("mWallet")) $("mWallet").textContent = "读取失败";
+      if ($("mReal")) $("mReal").textContent = "—";
     }
   }
 
@@ -308,6 +342,7 @@
       if (!d.available) {
         box.innerHTML = empty("运行器尚未写入读数", d.reason || "");
         if ($("readingMarketTag")) $("readingMarketTag").textContent = "—";
+        if ($("runnerState")) $("runnerState").textContent = runnerStatusText(d.runner);
         return;
       }
       const mk =
@@ -315,6 +350,7 @@
       if ($("readingMarketTag")) {
         $("readingMarketTag").textContent = `${mk} · ${d.interval || ""} · ${d.bar_utc || ""} UTC`;
       }
+      if ($("runnerState")) $("runnerState").textContent = runnerStatusText(d.runner);
       const f = (v, n) => (v === null || v === undefined || Number.isNaN(Number(v)) ? "—" : Number(v).toFixed(n));
       const cells = [
         ["市场", mk],
@@ -325,6 +361,8 @@
         ["持仓", d.position || "—"],
         ["做多信号", d.signal_long ? "是" : "否"],
         ["做空信号", d.signal_short ? "是" : "否"],
+        ["停机漏过 K 线", `${d.missed_bars ?? 0} 根`],
+        ["其中带交叉信号", `${d.missed_signals ?? 0} 根`],
         ["K 线数据源", d.kline_url || "—"],
         ["账户地址", d.account_base_url || "—"],
         ["行情 WS", d.ws || "—"],
@@ -383,7 +421,7 @@
             <div class="strategy-head">
               <span class="strategy-icon ${on ? "purple" : "blue"}">${on ? "ON" : "OFF"}</span>
               <div><h3>${esc(s.name || s.strategy_id)}</h3><p>${esc(s.kind || "")} · ${esc(s.symbol || "BTCUSDT")} · ${esc(s.market || "")}</p></div>
-              <span class="tag ${on ? "safe" : "paused"}">${on ? "RUNNING" : "未启用"}</span>
+              <span class="tag ${on ? "safe" : "paused"}">${on ? "配置已启用" : "未启用"}</span>
             </div>
             ${live}
             <div class="kv-list">${rows}</div>
@@ -404,6 +442,22 @@
     REJECTED: "已拒绝",
   };
 
+  function renderSourceSummary(counts, hidden) {
+    const el = $("sourceSummary");
+    if (!el) return;
+    if (!counts) {
+      el.textContent = "来源统计不可用";
+      return;
+    }
+    const parts = ["strategy", "manual_web", "function_test", "user_action", "unknown"]
+      .filter((k) => counts[k])
+      .map((k) => `${SOURCE_ZH[k]} ${counts[k]}`);
+    el.textContent =
+      "来源统计（最近 7 天）：" +
+      (parts.join(" · ") || "无记录") +
+      (hidden ? ` · 已隐藏测试 ${hidden} 笔` : "");
+  }
+
   async function loadOrders() {
     const box = $("histOrdersBox");
     if (!box) return;
@@ -415,18 +469,29 @@
         return;
       }
       const list = (d.orders || []).slice().reverse();
-      if ($("histOrdersTag")) $("histOrdersTag").textContent = list.length + " 条";
-      if (!list.length) {
-        box.innerHTML = empty("暂无历史委托", "币安返回空列表");
+      const shown = hideTests ? list.filter((o) => !isTest(o)) : list;
+      const hidden = list.length - shown.length;
+      renderSourceSummary(d.source_counts, hidden);
+      if ($("histOrdersTag")) {
+        $("histOrdersTag").textContent =
+          shown.length + " 条" + (hidden ? ` · 隐藏测试 ${hidden}` : "");
+        if (d.truncated) $("histOrdersTag").textContent += " · 上限";
+      }
+      if (!shown.length) {
+        box.innerHTML = empty(
+          hideTests ? "没有真实交易委托" : "暂无历史委托",
+          hideTests ? "当前只显示非测试单；可取消勾选查看全部" : "币安返回空列表"
+        );
         return;
       }
-      box.innerHTML = list
+      box.innerHTML = shown
         .map(
-          (o) => `<div class="table-row cols-7">
+          (o) => `<div class="table-row cols-o8">
             <span>${fmtTime(o.time ?? o.updateTime)}</span>
-            <span class="${o.side === "BUY" ? "positive" : "negative"}">${esc(o.side)}</span>
-            <span>${esc(o.type)}</span>
-            <span>${num(o.price, 2)}</span>
+            <span class="${o.side === "BUY" ? "positive" : "negative"}">${esc(o.side === "BUY" ? "买入" : "卖出")}<small>${esc(o.type)} · ${esc(o.timeInForce || "—")}</small></span>
+            <span class="mono id-cell">${esc(o.orderId)}</span>
+            <span>${sourceCell(o)}</span>
+            <span>${Number(o.price) ? num(o.price, 2) : "市价"}<small>成交均价 ${Number(o.avgPrice) ? num(o.avgPrice, 2) : "—"}</small></span>
             <span>${num(o.origQty, 4)}</span>
             <span>${num(o.executedQty, 4)}</span>
             <span>${esc(ORDER_STATUS_ZH[o.status] || o.status)}</span>
@@ -449,19 +514,29 @@
         return;
       }
       const list = (d.trades || []).slice().reverse();
-      if ($("histTradesTag")) $("histTradesTag").textContent = list.length + " 条";
-      if (!list.length) {
-        box.innerHTML = empty("暂无历史成交", "币安返回空列表");
+      const shown = hideTests ? list.filter((t) => !isTest(t)) : list;
+      const hidden = list.length - shown.length;
+      if ($("histTradesTag")) {
+        $("histTradesTag").textContent =
+          shown.length + " 条" + (hidden ? ` · 隐藏测试 ${hidden}` : "");
+        if (d.truncated) $("histTradesTag").textContent += " · 上限";
+      }
+      if (!shown.length) {
+        box.innerHTML = empty(
+          hideTests ? "没有真实交易成交" : "暂无历史成交",
+          hideTests ? "当前只显示非测试单；可取消勾选查看全部" : "币安返回空列表"
+        );
         return;
       }
-      box.innerHTML = list
+      box.innerHTML = shown
         .map((t) => {
           const p = Number(t.realizedPnl || 0);
-          return `<div class="table-row cols-6">
+          return `<div class="table-row cols-t7">
             <span>${fmtTime(t.time)}</span>
-            <span class="${t.side === "BUY" ? "positive" : "negative"}">${esc(t.side)}</span>
-            <span>${num(t.price, 2)}</span>
-            <span>${num(t.qty, 4)}</span>
+            <span class="mono id-cell">${esc(t.orderId)}<small>成交 ${esc(t.id)}</small></span>
+            <span>${sourceCell(t)}</span>
+            <span class="${t.side === "BUY" ? "positive" : "negative"}">${esc(t.side === "BUY" ? "买入" : "卖出")}<small>${t.maker ? "Maker" : "Taker"}</small></span>
+            <span>${num(t.price, 2)}<small>× ${num(t.qty, 4)} BTC</small></span>
             <span class="${pnlClass(p)}">${signed(p, 4)}</span>
             <span>${num(t.commission, 4)}</span>
           </div>`;
@@ -586,13 +661,25 @@
 
     bindAccountForm();
 
+    const hideToggle = $("hideTestToggle");
+    if (hideToggle) {
+      hideToggle.checked = hideTests;
+      hideToggle.addEventListener("change", () => {
+        hideTests = !!hideToggle.checked;
+        loadOrders();
+        loadTrades();
+      });
+    }
+
     const smoke = $("testnetSmokeBtn");
     if (smoke)
-      smoke.addEventListener("click", () =>
-        postAction("testnetSmokeBtn", "/api/testnet/smoke-limit-close", "冒烟测试", {
+      smoke.addEventListener("click", () => {
+        const answer = window.prompt("这是非策略功能测试：将在 Binance 测试网实际下单、立即平仓并留下多笔委托/成交，产生手续费。若仍要测试，请输入「测试单」：");
+        if (answer !== "测试单") return;
+        postAction("testnetSmokeBtn", "/api/testnet/smoke-limit-close", "非策略功能测试", {
           quantity: 0.001,
-        })
-      );
+        });
+      });
     const flat = $("testnetFlattenBtn");
     if (flat)
       flat.addEventListener("click", () =>

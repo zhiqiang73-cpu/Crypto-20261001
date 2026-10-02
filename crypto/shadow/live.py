@@ -18,11 +18,11 @@ from datetime import datetime, timezone
 import numpy as np
 import urllib.request
 
-from shadow.engine import (ATR_MULT_K, DISASTER_ATR, FEE_PER_SIDE, GATE_FEE_RATE,
-                           GATE_STRONG, GATE_WEAK, K_LONG_MAX, K_SHORT_MIN,
-                           LOOSE_LOOKBACK, MIN_NOTIONAL, MIN_QTY, RISK_R, STEP_SIZE,
+from shadow.engine import (ATR_MULT_K, BOLL_GATE_ENABLED, DISASTER_ATR, FEE_PER_SIDE, GATE_FEE_RATE,
+                           GATE_STRONG, GATE_WEAK, MIN_NOTIONAL, MIN_QTY, RISK_R, STEP_SIZE,
                            floor_step)
 from shadow.indicators import atr_wilder, boll, kdj
+from shadow.signals import crossing
 from shadow.reporting import BAR_COLS, TRADE_COLS
 from config.market_endpoints import resolve_for_account
 
@@ -166,19 +166,17 @@ def cycle(st: dict) -> int:
                 pos = None
 
         # --- 信号 ---
-        gold = bool(k[i] > d[i] and k[i - 1] <= d[i - 1])
-        dead = bool(k[i] < d[i] and k[i - 1] >= d[i - 1])
-        sig_long = bool(gold and k[i] < K_LONG_MAX)
-        sig_short = bool(dead and k[i] > K_SHORT_MIN)
-        w = k[max(0, i - LOOSE_LOOKBACK + 1):i + 1]
-        loose_long = bool(gold and float(np.min(w)) < K_LONG_MAX)
-        loose_short = bool(dead and float(np.max(w)) > K_SHORT_MIN)
+        gold, dead = crossing(k[i - 1], d[i - 1], k[i], d[i])
+        sig_long, sig_short = gold, dead
+        loose_long, loose_short = gold, dead  # 兼容旧日志列名
 
         bw = float(up[i] - lb[i])
         target = bw / 2.0
         fp = GATE_FEE_RATE * float(c[i])
         mult = target / fp if fp > 0 else 0.0
-        r_eff = RISK_R if mult >= GATE_STRONG else (RISK_R / 2.0 if mult >= GATE_WEAK else None)
+        r_eff = (RISK_R if not BOLL_GATE_ENABLED else
+                 (RISK_R if mult >= GATE_STRONG else
+                  (RISK_R / 2.0 if mult >= GATE_WEAK else None)))
 
         # --- 执行: 用"下一根已收盘 K 线"的开盘; 若尚无下一根则留待下轮 ---
         nxt = i + 1

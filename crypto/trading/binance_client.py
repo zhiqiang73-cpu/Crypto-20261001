@@ -333,6 +333,31 @@ class BinanceTestnetClient:
         info.mark_price = mark
         return info
 
+    async def get_position_settings(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """读取 BTCUSDT 的交易所逐仓/杠杆设置（即使空仓也能返回真实设置）。
+
+        `get_position()` 在空仓时为了简洁返回默认 `leverage=1`，因此不能拿它
+        验证策略的「10x 逐仓」要求。本方法直接读取 positionRisk 的原始设置，
+        仅做 GET、没有任何账户修改副作用。
+        """
+        symbol = symbol or self.symbol
+        data = await self._request(
+            "GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True
+        )
+        for item in data or []:
+            if item.get("symbol") != symbol:
+                continue
+            isolated_raw = item.get("isolated", False)
+            isolated = (isolated_raw is True or str(isolated_raw).lower() == "true")
+            return {
+                "symbol": symbol,
+                "leverage": int(float(item.get("leverage") or 0)),
+                "isolated": isolated,
+                "margin_type": "ISOLATED" if isolated else "CROSSED",
+            }
+        return {"symbol": symbol, "leverage": 0, "isolated": False,
+                "margin_type": "UNKNOWN"}
+
     async def get_open_orders(self, symbol: Optional[str] = None) -> list:
         return await self._request(
             "GET",
@@ -962,6 +987,8 @@ class BinanceTestnetClient:
         mark_price: Optional[float] = None,
         max_steps: Optional[int] = None,
         window_sec: Optional[float] = None,
+        tag: str = "ps",
+        force_cross: bool = False,
     ) -> OrderResult:
         """被动限价挂单 (post-only) + 跟盘口重挂, 超时兜底.
 
@@ -983,6 +1010,14 @@ class BinanceTestnetClient:
 
         竞态处理: 每档撤单后必须复核订单状态 —— 撤单与成交可能同时发生,
         撤单返回 -2011 (订单不存在/已成交) 同样按成交复核, 避免漏记成交。
+
+        tag: clientOrderId 前缀, 用于事后区分下单来源 (见 review/order_sources.py)。
+            策略运行器用 "kdj", 面板冒烟测试用 "smk", 用户在面板主动平仓用 "usr"。
+            没有它, 账户里「策略单」和「功能测试单」就无法可靠分开 —— 2026-10-02
+            的 10:22 事故正是这样发生的。
+        force_cross: 仅限灾难止损。跳过 post-only 等待，直接提交带滑点上限的
+            穿盘口 LIMIT 单。仍然**不是 MARKET 单**；普通开仓、反手、用户平仓
+            一律保持 180 秒 post-only 追价逻辑。
         """
         symbol = symbol or self.symbol
         lot_step = await self._lot_step(symbol)
@@ -993,7 +1028,9 @@ class BinanceTestnetClient:
             )
         tick = await self.price_tick(symbol)
         is_long = side.upper() == "LONG"
-        deadline = time.time() + (window_sec or PASSIVE_WINDOW_SEC)
+        deadline = time.time() if force_cross else time.time() + (
+            window_sec or PASSIVE_WINDOW_SEC
+        )
         attempts: List[Dict[str, Any]] = []
         pad = 0
 
@@ -1011,7 +1048,7 @@ class BinanceTestnetClient:
             px = self._price_precision(px, tick)
 
             idx = len(attempts)
-            cid = _new_client_order_id(f"ps{idx}")
+            cid = _new_client_order_id(f"{tag}{idx}")
             res = await self.place_limit_order(
                 side,
                 qty,
@@ -1070,7 +1107,7 @@ class BinanceTestnetClient:
             (ask + PASSIVE_CROSS_TICKS * tick) if is_long
             else (bid - PASSIVE_CROSS_TICKS * tick), tick
         )
-        cid = _new_client_order_id("cx")
+        cid = _new_client_order_id(f"{tag}x")
         res = await self.place_limit_order(
             side, qty, cross_px, symbol,
             reduce_only=reduce_only, client_order_id=cid,

@@ -311,6 +311,16 @@ class TestTimeoutFallback(unittest.TestCase):
         _run(c.place_limit_chase("SHORT", 0.001, window_sec=_TINY_WINDOW))
         self.assertLess(c.calls[-1]["price"], c._bid)
 
+    def test_force_cross_skips_post_only_but_remains_limit(self):
+        """灾难止损不等 180 秒，但仍用有滑点上限的 LIMIT，不用 MARKET。"""
+        c = _PassiveStub(fill_crossing=True)
+        res = _run(c.place_limit_chase("LONG", 0.001, force_cross=True))
+        self.assertTrue(res.ok)
+        self.assertEqual(len(c.calls), 1)
+        self.assertFalse(c.calls[0]["post_only"])
+        self.assertGreater(c.calls[0]["price"], c._ask)
+        self.assertFalse(res.raw["chase"]["likely_maker"])
+
     def test_fallback_unfilled_returns_explicit_failure(self):
         """被动 + 兜底都没成交: 必须明确失败, 绝不静默挂单。"""
         c = _PassiveStub(fill_at_step=None, fill_crossing=False)

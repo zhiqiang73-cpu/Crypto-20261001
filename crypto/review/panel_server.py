@@ -66,6 +66,8 @@ from engine.scorer import FactorScoringEngine
 from models.review import SettleStatus, TradeRecord, now_ms
 from models.signals import DimensionScores, StrategyHorizon
 from review import meta_review, overrides, review_loop
+from review.order_sources import (SOURCE_LABELS, annotate_orders, annotate_trades,
+                                  load_strategy_order_ids, summarize)
 from review.journal import TradeJournal, new_trade_id
 from review.settle import settle_pending
 from review.stats import compute_stats
@@ -388,6 +390,19 @@ def create_app(
     # ------------------------------------------------------------------ trading
     async def api_trading_status(_request):
         status = await review.executor.status()
+        # `get_position()` 在空仓时默认 leverage=1，不能拿来展示账户的真实
+        # 10x/逐仓设置。额外读 positionRisk 的设置，避免前端和交易所对不上。
+        client = review.executor.client
+        if client.configured:
+            try:
+                settings = await client.get_position_settings()
+                status["exchange_settings"] = settings
+                exch = status.get("exchange_position")
+                if isinstance(exch, dict):
+                    exch["leverage"] = settings.get("leverage", 0)
+                    exch["margin_type"] = settings.get("margin_type", "UNKNOWN")
+            except Exception as exc:  # noqa: BLE001
+                status["exchange_settings_error"] = f"{type(exc).__name__}: {exc}"
         if os.getenv("TRADING_MODE", "paper").lower() == "paper" and paper_account["forced_flat"]:
             status["exchange_position"] = {"symbol": "BTCUSDT", "side": "FLAT", "quantity": 0.0, "position_amt": 0.0}
             status["positions"] = {"short_term": None, "long_term": None}
@@ -441,7 +456,9 @@ def create_app(
                 }, status=409)
             mark = float(await client.mark_price())
             # 限价追价: 先被动挂单争取 maker 手续费, 未成交则逐档追价直至成交
-            entry = await client.place_limit_chase("LONG", qty)
+            # tag="smk": 这是功能测试, 不是策略交易。标签让事后能可靠分开,
+            # 不靠时间窗口猜测。
+            entry = await client.place_limit_chase("LONG", qty, tag="smk")
             filled = float(entry.cum_filled_qty or 0)
             if filled <= 0:
                 recon = await review.executor.reconcile(
@@ -460,7 +477,7 @@ def create_app(
                     "reconciliation": recon,
                 }, status=409)
             close = await client.place_limit_chase(
-                "SHORT", filled, reduce_only=True
+                "SHORT", filled, reduce_only=True, tag="smk"
             )
             after = await client.get_position()
             flat = abs(float(getattr(after, "quantity", 0) or 0)) <= 1e-12
@@ -515,7 +532,8 @@ def create_app(
                     "reconciliation": recon,
                 })
             close = await client.place_limit_chase(
-                "SHORT" if side == "LONG" else "LONG", qty, reduce_only=True
+                "SHORT" if side == "LONG" else "LONG", qty, reduce_only=True,
+                tag="usr",
             )
             after = await client.get_position()
             flat = abs(float(getattr(after, "quantity", 0) or 0)) <= 1e-12
@@ -764,6 +782,15 @@ def create_app(
         2026-10-02 的市场错位之所以难查, 正是因为当时没有这个快照。
         """
         path = os.path.join(ROOT, "runtime", "shadow", "latest_reading.json")
+        heartbeat_path = os.path.join(
+            ROOT, "runtime", "shadow", "runner_heartbeat.json"
+        )
+        heartbeat = None
+        try:
+            with open(heartbeat_path, encoding="utf-8") as fh:
+                heartbeat = json.load(fh)
+        except Exception:
+            pass
         try:
             with open(path, encoding="utf-8") as fh:
                 rec = json.load(fh)
@@ -771,8 +798,10 @@ def create_app(
             return web.json_response({
                 "available": False,
                 "reason": "runner_not_written_yet",
+                "runner": heartbeat,
             })
         rec["available"] = True
+        rec["runner"] = heartbeat
         return web.json_response(rec)
 
     async def api_strategies_active(_request):
@@ -804,26 +833,31 @@ def create_app(
         return web.json_response({"strategies": out})
 
     async def api_binance_orders(request):
-        """币安历史委托 —— 以交易所为准, 非本地账本.
-
-        ⚠ 这里**不得**按统计起算日过滤: 历史列表必须完整。曾经因为复用了
-        stats_start_ms() 而把起算日之前的委托全部藏掉, 用户看到的「记录不见了」
-        就是这个原因。起算日只作用于「赚了多少」那组统计指标。
-        """
+        """币安委托：未传起点时交易所仅返回最近七天，绝非全部历史。"""
         client = review.executor.client
         if not client.configured:
             return web.json_response(
                 {"connected": False, "reason": "binance_keys_missing", "orders": []}
             )
         try:
-            limit = int(request.query.get("limit", 200))
+            limit = max(1, min(200, int(request.query.get("limit", 200))))
         except Exception:
             limit = 200
         try:
             orders = await client.all_orders(limit=limit)
+            # 来源标签: 策略单 / 网页手动 / 功能测试 / 面板手动 / 未判定。
+            # 交易所记录不删不改, 只加可核验的标签 —— 见 review/order_sources.py。
+            orders = annotate_orders(
+                orders, strategy_order_ids=load_strategy_order_ids()
+            )
+            counts = summarize(orders)
             return web.json_response({
                 "connected": True,
                 "orders": orders,
+                "scope": "recent_7d", "limit": limit,
+                "truncated": len(orders) >= limit,
+                "source_counts": counts,
+                "source_labels": SOURCE_LABELS,
             })
         except Exception as exc:
             return web.json_response({
@@ -833,24 +867,37 @@ def create_app(
             })
 
     async def api_binance_trades(request):
-        """币安历史成交 —— 含 realizedPnl 与 commission, 是盈亏的唯一可信来源.
-
-        同 api_binance_orders: 返回**完整**成交历史, 不按统计起算日过滤。
-        """
+        """币安逐笔成交：默认最近七天；一笔委托可拆为多笔成交。"""
         client = review.executor.client
         if not client.configured:
             return web.json_response(
                 {"connected": False, "reason": "binance_keys_missing", "trades": []}
             )
         try:
-            limit = int(request.query.get("limit", 200))
+            limit = max(1, min(200, int(request.query.get("limit", 200))))
         except Exception:
             limit = 200
         try:
             trades = await client.user_trades(limit=limit)
+            # 逐笔成交沿用其所属委托的来源, 避免同一笔单出现两个口径。
+            try:
+                parents = annotate_orders(
+                    await client.all_orders(limit=limit),
+                    strategy_order_ids=load_strategy_order_ids(),
+                )
+            except Exception:  # noqa: BLE001
+                parents = []
+            trades = annotate_trades(
+                trades, parents, strategy_order_ids=load_strategy_order_ids()
+            )
+            counts = summarize(trades)
             return web.json_response({
                 "connected": True,
                 "trades": trades,
+                "scope": "recent_7d", "limit": limit,
+                "truncated": len(trades) >= limit,
+                "source_counts": counts,
+                "source_labels": SOURCE_LABELS,
             })
         except Exception as exc:
             return web.json_response({
@@ -862,11 +909,8 @@ def create_app(
     async def api_account_summary(_request):
         """账户汇总: 余额 + 已实现/未实现盈亏 + 手续费 + 胜率与盈亏比.
 
-        ⚠ 同时返回**两套口径**, 因为页面上历史成交表是全量的:
-          * 顶层字段   = 自 STATS_START_DATE 起算 (用户指定的「赚了多少」口径)
-          * all_time  = 该账户的全部历史
-        只给一套会让页面自相矛盾 —— 历史成交表净亏 31.53, 而「赚了多少」说
-        净亏 1.97, 用户会以为哪边算错了。两套都摆出来才对得上。
+        顶层是最近七天内且在起算日之后；available_history 是最近七天最多200笔。
+        不能将默认近七天窗口伪称「全部历史」或「累计收益」。
         """
         client = review.executor.client
         if not client.configured:
@@ -879,8 +923,9 @@ def create_app(
             all_trades = []
             try:
                 all_trades = await client.user_trades(limit=200)
-            except Exception:
-                all_trades = []
+            except Exception as exc:
+                return web.json_response({"connected": False,
+                                          "reason": f"成交查询失败: {type(exc).__name__}: {exc}"})
 
             def bucket(rows):
                 pnls = [float(t.get("realizedPnl", 0) or 0) for t in rows]
@@ -912,6 +957,8 @@ def create_app(
             return web.json_response({
                 "connected": True,
                 "stats_start": STATS_START_DATE,
+                "scope": "recent_7d", "history_limit": 200,
+                "truncated": len(all_trades) >= 200,
                 "wallet_balance": float(
                     getattr(bal, "total_wallet_balance", 0) or 0
                 ),
@@ -921,8 +968,8 @@ def create_app(
                 "unrealized_pnl": float(getattr(pos, "unrealized_pnl", 0) or 0),
                 # 起算日口径（用户指定的「赚了多少」）
                 **scoped,
-                # 全部历史口径 —— 与页面上全量的历史成交表对齐
-                "all_time": every,
+                # 与最近七天、最多200笔的表格对齐，不提供假「全历史」。
+                "available_history": every,
                 "position": {
                     "side": str(getattr(pos, "side", "FLAT") or "FLAT"),
                     "quantity": float(getattr(pos, "quantity", 0) or 0),
