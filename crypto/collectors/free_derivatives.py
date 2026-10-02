@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover
 from config.mapping import (
     BINANCE_FUTURES_REST,
     BINANCE_FUTURES_WS,
+    BINANCE_SENTIMENT_REST,
     BINANCE_SYMBOL,
     BLACK_SWAN_LIQ_5M_USD,
     COINGLASS_POLL_INTERVAL_SEC,
@@ -220,6 +221,7 @@ class FreeDerivativesCollector:
         symbol: str = BINANCE_SYMBOL,
         rest_base: str = BINANCE_FUTURES_REST,
         ws_base: str = BINANCE_FUTURES_WS,
+        sentiment_base: str = BINANCE_SENTIMENT_REST,
         poll_interval: float = COINGLASS_POLL_INTERVAL_SEC,
         session: Optional[Any] = None,
     ) -> None:
@@ -227,6 +229,8 @@ class FreeDerivativesCollector:
         self.symbol_lower = self.symbol.lower()
         self.rest_base = rest_base.rstrip("/")
         self.ws_base = ws_base
+        # `/futures/data/*` 只有主网提供（测试网 301）; 与交易市场无关, 恒为主网。
+        self.sentiment_base = sentiment_base.rstrip("/")
         self.poll_interval = poll_interval
         self._external_session = session
         self._session: Optional[Any] = None
@@ -298,11 +302,11 @@ class FreeDerivativesCollector:
         price = mark_price or self._mark_price
         bn_hist, bn_lsr, bybit, okx = await asyncio.gather(
             self._get_json(
-                f"{self.rest_base}/futures/data/openInterestHist",
+                f"{self.sentiment_base}/futures/data/openInterestHist",
                 {"symbol": self.symbol, "period": "5m", "limit": 300},
             ),
             self._get_json(
-                f"{self.rest_base}/futures/data/globalLongShortAccountRatio",
+                f"{self.sentiment_base}/futures/data/globalLongShortAccountRatio",
                 {"symbol": self.symbol, "period": "5m", "limit": 12},
             ),
             self._get_json(

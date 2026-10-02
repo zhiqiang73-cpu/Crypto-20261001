@@ -594,3 +594,97 @@ KDJ 极值反转，金叉且 K<30 做多 / 死叉且 K>70 做空，反手出场�
 ### 备份
 远端 `backup/main` 经核实已包含上一轮「删除 kdj_rsi_reversal_v1」提交
 （`1d59ecf`），此前记录的推送失败实为误判。
+
+---
+
+## 2026-10-02（第三次）· 市场错位事故修复 ★ 严重
+
+### 事故：行情腿走主网，下单腿走测试网
+
+用户发现并定位：**bot 用主网的 K 线算 KDJ，却在测试网下单。**
+
+```
+shadow/deploy.py:29  from shadow.live import fetch
+shadow/live.py:33    BASE = "https://fapi.binance.com/fapi/v1/klines"   ← 主网
+trading/binance_client.py:3  下单默认 https://testnet.binancefuture.com ← 测试网
+```
+
+两条腿踩在两个市场上，价格序列不同。用户用两条序列分别重算 bot 记录的 K/D：
+12 根全部对主网命中（误差 0.00），对测试网平均差 29.73 点、最大 276.70 点。
+
+### 代价（已核实）
+
+信号比测试网真实信号**晚 2 根 K 线（30 分钟）**。那一笔空单实际成交 84,776.70：
+
+| 进场依据 | 进场价 | 毛盈亏 | 手续费 | 净 |
+| --- | --- | --- | --- | --- |
+| 按测试网信号（应为） | 84,843.2 | +103.5 点 | — | 正 |
+| 按主网信号（实际） | 84,776.70 | +37.0 点 | 84.8 点 | **−2.24 USDT** |
+
+晚的 30 分钟吃掉了约 1.8 倍毛利。出场同样错位：主网 06:00 那根 K 28.95 触发金叉，
+测试网同根 K 36.04 根本没触发。
+
+### 根因
+
+不是策略问题，是**行情地址和账户地址各有各的来源**，没有任何机制保证两者一致。
+
+### 修复
+
+**1. 新增 `config/market_endpoints.py` —— 行情地址的唯一来源**
+
+刻意做成**由账户地址反推**（`source=account_base_url`）：账户在哪，行情就在哪，
+两者不可能再分叉。仅当账户地址缺失时才退回按 `TRADING_MODE` 推断，并在
+`source` 里标注退化原因。
+
+实测确认的地址表：
+
+| 市场 | REST | WS |
+| --- | --- | --- |
+| 主网 | `https://fapi.binance.com` | `wss://fstream.binance.com` |
+| 测试网 | `https://testnet.binancefuture.com` | `wss://fstream.binancefuture.com` |
+
+> `demo-fapi.binance.com` 与 legacy 测试网返回**完全相同**的 K 线，是同一市场。
+> ⚠️ `wss://stream.binancefuture.com` 实测是**另一个市场**，已列入 `FORBIDDEN_HOSTS`。
+
+**2. 一致性硬闸门**
+
+`assert_market_consistency()` 在下单链路启动前校验行情腿与下单腿同市场，
+不一致直接**拒绝启动**。`shadow/deploy.py` 启动时打印双腿地址横幅。
+
+**3. 所有硬编码地址改为跟随账户**
+
+- `shadow/live.py`：K 线基准由解析器给出
+- `config/mapping.py`：采集层 WS/REST 跟随账户
+- `frontend/app.js`：WS 地址改为后端下发（`/api/market` 新增 `market_ws`），
+  拿不到地址就只重试，**绝不退回主网**
+
+**4. 外部情绪数据单独命名**
+
+`/futures/data/*`（多空比、持仓量历史）**只有主网提供**，测试网返回 301。
+它不是交易行情、不参与下单决策，因此新增 `SENTIMENT_REST` / `BINANCE_SENTIMENT_REST`
+单独命名，恒为主网是**有意的**，与事故性质不同。
+
+### 回归闸门（防止复发）
+
+新增 `tests/test_market_endpoints.py`（24 项），其中两条是结构性的：
+
+- `test_shadow_live_klines_follow_account_market` —— 实际生效的 K 线地址
+  必须与账户地址同市场。**这条失败即说明事故复发。**
+- `test_no_hardcoded_mainnet_market_data_in_source` —— 源码静态扫描，
+  `shadow/live.py` / `config/mapping.py` / `frontend/app.js` 不得再出现主网行情字面量
+
+### 数据清理
+
+被主网 K 线污染的日志已**归档而非删除**，移到
+`runtime/shadow/_archive_mainnet_klines_2026-10-02/`，附 README 说明为何不可用于复盘。
+交易记录本身是真实发生过的测试网成交，交易所侧可查，保留。
+
+### 验证结果
+
+- **全量回归 388 项全部通过**（原 364 + 新增 24）
+- 运行器启动横幅：`行情腿: 测试网 (testnet) K线基准=https://testnet.binancefuture.com`
+  / `下单腿: https://testnet.binancefuture.com` / `地址来源: account_base_url`
+- 同一根 01:45 K 线：主网算出 K=85.56 / D=79.97，**测试网算出 K=50.73 / D=49.99**，
+  收盘价 84863.80 与测试网一致
+- 后端 `/api/market` 返回 `market=testnet`、`market_ws=wss://fstream.binancefuture.com/stream`
+- 后端采集器日志确认连的是测试网 WS，`free_deriv 202` 错误消失

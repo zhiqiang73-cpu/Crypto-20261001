@@ -29,6 +29,9 @@ from shadow.indicators import atr_wilder, boll, kdj
 from shadow.live import fetch
 from trading.binance_client import BinanceTestnetClient
 from trading.runtime_mode import current_mode, validate_exchange_target
+from config.market_endpoints import (MARKET_MAINNET, MarketMismatchError,
+                                     assert_market_consistency,
+                                     resolve_for_account)
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 OUT = os.path.join(ROOT, "runtime", "shadow")
@@ -218,10 +221,32 @@ async def main() -> int:
     if mode.value == "live":
         print("拒绝启动: TRADING_MODE=live 被安全闸门阻断"); return 1
     print(f"运行模式: {mode.value}")
+
+    # ---- 市场一致性闸门 ----------------------------------------------------
+    # 2026-10-02 事故的硬性防复发措施: 行情腿与下单腿必须同市场。
+    # 曾经 K 线写死主网、下单走测试网, 信号错位 2 根 K 线(30 分钟),
+    # 同一笔空单毛利从 +103.5 点掉到 +37.0 点。不一致就拒绝启动, 不做任何交易。
+    ep = resolve_for_account()
+    print(f"行情腿: {ep.label}   K线基准={ep.rest}   WS={ep.ws}")
+    print(f"下单腿: {client.base_url}")
+    print(f"地址来源: {ep.source}")
+    try:
+        assert_market_consistency(client.base_url, ep.rest)
+        assert_market_consistency(client.base_url, ep.ws)
+    except MarketMismatchError as exc:
+        print(f"[拒绝启动] {exc}")
+        return 1
+    if ep.market == MARKET_MAINNET:
+        print("[拒绝启动] 行情腿指向主网, 但本框架只允许测试网验证")
+        return 1
+
     await client.sync_time()
-    print(f"已连接 Testnet | 模式={'真实下单' if args.execute else '仅观察'}")
+    print(f"已连接 {ep.label} | 模式={'真实下单' if args.execute else '仅观察'}")
 
     st = load_state()
+    st["market"] = ep.market
+    st["market_rest"] = ep.rest
+    save_state(st)
     try:
         while True:
             try:
