@@ -1,0 +1,50 @@
+{
+  "strategy_id": "deployed_kdj_eth_extreme_v1",
+  "runtime_key": "eth15",
+  "name": "KDJ 交叉反手 (ETHUSDT 15m)",
+  "kind": "mean_reversion",
+  "timeframe": "15m",
+  "risk_timeframe": "1h",
+  "symbol": "ETHUSDT",
+  "market": "Binance USDⓈ-M 永续",
+  "side": "both",
+  "entry": {
+    "golden_cross": "K[t-1] <= D[t-1] and K[t] > D[t]",
+    "dead_cross": "K[t-1] >= D[t-1] and K[t] < D[t]",
+    "long": "金叉做多（无 K 数值阈值）",
+    "short": "死叉做空（无 K 数值阈值）",
+    "execution": "t 收盘判定, 与同标的 5m 策略合成净仓后限价追价"
+  },
+  "exit": {
+    "mode_a": "对侧交叉 → 平旧仓，交易所确认归零后再开新方向"
+  },
+  "indicators": {
+    "KDJ": "(9,3,3) 15m",
+    "ATR": "(14) 1h Wilder，用于仓位",
+    "BOLL": "(20,2) 15m —— 仅记录"
+  },
+  "position_sizing": {
+    "formula": "qty = 权益_USDT × r ÷ (k × ATR_1H)",
+    "r": 0.03,
+    "k": 2,
+    "step": 0.001,
+    "note": "与 5m 策略各记各的仓，ETHUSDT 只下净额；不与 BTC 混仓"
+  },
+  "risk": {
+    "leverage": 10,
+    "margin": "isolated",
+    "max_concurrent": 1,
+    "daily_loss_stop": 0.03,
+    "max_drawdown_stop": 0.10,
+    "disaster_stop": "ETHUSDT 净仓浮亏 ≥ 3 × ATR_1H → 清掉 ETH 两条虚拟仓并同步净仓"
+  },
+  "execution_style": {
+    "order_type": "LIMIT_GTX_POST_ONLY_THEN_LIMIT_CROSS",
+    "tag": "e15",
+    "description": "GTX 被动限价挂单争取 maker；超时穿盘口限价兜底，可能为 taker"
+  },
+  "status": "testnet_ready_manual_activation",
+  "enabled": true,
+  "source": "user_spec",
+  "note": "2026-10-02 第三条策略。ETH 15m 与 BTC 15m 同一套交叉规则。冷启动不追溯旧 K 线。"
+}

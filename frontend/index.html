@@ -4,26 +4,36 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BTC Quant Console</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/styles.css?v=10" />
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand"><span class="brand-mark">BQ</span><div><strong>BTC Quant</strong><small>TRADING OS</small></div></div>
-      <div class="mode-pill"><span class="dot amber"></span><div><b id="modeLabel">PAPER MODE</b><small>主网交易已锁定</small></div></div>
+      <div class="brand"><span class="brand-mark">B<span>·</span>Q</span><div><strong>BTC Quant</strong><small>LOCAL TRADING DESK</small></div></div>
+      <div class="mode-pill"><span class="dot amber"></span><div><b id="modeLabel">TESTNET · READ ONLY</b><small>主网交易锁定 / 模拟账户</small></div></div>
       <nav class="nav">
         <button class="nav-item active" data-view="trading"><span>01</span>交易总览</button>
         <button class="nav-item" data-view="account"><span>02</span>账户连接</button>
       </nav>
+      <section class="sidebar-strategies" aria-label="已配置策略">
+        <div class="sidebar-section-head">
+          <div><p>CONFIGURED</p><h2>已配置策略</h2></div>
+          <span class="sidebar-count" id="sidebarStrategyCount">—</span>
+        </div>
+        <div class="sidebar-strategy-list" id="sidebarStrategyList">
+          <div class="sidebar-strategy-loading">正在读取策略…</div>
+        </div>
+        <p class="sidebar-strategy-note">名称、启用状态和入场规则以本机策略配置为准。</p>
+      </section>
       <div class="sidebar-bottom">
         <div class="server-state"><span class="dot green"></span><div><b>LOCAL ENGINE</b><small id="engineState">等待连接</small></div></div>
-        <small class="build">BUILD 0.2.0 · BTCUSDT</small>
+        <small class="build">BTCUSDT + ETHUSDT / USDⓈ-M<br>Local system · v0.4</small>
       </div>
     </aside>
 
     <main class="main">
       <header class="topbar">
-        <div><p class="eyebrow">SYSTEM / BTCUSDT PERPETUAL</p><h1 id="pageTitle">交易总览</h1></div>
+        <div><p class="eyebrow">WORKSPACE / BINANCE TESTNET <span class="header-divider">/</span> BTCUSDT + ETHUSDT</p><h1 id="pageTitle">交易总览<span class="title-period">.</span></h1><p class="page-intro">账户、信号与委托分开展示。每笔记录以交易所订单号核对。</p></div>
         <div class="top-actions">
           <span class="sync"><span class="dot green"></span><span id="syncText">数据同步中</span></span>
           <button class="ghost-btn" id="refreshBtn">刷新数据 <kbd>R</kbd></button>
@@ -32,6 +42,7 @@
 
       <!-- ================= 第 1 页 · 交易总览 ================= -->
       <section class="view active" id="view-trading">
+        <div class="notice-bar"><span class="notice-icon">i</span><div><strong>数据口径</strong><span>钱包余额和持仓为交易所实时状态；委托与逐笔成交默认查最近 7 天、各最多 200 条。逐笔成交不等于完整平仓笔数。</span></div><span id="runnerState" class="notice-status">检查运行器…</span></div>
 
         <div class="hero-grid">
           <article class="hero-card">
@@ -50,19 +61,24 @@
             <div class="metric-foot">USDT <span id="posHint">无持仓</span></div>
           </article>
           <article class="metric-card accent-card">
-            <div class="card-kicker">REALIZED PNL</div>
+            <div class="card-kicker">REALIZED PNL · WINDOW</div>
             <div class="metric-value" id="mReal">—</div>
             <div class="metric-foot">USDT <span id="realHint">币安 userTrades</span></div>
           </article>
         </div>
 
+        <div class="table-panel pos-panel">
+          <div class="panel-head">
+            <div><p class="eyebrow">POSITION / BINANCE NET + LOTS</p><h2>当前仓位</h2><p class="subline">每个标的各自一行策略仓，各自一行币安净仓。BTC 和 ETH 不混加。</p></div>
+            <span class="tag" id="posSideTag">FLAT</span>
+          </div>
+          <div class="table-head cols-pos"><span>标的</span><span>来源</span><span>方向</span><span>数量</span><span>开仓价</span><span>时间</span><span>原因</span><span>浮盈</span></div>
+          <div class="table-body" id="posBox">
+            <div class="empty-state"><span>○</span><div><b>空仓</b><small>当前无持仓</small></div></div>
+          </div>
+        </div>
+
         <div class="lower-grid">
-          <article class="panel">
-            <div class="panel-head"><div><p class="eyebrow">POSITION</p><h2>当前仓位</h2></div><span class="tag" id="posSideTag">FLAT</span></div>
-            <div class="kv-list" id="posBox">
-              <div class="empty-state"><span>○</span><div><b>空仓</b><small>当前无持仓</small></div></div>
-            </div>
-          </article>
           <article class="panel">
             <div class="panel-head"><div><p class="eyebrow">OPEN ORDERS</p><h2>当前委托</h2></div><span class="tag" id="openOrdersCount">0</span></div>
             <div class="kv-list" id="openOrdersBox">
@@ -71,50 +87,49 @@
           </article>
         </div>
 
-        <div class="section-head">
-          <div><p class="eyebrow">ACTIVE STRATEGY</p><h2>当前运行的策略</h2><p class="subline">显示实际执行中的规则。为后续多策略并列预留。</p></div>
-        </div>
-        <div class="strategy-grid" id="strategyList">
-          <div class="empty-state"><span>○</span><div><b>加载中…</b></div></div>
-        </div>
-
         <div class="table-panel">
           <div class="panel-head">
-            <div><p class="eyebrow">BOT READING · VERIFY HERE</p><h2>策略当前读数</h2><p class="subline">这是 bot 真正使用的那条行情序列算出来的值。核对信号请以此为准，不要拿交易所图表比对 —— 图表可能显示的是另一个市场。</p></div>
+            <div><p class="eyebrow">SIGNAL AUDIT / LAST CLOSED BAR</p><h2>最近一根信号读数</h2><p class="subline">上 BTC、下 ETH；左 15m、右 5m。橙线是 K，灰线是 D。5m 虚线是 30 / 70。只看已收盘的测试网 K 线。</p></div>
             <span class="tag" id="readingMarketTag">—</span>
           </div>
-          <div class="kv-list cols-4" id="readingBox">
+          <div class="reading-board" id="readingBox">
             <div class="empty-state"><span>○</span><div><b>等待运行器写入…</b></div></div>
           </div>
         </div>
 
         <div class="section-head">
-          <div><p class="eyebrow">PERFORMANCE</p><h2>赚了多少</h2><p class="subline">逐笔已实现盈亏与手续费全部取自币安成交记录。统计自 <b id="statsStart">—</b> 起算。</p></div>
+          <div><p class="eyebrow">ACCOUNT PNL / API WINDOW</p><h2>账户盈亏核对</h2><p class="subline">交易所账户所有来源的逐笔成交（包括限价功能测试），不是 KDJ 策略绩效。最近 7 天内，自 <b id="statsStart">—</b> 起算；最多 200 笔。</p></div>
         </div>
         <div class="hero-grid four">
-          <article class="metric-card"><div class="card-kicker">TRADES</div><div class="metric-value" id="pCount">—</div><div class="metric-foot" id="pCountHint">已平仓笔数</div></article>
-          <article class="metric-card"><div class="card-kicker">WIN / LOSS</div><div class="metric-value" id="pWinLoss">—</div><div class="metric-foot">胜 / 负</div></article>
-          <article class="metric-card"><div class="card-kicker">WIN RATE</div><div class="metric-value" id="pWinRate">—</div><div class="metric-foot">胜率</div></article>
+          <article class="metric-card"><div class="card-kicker">PNL EVENTS</div><div class="metric-value" id="pCount">—</div><div class="metric-foot" id="pCountHint">非零盈亏成交数</div></article>
+          <article class="metric-card"><div class="card-kicker">POSITIVE / NEGATIVE</div><div class="metric-value" id="pWinLoss">—</div><div class="metric-foot">正 / 负盈亏成交笔数</div></article>
+          <article class="metric-card"><div class="card-kicker">POSITIVE RATE</div><div class="metric-value" id="pWinRate">—</div><div class="metric-foot">非零盈亏成交占比</div></article>
           <article class="metric-card"><div class="card-kicker">PROFIT FACTOR</div><div class="metric-value" id="pPF">—</div><div class="metric-foot">盈亏比（总盈利 / 总亏损）</div></article>
         </div>
-        <p class="subline" id="perfNote">上面四格是<b>起算口径</b>（自 <b id="statsStart2">—</b> 起）：累计手续费 <b id="pFee">—</b> USDT</p>
-        <p class="subline" id="allTimeNote">全部历史对账：<b id="atCount">—</b> 笔成交 · 已实现 <b id="atReal">—</b> · 手续费 <b id="atFee">—</b> · 净 <b id="atNet">—</b> USDT —— 与下方「历史成交」表一致</p>
+        <p class="subline" id="perfNote">起算口径（自 <b id="statsStart2">—</b> 起且仅限最近 7 天）：手续费 <b id="pFee">—</b> USDT</p>
+        <p class="subline" id="allTimeNote">最近 7 天对账：<b id="atCount">—</b> 笔逐笔成交 · 已实现 <b id="atReal">—</b> · 手续费 <b id="atFee">—</b> · 净 <b id="atNet">—</b> USDT <span id="scopeWarning"></span></p>
 
         <div class="table-panel">
           <div class="panel-head">
-            <div><p class="eyebrow">ORDER HISTORY · BINANCE</p><h2>历史委托</h2><p class="subline">完整历史，直接读取币安委托记录（含已撤销）。</p></div>
-            <span class="tag" id="histOrdersTag">—</span>
+            <div><p class="eyebrow">ORDERS / BINANCE API</p><h2>历史委托 · 2026-10-02 策略成交</h2><p class="subline">只显示当天已成交的策略单，撤单不显示。盈亏按该委托下逐笔成交汇总：已实现 − 手续费。</p></div>
+            <div class="hist-tools" aria-label="历史委托显示条数">
+              <button type="button" class="hist-limit-btn is-on" data-limit="10">10</button>
+              <button type="button" class="hist-limit-btn" data-limit="20">20</button>
+            </div>
           </div>
-          <div class="table-head cols-7"><span>时间</span><span>方向</span><span>类型</span><span>价格</span><span>数量</span><span>已成交</span><span>状态</span></div>
+          <div class="table-head cols-o10"><span>时间 · UTC+8</span><span>标的</span><span>方向 / 类型</span><span>委托号</span><span>来源</span><span>委托 / 均价</span><span>委托量</span><span>成交量</span><span>盈亏</span><span>状态</span></div>
           <div class="table-body" id="histOrdersBox"></div>
         </div>
 
         <div class="table-panel">
           <div class="panel-head">
-            <div><p class="eyebrow">TRADE HISTORY · BINANCE</p><h2>历史成交</h2><p class="subline">完整历史，含逐笔已实现盈亏与手续费。</p></div>
-            <span class="tag" id="histTradesTag">—</span>
+            <div><p class="eyebrow">FILLS / BINANCE API</p><h2>历史成交 · 2026-10-02 策略成交</h2><p class="subline">按委托号合并当天策略成交，一笔委托一行。开仓腿已实现通常为 0；平仓腿才有已实现盈亏。</p></div>
+            <div class="hist-tools" aria-label="历史成交显示条数">
+              <button type="button" class="hist-limit-btn is-on" data-limit="10">10</button>
+              <button type="button" class="hist-limit-btn" data-limit="20">20</button>
+            </div>
           </div>
-          <div class="table-head cols-6"><span>时间</span><span>方向</span><span>价格</span><span>数量</span><span>已实现盈亏</span><span>手续费</span></div>
+          <div class="table-head cols-t9"><span>时间 · UTC+8</span><span>标的</span><span>订单号 / 成交ID</span><span>来源</span><span>方向 / 角色</span><span>价格 × 数量</span><span>已实现</span><span>手续费</span><span>盈亏</span></div>
           <div class="table-body" id="histTradesBox"></div>
         </div>
 
@@ -137,7 +152,7 @@
             <label>API Secret<input id="apiSecretInput" type="password" autocomplete="new-password" placeholder="粘贴 Testnet API Secret" required></label>
             <label>Base URL<input id="baseUrlInput" type="url" value="https://testnet.binancefuture.com" required></label>
             <button class="primary-btn" type="submit">保存并验证 Testnet 连接</button>
-            <button class="secondary-btn" type="button" id="testnetSmokeBtn">冒烟：0.001 BTC 限价追价入场后平仓</button>
+            <button class="secondary-btn" type="button" id="testnetSmokeBtn">非策略功能测试：0.001 BTC 入场后平仓（产生历史成交）</button>
             <button class="secondary-btn" type="button" id="testnetFlattenBtn">立即平掉当前 Testnet 仓位</button>
             <button class="secondary-btn" type="button" id="reconcileBtn">立即对账（修复陈旧阻塞）</button>
             <p class="form-note" id="accountResult">尚未提交密钥。请确认使用的是重新生成的 Testnet Key。</p>
@@ -155,6 +170,6 @@
       </section>
     </main>
   </div>
-  <script src="/app.js?v=10"></script>
+  <script src="/app.js?v=25"></script>
 </body>
 </html>

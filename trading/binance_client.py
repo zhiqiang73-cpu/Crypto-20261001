@@ -333,6 +333,31 @@ class BinanceTestnetClient:
         info.mark_price = mark
         return info
 
+    async def get_position_settings(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """读取 BTCUSDT 的交易所逐仓/杠杆设置（即使空仓也能返回真实设置）。
+
+        `get_position()` 在空仓时为了简洁返回默认 `leverage=1`，因此不能拿它
+        验证策略的「10x 逐仓」要求。本方法直接读取 positionRisk 的原始设置，
+        仅做 GET、没有任何账户修改副作用。
+        """
+        symbol = symbol or self.symbol
+        data = await self._request(
+            "GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True
+        )
+        for item in data or []:
+            if item.get("symbol") != symbol:
+                continue
+            isolated_raw = item.get("isolated", False)
+            isolated = (isolated_raw is True or str(isolated_raw).lower() == "true")
+            return {
+                "symbol": symbol,
+                "leverage": int(float(item.get("leverage") or 0)),
+                "isolated": isolated,
+                "margin_type": "ISOLATED" if isolated else "CROSSED",
+            }
+        return {"symbol": symbol, "leverage": 0, "isolated": False,
+                "margin_type": "UNKNOWN"}
+
     async def get_open_orders(self, symbol: Optional[str] = None) -> list:
         return await self._request(
             "GET",
@@ -962,6 +987,8 @@ class BinanceTestnetClient:
         mark_price: Optional[float] = None,
         max_steps: Optional[int] = None,
         window_sec: Optional[float] = None,
+        tag: str = "ps",
+        force_cross: bool = False,
     ) -> OrderResult:
         """被动限价挂单 (post-only) + 跟盘口重挂, 超时兜底.
 
@@ -983,6 +1010,14 @@ class BinanceTestnetClient:
 
         竞态处理: 每档撤单后必须复核订单状态 —— 撤单与成交可能同时发生,
         撤单返回 -2011 (订单不存在/已成交) 同样按成交复核, 避免漏记成交。
+
+        tag: clientOrderId 前缀, 用于事后区分下单来源 (见 review/order_sources.py)。
+            策略运行器用 "kdj", 面板冒烟测试用 "smk", 用户在面板主动平仓用 "usr"。
+            没有它, 账户里「策略单」和「功能测试单」就无法可靠分开 —— 2026-10-02
+            的 10:22 事故正是这样发生的。
+        force_cross: 仅限灾难止损。跳过 post-only 等待，直接提交带滑点上限的
+            穿盘口 LIMIT 单。仍然**不是 MARKET 单**；普通开仓、反手、用户平仓
+            一律保持 180 秒 post-only 追价逻辑。
         """
         symbol = symbol or self.symbol
         lot_step = await self._lot_step(symbol)
@@ -991,9 +1026,14 @@ class BinanceTestnetClient:
             return OrderResult(
                 ok=False, error=f"quantity too small: {quantity}", symbol=symbol
             )
+        # 追价会多次重挂，提示音只在本轮委托开始时响一次。
+        from utils.alert_sound import play_alert
+        play_alert("order")
         tick = await self.price_tick(symbol)
         is_long = side.upper() == "LONG"
-        deadline = time.time() + (window_sec or PASSIVE_WINDOW_SEC)
+        deadline = time.time() if force_cross else time.time() + (
+            window_sec or PASSIVE_WINDOW_SEC
+        )
         attempts: List[Dict[str, Any]] = []
         pad = 0
 
@@ -1011,7 +1051,7 @@ class BinanceTestnetClient:
             px = self._price_precision(px, tick)
 
             idx = len(attempts)
-            cid = _new_client_order_id(f"ps{idx}")
+            cid = _new_client_order_id(f"{tag}{idx}")
             res = await self.place_limit_order(
                 side,
                 qty,
@@ -1028,7 +1068,8 @@ class BinanceTestnetClient:
             if filled > 0:
                 attempts.append({"step": idx, "price": px, "filled": filled,
                                  "bid": bid, "ask": ask, "maker": True})
-                return self._with_passive_meta(res, attempts, maker=True)
+                return self._finish_passive(res, attempts, maker=True,
+                                            reduce_only=reduce_only)
 
             # 撤单后复核: 撤单与成交可能竞态
             final = await self.query_order(client_order_id=cid, symbol=symbol)
@@ -1036,8 +1077,9 @@ class BinanceTestnetClient:
             if final.state == OrderState.FILLED or final_filled > 0:
                 attempts.append({"step": idx, "price": px, "filled": final_filled,
                                  "bid": bid, "ask": ask, "maker": True})
-                return self._with_passive_meta(
-                    final.to_order_result(), attempts, maker=True
+                return self._finish_passive(
+                    final.to_order_result(), attempts, maker=True,
+                    reduce_only=reduce_only,
                 )
 
             if res.error and "POST_ONLY_REJECT" in res.error:
@@ -1070,29 +1112,41 @@ class BinanceTestnetClient:
             (ask + PASSIVE_CROSS_TICKS * tick) if is_long
             else (bid - PASSIVE_CROSS_TICKS * tick), tick
         )
-        cid = _new_client_order_id("cx")
+        cid = _new_client_order_id(f"{tag}x")
         res = await self.place_limit_order(
             side, qty, cross_px, symbol,
+            # IOC 仍然是 LIMIT：立即成交可成交部分，余量由交易所取消。
+            # 不留下 GTC 挂单，避免运行器认为失败后该单又延迟成交。
+            time_in_force="IOC",
             reduce_only=reduce_only, client_order_id=cid,
             fill_timeout_sec=10.0, poll_interval_sec=CHASE_POLL_INTERVAL,
             cancel_if_unfilled=False,
         )
         filled = float(res.cum_filled_qty or 0)
         if filled > 0:
+            res.ok = True  # IOC 余量取消不抹掉已经确认的部分成交。
             attempts.append({"step": len(attempts), "price": cross_px,
                              "filled": filled, "bid": bid, "ask": ask,
                              "maker": False, "cross": True})
-            return self._with_passive_meta(res, attempts, maker=False)
-        return OrderResult(
-            ok=False, symbol=symbol,
-            side="BUY" if is_long else "SELL", position_side=side.upper(),
-            quantity=0.0, requested_qty=quantity, submitted_qty=qty,
-            cum_filled_qty=0.0, avg_price=0.0,
-            status=OrderState.CANCELED.value, client_order_id=cid,
-            order_state=OrderState.CANCELED.value,
-            error=f"passive_exhausted: 被动 {len(attempts)} 次 + 兜底穿盘口仍未成交",
-            raw={"chase": {"attempts": attempts, "likely_maker": False}},
-        )
+            return self._finish_passive(res, attempts, maker=False,
+                                        reduce_only=reduce_only)
+        # 保留交易所实际订单状态/ID；网络未知不能伪称已经撤销。
+        res.error = (f"passive_exhausted: 被动 {len(attempts)} 次 + IOC限价兜底未确认成交; "
+                     f"{res.error or res.order_state}")
+        res.raw = {**(res.raw or {}),
+                   "chase": {"attempts": attempts, "likely_maker": False}}
+        return res
+
+    @staticmethod
+    def _finish_passive(
+        res: OrderResult, attempts: List[Dict[str, Any]], *, maker: bool,
+        reduce_only: bool,
+    ) -> OrderResult:
+        out = BinanceTestnetClient._with_passive_meta(res, attempts, maker=maker)
+        if (not reduce_only) and float(out.cum_filled_qty or 0) > 0:
+            from utils.alert_sound import play_alert
+            play_alert("open")
+        return out
 
     @staticmethod
     def _with_passive_meta(
