@@ -1,8 +1,8 @@
 {
   "strategy_id": "deployed_kdj_extreme_v1",
   "runtime_key": "kdj15",
-  "name": "KDJ×MACD 双指标闸门 (BTCUSDT 15m)",
-  "kind": "mean_reversion",
+  "name": "KDJ×MACD 趋势分层 (BTCUSDT 15m)",
+  "kind": "trend_following",
   "timeframe": "15m",
   "risk_timeframe": "1h",
   "symbol": "BTCUSDT",
@@ -11,15 +11,16 @@
   "entry": {
     "golden_cross": "K[t-1] <= D[t-1] and K[t] > D[t]",
     "dead_cross": "K[t-1] >= D[t-1] and K[t] < D[t]",
-    "long": "金叉且 MACD 能量柱为正（绿柱）才做多；下一根开盘下限价单",
-    "short": "死叉且 MACD 能量柱为负（红柱）才做空；下一根开盘下限价单",
+    "long": "金叉且 MACD 能量柱为正（绿柱）：空仓开多；已多则同向加一层；下一根开盘下限价单",
+    "short": "死叉且 MACD 能量柱为负（红柱）：空仓开空；已空则同向加一层；下一根开盘下限价单",
     "execution": "当根收盘同时判定交叉与能量柱方向，下一根开盘限价追价",
-    "divergence": "金叉遇红柱 / 死叉遇绿柱 → 方向背离，丢弃不操作：不开新仓、不平仓、不反手",
+    "divergence": "金叉遇红柱 / 死叉遇绿柱 → 方向背离，丢弃不操作：不开新仓、不加仓、不平仓、不反手",
     "loose_long": "已废弃：无极值过滤",
-    "loose_short": "已废弃：无极值过滤"
+    "loose_short": "已废弃：无极值过滤",
+    "same_side_add": "只对同向且通过 MACD 方向闸门的 KDJ 回调恢复交叉加仓；每次加一层，最多 3 层；达到上限后忽略同向信号"
   },
   "exit": {
-    "mode_a": "对侧交叉同样要过能量柱方向闸门，下一根开盘限价反手；背离的交叉不动仓",
+    "mode_a": "有效对侧交叉同样要过能量柱方向闸门：清空全部累计层，再以第 1 层反手；背离交叉不动仓",
     "mode_b": "对侧交叉平仓 (仅并行记录, 不执行)"
   },
   "indicators": {
@@ -33,15 +34,20 @@
     "r": 0.03,
     "k": 2,
     "step": 0.001,
-    "note": "按交易所最小变动单位向下取整; 不足最小名义金额则跳过"
+    "note": "按交易所最小变动单位向下取整; 不足最小名义金额则跳过",
+    "per_layer": "每层数量沿用 qty = 权益_USDT × r ÷ (k × ATR_1H)，向下取整",
+    "max_layers": 3,
+    "total_exposure_note": "同向最多 3 层；每层按现有 r=0.03 基准仓位计算，因此满层名义风险可达单层的 3 倍，必须先完成样本外与成本压力验证"
   },
   "risk": {
     "leverage": 10,
     "margin": "isolated",
     "max_concurrent": 1,
     "daily_loss_stop": 0.03,
-    "max_drawdown_stop": 0.10,
-    "disaster_stop": "浮亏 ≥ 3 × ATR_1H → 立即穿盘口 LIMIT reduceOnly 平仓（不是 MARKET，可能为 taker）"
+    "max_drawdown_stop": 0.1,
+    "disaster_stop": "浮亏 ≥ 3 × ATR_1H → 立即穿盘口 LIMIT reduceOnly 平仓（不是 MARKET，可能为 taker）",
+    "max_layers": 3,
+    "layer_limit": "仅限同一标的同一15m策略；有效反向统一清仓后重新从第1层计数"
   },
   "execution_style": {
     "order_type": "LIMIT_GTX_POST_ONLY_THEN_LIMIT_CROSS",
@@ -54,5 +60,5 @@
   "status": "testnet_ready_manual_activation",
   "enabled": true,
   "source": "user_spec",
-  "note": "2026-10-02：15m 原「价格突破上一根高低点」过滤已按用户指令替换为 MACD(12,26,9) 能量柱方向闸门。背离丢弃。下一根开盘下限价。r=0.03 未改。"
+  "note": "2026-10-03：候选版本改为双向趋势跟随 + MACD方向过滤 + KDJ回调恢复分层加仓 + 真正反向统一离场/反手。仅在隔离worktree实现和测试，未部署、未重启运行器。"
 }

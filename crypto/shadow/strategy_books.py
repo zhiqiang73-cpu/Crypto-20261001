@@ -29,6 +29,9 @@ class StrategySpec:
     confirm_next: bool = False
     require_break: bool = False
     require_macd: bool = False
+    # 同向有效交叉可分层加仓；1 表示沿用旧版「同向忽略」。
+    # 它是硬上限，不是优化参数，防止趋势震荡中无限叠加杠杆。
+    max_layers: int = 1
 
 
 SPEC_15M = StrategySpec(
@@ -40,13 +43,15 @@ SPEC_15M = StrategySpec(
     k_long_max=None,
     k_short_min=None,
     lookback=96,
-    signal_rule="当根收盘金叉且 MACD 能量柱为正 → 做多；死叉且能量柱为负 → 做空；"
-                "方向背离的交叉丢弃不操作；不使用 K 极值过滤",
+    signal_rule="当根收盘金叉且 MACD 能量柱为正 → 首层做多 / 已多则同向加一层；"
+                "死叉且 MACD 能量柱为负 → 首层做空 / 已空则同向加一层；"
+                "方向背离丢弃不操作；有效反向则清空全部层后反手；最多 3 层",
     cold_start=False,
     label="BTC 15m",
     confirm_next=False,
     require_break=False,
     require_macd=True,
+    max_layers=3,
 )
 SPEC_5M = StrategySpec(
     id="kdj5",
@@ -74,13 +79,15 @@ SPEC_ETH_15M = StrategySpec(
     k_long_max=None,
     k_short_min=None,
     lookback=96,
-    signal_rule="当根收盘金叉且 MACD 能量柱为正 → 做多；死叉且能量柱为负 → 做空；"
-                "方向背离的交叉丢弃不操作；不使用 K 极值过滤",
+    signal_rule="当根收盘金叉且 MACD 能量柱为正 → 首层做多 / 已多则同向加一层；"
+                "死叉且 MACD 能量柱为负 → 首层做空 / 已空则同向加一层；"
+                "方向背离丢弃不操作；有效反向则清空全部层后反手；最多 3 层",
     cold_start=True,
     label="ETH 15m",
     confirm_next=False,
     require_break=False,
     require_macd=True,
+    max_layers=3,
 )
 SPEC_ETH_5M = StrategySpec(
     id="eth5",
@@ -152,17 +159,47 @@ def migrate_state(st: Dict[str, Any]) -> Dict[str, Any]:
 CONTRA_5M_MULT = 0.5
 
 
+def entry_layers(entry: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """返回虚拟仓的逐层明细，并兼容旧版单层 ``entry`` 状态。
+
+    旧运行状态只有 ``side/qty/px``，没有 ``layers``。升级后把它视作第 1 层，
+    不重写历史状态；只有下一次有效同向信号才会落为显式分层结构。
+    """
+    if not isinstance(entry, dict):
+        return []
+    raw = entry.get("layers")
+    if isinstance(raw, list):
+        layers = [dict(x) for x in raw if isinstance(x, dict)]
+        if layers:
+            return layers
+    try:
+        return [dict(entry)] if float(entry.get("qty") or 0.0) > 0 else []
+    except (TypeError, ValueError):
+        return []
+
+
+def layer_count(entry: Optional[Dict[str, Any]]) -> int:
+    """当前虚拟仓层数（旧单层状态返回 1）。"""
+    return len(entry_layers(entry))
+
+
 def book_signed_qty(book: Dict[str, Any]) -> float:
+    """策略账本的带方向数量；显式分层时逐层求和。"""
     entry = book.get("entry") or {}
-    qty = float(entry.get("qty") or 0.0)
-    if qty <= 0:
-        return 0.0
-    side = entry.get("side")
-    if side in (1, "LONG", "long"):
-        return qty
-    if side in (-1, "SHORT", "short"):
-        return -qty
-    return 0.0
+    total = 0.0
+    for layer in entry_layers(entry):
+        try:
+            qty = float(layer.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0:
+            continue
+        side = layer.get("side")
+        if side in (1, "LONG", "long"):
+            total += qty
+        elif side in (-1, "SHORT", "short"):
+            total -= qty
+    return total
 
 
 def trend_side(st: Dict[str, Any], symbol: str) -> int:
@@ -238,6 +275,44 @@ def _entry_record(want: int, qty: float, px: float, atr: float, ms: int,
     return rec
 
 
+def _aggregate_layers(want: int, layers: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """将同向层合成旧调用方仍可识别的 ``entry`` 顶层视图。
+
+    顶层 ``qty`` 与 ``px`` 分别是总数量和数量加权均价，确保净仓同步、面板与
+    灾难止损继续使用正确的账户级数据；逐层细节完整保留在 ``layers``。
+    """
+    clean = [dict(layer) for layer in layers]
+    total_qty = sum(max(0.0, float(layer.get("qty") or 0.0)) for layer in clean)
+    if total_qty <= 0:
+        raise ValueError("分层仓位总数量必须大于 0")
+    weighted_px = sum(
+        max(0.0, float(layer.get("qty") or 0.0)) * float(layer.get("px") or 0.0)
+        for layer in clean
+    ) / total_qty
+    weighted_atr = sum(
+        max(0.0, float(layer.get("qty") or 0.0)) * float(layer.get("atr") or 0.0)
+        for layer in clean
+    ) / total_qty
+    # 最新层的信号解释作为顶层原因；所有历史原因仍在 layers 内可审计。
+    merged = dict(clean[-1])
+    merged.update({
+        "side": want,
+        "qty": total_qty,
+        "px": weighted_px,
+        "atr": weighted_atr,
+        "layers": clean,
+        "layer_count": len(clean),
+    })
+    return merged
+
+
+def _new_layer(want: int, qty: float, px: float, atr: float, ms: int,
+               meta: Optional[Dict[str, Any]], number: int) -> Dict[str, Any]:
+    layer = _entry_record(want, qty, px, atr, ms, meta)
+    layer["layer"] = number
+    return layer
+
+
 def apply_virtual_signal(
     book: Dict[str, Any],
     *,
@@ -249,32 +324,59 @@ def apply_virtual_signal(
     ms: int,
     block: bool,
     min_qty: float,
+    max_layers: int = 1,
     meta: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], str, bool]:
-    """只改虚拟账本，不下单。返回 (动作, 备注, 是否变化)。"""
+    """只改虚拟账本，不下单。返回 (动作, 备注, 是否变化)。
+
+    有效同向信号可新增一层，最多 ``max_layers`` 层；方向背离在本函数外已经
+    归零为无信号，因此不会加仓、平仓或反手。有效反向会先丢弃全部旧层，再以
+    一层新方向仓位重建账本。
+    """
     want = 1 if sig_long else (-1 if sig_short else 0)
     if want == 0:
         return None, "观察", False
+    max_layers = max(1, int(max_layers))
     entry = book.get("entry")
     if entry is None:
         if block:
             return None, "风控闸门: 不开新仓", False
         if qty < min_qty:
             return None, f"数量不足 qty={qty:.4f}", False
-        book["entry"] = _entry_record(want, qty, px, atr, ms, meta)
+        book["entry"] = _aggregate_layers(
+            want, [_new_layer(want, qty, px, atr, ms, meta, 1)]
+        )
         return ("开多" if want == 1 else "开空"), f"qty={qty:.4f}", True
 
-    cur = 1 if float(entry.get("side") or 0) > 0 else -1
+    current_layers = entry_layers(entry)
+    current_signed = book_signed_qty({"entry": entry})
+    cur = 1 if current_signed > 0 else -1
     if cur == want:
-        return None, "同向持仓", False
+        if block:
+            return None, "风控闸门: 不加仓", False
+        if len(current_layers) >= max_layers:
+            return None, f"同向信号; 已达最大分层 {max_layers}层，不加仓", False
+        if qty < min_qty:
+            return None, f"同向信号; 加仓数量不足 {qty:.4f}", False
+        number = len(current_layers) + 1
+        current_layers.append(_new_layer(want, qty, px, atr, ms, meta, number))
+        book["entry"] = _aggregate_layers(want, current_layers)
+        action = "加多" if want == 1 else "加空"
+        return action, (f"第{number}/{max_layers}层; 本层 {qty:.4f}; "
+                        f"累计 {book['entry']['qty']:.4f}"), True
+
+    cleared = max(1, len(current_layers))
     book["entry"] = None
+    close_action = "平仓" if max_layers == 1 else f"清仓{cleared}层"
     if block:
-        return "平仓", "平仓; 风控阻止反手开新仓", True
+        return close_action, f"{close_action}; 风控阻止反手开新仓", True
     if qty < min_qty:
-        return "平仓", f"平仓; 反手数量不足 {qty:.4f}", True
-    book["entry"] = _entry_record(want, qty, px, atr, ms, meta)
-    action = "平仓并开多" if want == 1 else "平仓并开空"
-    return action, f"平仓; 反手 {qty:.4f}", True
+        return close_action, f"{close_action}; 反手数量不足 {qty:.4f}", True
+    book["entry"] = _aggregate_layers(
+        want, [_new_layer(want, qty, px, atr, ms, meta, 1)]
+    )
+    action = f"{close_action}并开多" if want == 1 else f"{close_action}并开空"
+    return action, f"{close_action}; 反手第1/{max_layers}层 {qty:.4f}", True
 
 
 def runtime_view(st: Dict[str, Any], strategy_id: str,
@@ -290,6 +392,8 @@ def runtime_view(st: Dict[str, Any], strategy_id: str,
     return {
         "last_ts": book.get("last_ts"),
         "entry": book.get("entry"),
+        "layer_count": layer_count(book.get("entry")),
+        "max_layers": spec.max_layers if spec else 1,
         "missed_bars": int(book.get("missed_bars") or 0),
         "missed_signals": int(book.get("missed_signals") or 0),
         "armed": bool(book.get("armed")),
@@ -396,6 +500,8 @@ def position_sources(st: Dict[str, Any],
             "reason": reason,
             "k": None if k_val is None else float(k_val),
             "d": None if d_val is None else float(d_val),
+            "layer_count": layer_count(entry),
+            "max_layers": spec.max_layers,
             "signal_rule": spec.signal_rule,
         })
     return out

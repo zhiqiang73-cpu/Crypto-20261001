@@ -572,7 +572,7 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
     action, note, changed = apply_virtual_signal(
         book, sig_long=sig_long, sig_short=sig_short, qty=qty,
         px=px, atr=float(atr_al[i]), ms=int(ts[i]), block=block,
-        min_qty=MIN_QTY,
+        min_qty=MIN_QTY, max_layers=spec.max_layers,
         meta={
             "interval": spec.interval,
             "strategy_id": spec.id,

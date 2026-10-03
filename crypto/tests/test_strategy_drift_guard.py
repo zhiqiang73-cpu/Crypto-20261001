@@ -32,6 +32,9 @@ class TestStrategyDriftGuard(unittest.TestCase):
         self.assertEqual(signal["kdj"], [9, 3, 3])
         self.assertEqual(signal["macd"], [12, 26, 9])
         self.assertTrue(signal["all_runtime_require_macd"])
+        self.assertEqual(signal["runtime_max_layers"], {"kdj15": 3, "eth15": 3})
+        self.assertTrue(signal["all_runtime_pyramiding_enabled"])
+        self.assertTrue(signal["enabled_cards_pyramid_match_runtime"])
         self.assertTrue(signal["all_cards_macd_gate"])
         self.assertTrue(signal["no_enabled_card_k_extreme"])
 

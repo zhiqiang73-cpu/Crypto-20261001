@@ -116,6 +116,16 @@ def build_audit() -> Dict[str, Any]:
         "kdj": [9, 3, 3],
         "macd": [MACD_FAST, MACD_SLOW, MACD_SIGNAL],
         "all_runtime_require_macd": all(s.require_macd and s.k_long_max is None and s.k_short_min is None for s in SPECS),
+        "runtime_max_layers": {s.id: s.max_layers for s in SPECS},
+        "all_runtime_pyramiding_enabled": all(s.max_layers == 3 for s in SPECS),
+        "enabled_cards_pyramid_match_runtime": all(
+            int(card_by_runtime.get(s.id, {}).get("risk", {}).get("max_layers") or 0)
+            == s.max_layers
+            and int(card_by_runtime.get(s.id, {}).get("position_sizing", {}).get("max_layers") or 0)
+            == s.max_layers
+            and "同向" in str(card_by_runtime.get(s.id, {}).get("entry", {}).get("same_side_add") or "")
+            for s in SPECS
+        ),
         "schema_signal_matches_runtime": schema["signal"]["macd"] == [MACD_FAST, MACD_SLOW, MACD_SIGNAL],
         "all_cards_macd_gate": all("MACD" in str(c.get("entry", {})) for c in card_rows),
         "no_enabled_card_k_extreme": all(not (c.get("enabled") and ("K<30" in json.dumps(c, ensure_ascii=False) or "K>70" in json.dumps(c, ensure_ascii=False))) for c in card_rows),
@@ -148,7 +158,7 @@ def build_audit() -> Dict[str, Any]:
     }
     facts = {
         "active_runtime": [
-            {"runtime_key": s.id, "strategy_id": next((c.get("strategy_id") for c in card_rows if c.get("runtime_key") == s.id), None), "symbol": s.symbol, "timeframe": s.interval, "enabled_for_runtime": True, "signal_rule": s.signal_rule}
+            {"runtime_key": s.id, "strategy_id": next((c.get("strategy_id") for c in card_rows if c.get("runtime_key") == s.id), None), "symbol": s.symbol, "timeframe": s.interval, "enabled_for_runtime": True, "max_layers": s.max_layers, "signal_rule": s.signal_rule}
             for s in SPECS
         ],
         "research_only": [
@@ -161,6 +171,7 @@ def build_audit() -> Dict[str, Any]:
             {"canonical_field": "symbol", "card": "symbol", "runtime": "StrategySpec.symbol", "heartbeat": "symbols[]", "frontend": "position_sources[].symbol"},
             {"canonical_field": "timeframe", "card": "timeframe", "runtime": "StrategySpec.interval", "heartbeat": "(indirect via strategies)", "frontend": "reading.interval"},
             {"canonical_field": "signal_rule", "card": "entry.long/short + indicators", "runtime": "signal_rule/require_macd/k_*", "heartbeat": "not applicable", "frontend": "reading + strategy card"},
+            {"canonical_field": "max_layers", "card": "risk.max_layers + position_sizing.max_layers", "runtime": "StrategySpec.max_layers + apply_virtual_signal", "heartbeat": "not applicable", "frontend": "position_sources[].layer_count/max_layers"},
             {"canonical_field": "risk", "card": "position_sizing/risk", "runtime": "shadow.engine constants", "heartbeat": "not applicable", "frontend": "display only; never define"},
             {"canonical_field": "market", "card": "market", "runtime": "market_endpoints + reading", "heartbeat": "market", "frontend": "api/market/runner"},
         ],
@@ -182,12 +193,13 @@ def build_audit() -> Dict[str, Any]:
         "checks": {"runtime": runtime_checks, "signal": signal_checks, "risk": risk_checks, "market": market_checks},
         "drift_scan": drift_scan,
         "verdict": "PASS" if all([
-            runtime_checks["runtime_is_two_15m"], runtime_checks["heartbeat_matches_runtime"], runtime_checks["state_books_match_runtime"], runtime_checks["five_minute_not_in_runtime_specs"], signal_checks["all_runtime_require_macd"], signal_checks["schema_signal_matches_runtime"], signal_checks["all_cards_macd_gate"], risk_checks["cards_uniform_risk"], market_checks["heartbeat_is_testnet"], market_checks["state_is_testnet"], market_checks["symbols_are_btc_eth"],
+            runtime_checks["runtime_is_two_15m"], runtime_checks["heartbeat_matches_runtime"], runtime_checks["state_books_match_runtime"], runtime_checks["five_minute_not_in_runtime_specs"], signal_checks["all_runtime_require_macd"], signal_checks["all_runtime_pyramiding_enabled"], signal_checks["enabled_cards_pyramid_match_runtime"], signal_checks["schema_signal_matches_runtime"], signal_checks["all_cards_macd_gate"], risk_checks["cards_uniform_risk"], market_checks["heartbeat_is_testnet"], market_checks["state_is_testnet"], market_checks["symbols_are_btc_eth"],
         ]) else "FAIL",
         "governance_findings": [
             {"severity": "RESOLVED", "finding": "旧对照报告曾把 5m K 阈值写成当前规则", "action": "已重写为 5m 研究保留、实盘停用；历史材料仍按背景处理"},
             {"severity": "RESOLVED", "finding": "前端曾包含 K<30/K>70 展示回退和固定日期", "action": "已改为消费快照/后端统计起点，不定义交易事实"},
             {"severity": "GUARD", "finding": "策略卡 runtime_key/启用状态必须与 shadow.SPECS、heartbeat、state 对齐", "action": "由本审计脚本和 tests/test_strategy_drift_guard.py 自动校验"},
+            {"severity": "GUARD", "finding": "同向加仓只能由有效KDJ+MACD同向信号触发，BTC/ETH 15m 均最多3层", "action": "代码、策略卡和前端层数标记必须由本审计与分层回归测试共同校验"},
             {"severity": "GUARD", "finding": "config/strategy_versions ACTIVE 是评分策略包，不是 KDJ 运行规格", "action": "报告分离 bundle 身份与 KDJ runtime 身份；禁止互相替代"},
         ],
         "allowed_legacy_mentions": [
@@ -221,7 +233,8 @@ def render_markdown(report: Dict[str, Any]) -> str:
         f"| 5m | 定义保留用于回测/研究；运行规格不含 5m，心跳不含 5m，实盘停用 |",
         f"| 心跳 | `{c['market']['heartbeat_market']}`，策略 `{', '.join(c['runtime']['heartbeat_strategies'])}`，15 秒 |",
         f"| 市场 | BTCUSDT、ETHUSDT；REST `{c['market']['state_market_rest']}` |",
-        f"| 信号 | KDJ(9,3,3)；MACD({','.join(map(str, c['signal']['macd']))}) 柱正负闸门；K 极值不参与当前规格 |",
+        f"| 信号 | KDJ(9,3,3)；MACD({','.join(map(str, c['signal']['macd']))}) 柱正负闸门；同向有效交叉可加仓、有效反向清空累计层后反手；K 极值不参与当前规格 |",
+        f"| 分层 | BTC 15m / ETH 15m 最大层数 `{c['signal']['runtime_max_layers']}`；达到上限后忽略同向交叉；背离交叉不动仓 |",
         f"| 风险 | r={c['risk']['risk_r']}，k={c['risk']['atr_multiplier_k']}，杠杆={c['risk']['leverage']}x，日亏={c['risk']['daily_loss_limit']:.0%}，回撤={c['risk']['max_drawdown']:.0%}，灾难止损={c['risk']['disaster_atr']}×ATR |",
         "",
         "### 策略数量与字段映射",
