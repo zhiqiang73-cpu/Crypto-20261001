@@ -139,7 +139,10 @@ ACTIVE_VERSION_FILE = VERSIONS_DIR / "ACTIVE.json"
 
 PANEL_HOST = "127.0.0.1"            # 只监听本机, 不对外网暴露
 PANEL_PORT = 8787
-PANEL_HTML = PROJECT_ROOT / "btc-four-face-monitor.html"
+# 面板直接服务 frontend/ 新版控制台，与 /api/* 同源，不再存在两套前端。
+# 旧的 btc-four-face-monitor.html（四面监控台）已停止服务，仅作历史文件保留。
+PANEL_STATIC_DIR = PROJECT_ROOT / "frontend"
+PANEL_HTML = PANEL_STATIC_DIR / "index.html"
 
 # ---------------------------------------------------------------------------
 # 七、自我递归改进 · 收敛控制 (元评审)

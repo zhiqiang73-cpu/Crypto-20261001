@@ -3,21 +3,21 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>BTC Quant Console</title>
-  <link rel="stylesheet" href="/styles.css?v=16" />
+  <title>BTC 量化控制台</title>
+  <link rel="stylesheet" href="/styles.css?v=19" />
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand"><span class="brand-mark">B<span>·</span>Q</span><div><strong>BTC Quant</strong><small>LOCAL TRADING DESK</small></div></div>
-      <div class="mode-pill"><span class="dot amber"></span><div><b id="modeLabel">TESTNET · READ ONLY</b><small>主网交易锁定 / 模拟账户</small></div></div>
+      <div class="brand"><span class="brand-mark">B<span>·</span>Q</span><div><strong>BTC 量化</strong><small>本机交易终端</small></div></div>
+      <div class="mode-pill"><span class="dot amber"></span><div><b id="modeLabel">测试网 · 只读</b><small>主网交易锁定 / 模拟账户</small></div></div>
       <nav class="nav">
         <button class="nav-item active" data-view="trading"><span>01</span>交易总览</button>
         <button class="nav-item" data-view="account"><span>02</span>账户连接</button>
       </nav>
       <section class="sidebar-strategies" aria-label="已配置策略">
         <div class="sidebar-section-head">
-          <div><p>CONFIGURED</p><h2>已配置策略</h2></div>
+          <div><p>策略配置</p><h2>已配置策略</h2></div>
           <span class="sidebar-count" id="sidebarStrategyCount">—</span>
         </div>
         <div class="sidebar-strategy-list" id="sidebarStrategyList">
@@ -26,23 +26,28 @@
         <p class="sidebar-strategy-note">名称、启用状态和入场规则以本机策略配置为准。</p>
       </section>
       <div class="sidebar-bottom">
-        <div class="server-state"><span class="dot green"></span><div><b>LOCAL ENGINE</b><small id="engineState">等待连接</small></div></div>
-        <small class="build">BTCUSDT + ETHUSDT / USDⓈ-M<br>Local system · v0.4</small>
+        <div class="server-state"><span class="dot green"></span><div><b>本机引擎</b><small id="engineState">等待连接</small></div></div>
+        <small class="build">BTCUSDT + ETHUSDT / USDⓈ-M<br>本机系统 · v0.4</small>
       </div>
     </aside>
 
     <main class="main">
       <header class="topbar">
-        <div><p class="eyebrow">WORKSPACE / BINANCE TESTNET <span class="header-divider">/</span> BTCUSDT + ETHUSDT</p><h1 id="pageTitle">交易总览<span class="title-period">.</span></h1><p class="page-intro">账户、信号与委托分开展示。每笔记录以交易所订单号核对。</p></div>
+        <div><p class="eyebrow">工作台 / 币安测试网 <span class="header-divider">/</span> BTCUSDT + ETHUSDT</p><h1 id="pageTitle">交易总览<span class="title-period">.</span></h1><p class="page-intro">账户、信号与委托分开展示。每笔记录以交易所订单号核对。</p></div>
         <div class="top-actions">
-          <span class="sync"><span class="dot green"></span><span id="syncText">数据同步中</span></span>
+          <span class="sync">
+            <span class="dot green"></span>
+            <span id="syncText">数据同步中</span>
+            <span class="sync-sep">·</span>
+            <span id="liveStamp">正在取数…</span>
+          </span>
           <button class="ghost-btn" id="refreshBtn">刷新数据 <kbd>R</kbd></button>
         </div>
       </header>
 
       <!-- ================= 第 1 页 · 交易总览 ================= -->
       <section class="view active" id="view-trading">
-        <div class="notice-bar"><span class="notice-icon">i</span><div><strong>数据口径</strong><span>钱包余额和持仓为交易所实时状态；委托与逐笔成交默认查最近 7 天、各最多 200 条。逐笔成交不等于完整平仓笔数。</span></div><span id="runnerState" class="notice-status">检查运行器…</span></div>
+        <div class="notice-bar"><span class="notice-icon">i</span><div><strong>数据口径</strong><span>钱包余额、持仓与挂单为交易所实时状态；委托与逐笔成交只显示「记录起点」之后的记录（各最多 200 条），起点之前的历史已清零。逐笔成交不等于完整平仓笔数。</span></div><span id="runnerState" class="notice-status">检查运行器…</span></div>
 
         <div class="notice-bar is-alert" id="externalBar" hidden>
           <span class="notice-icon">!</span>
@@ -55,17 +60,17 @@
 
         <div class="hero-grid">
           <article class="hero-card">
-            <div class="card-kicker">BINANCE MARK PRICE <span>· WS 1s</span></div>
+            <div class="card-kicker">币安标记价格 <span>· 实时推送</span></div>
             <div class="hero-price" id="markPrice">连接中…</div>
-            <div class="price-change positive" id="priceChange">等待 Binance WebSocket <span>公开行情</span></div>
+            <div class="price-change positive" id="priceChange">等待币安行情推送 <span>公开行情</span></div>
           </article>
           <article class="metric-card">
-            <div class="card-kicker">WALLET BALANCE</div>
+            <div class="card-kicker">钱包余额</div>
             <div class="metric-value" id="mWallet">—</div>
             <div class="metric-foot">USDT <span>币安账户</span></div>
           </article>
           <article class="metric-card">
-            <div class="card-kicker">UNREALIZED PNL</div>
+            <div class="card-kicker">未实现盈亏</div>
             <div class="sym-pnl-list">
               <div class="sym-pnl-row"><span class="sym-chip">BTC</span><b class="sym-pnl-value" id="mUnrealBTC">—</b></div>
               <div class="sym-pnl-row"><span class="sym-chip">ETH</span><b class="sym-pnl-value" id="mUnrealETH">—</b></div>
@@ -73,22 +78,126 @@
             <div class="metric-foot">USDT · 分标的 <span id="posHint">无持仓</span></div>
           </article>
           <article class="metric-card accent-card">
-            <div class="card-kicker">REALIZED PNL · WINDOW</div>
+            <div class="card-kicker">已实现盈亏 · 查询窗口</div>
             <div class="sym-pnl-list">
               <div class="sym-pnl-row"><span class="sym-chip">BTC</span><b class="sym-pnl-value" id="mRealBTC">—</b></div>
               <div class="sym-pnl-row"><span class="sym-chip">ETH</span><b class="sym-pnl-value" id="mRealETH">—</b></div>
             </div>
-            <div class="metric-foot">USDT · 净盈亏 <span id="realHint">币安 userTrades</span></div>
+            <div class="metric-foot">USDT · 净盈亏 <span id="realHint">币安逐笔成交</span></div>
           </article>
         </div>
 
+        <section class="quality-section" aria-label="核心指标看板">
+          <div class="section-head quality-head">
+            <div>
+              <p class="eyebrow">表现 · 风险 · 成本</p>
+              <h2>核心指标看板</h2>
+              <p class="subline">六项指标各自独立口径：净盈亏扣手续费且分标的；未实现单独列出；单笔边际按开仓名义金额、不依赖复利；回撤同时看账户权益与分组；胜率与盈亏比并列；交易成本逐项单列。</p>
+            </div>
+            <span class="tag" id="qualityWindow">窗口读取中</span>
+          </div>
+
+          <div class="metrics-grid">
+            <article class="metric-block">
+              <div class="card-kicker">① 已实现净盈亏 <span>· 扣手续费</span></div>
+              <b class="quality-value" id="qRealized">—</b>
+              <div class="metric-rows">
+                <div class="metric-row"><span class="sym-chip">BTC</span><b id="qRealBTC">—</b></div>
+                <div class="metric-row"><span class="sym-chip">ETH</span><b id="qRealETH">—</b></div>
+              </div>
+              <small>USDT · 已实现 − 手续费，分标的不混加</small>
+            </article>
+
+            <article class="metric-block">
+              <div class="card-kicker">② 未实现盈亏 <span>· 单独列出</span></div>
+              <b class="quality-value" id="qUnrealized">—</b>
+              <div class="metric-rows">
+                <div class="metric-row"><span class="sym-chip">BTC</span><b id="qUnrealBTC">—</b></div>
+                <div class="metric-row"><span class="sym-chip">ETH</span><b id="qUnrealETH">—</b></div>
+              </div>
+              <small>USDT · 当前持仓浮动（分标的合计），不与已实现混合</small>
+            </article>
+
+            <article class="metric-block">
+              <div class="card-kicker">③ 单笔边际 <span>· 开仓名义口径</span></div>
+              <b class="quality-value" id="qEdge">—</b>
+              <div class="metric-rows">
+                <div class="metric-row"><span>开仓名义</span><b id="qOpenNotional">—</b></div>
+                <div class="metric-row"><span>窗口净额</span><b id="qNetForEdge">—</b></div>
+              </div>
+              <small id="qEdgeBasis">净额 ÷ 开仓腿名义 × 10000，不依赖复利</small>
+            </article>
+
+            <article class="metric-block">
+              <div class="card-kicker">④ 最大回撤 <span>· 账户 + 分组</span></div>
+              <b class="quality-value" id="qDrawdown">—</b>
+              <div class="metric-rows">
+                <div class="metric-row"><span class="sym-chip">BTC</span><b id="qDdBTC">—</b></div>
+                <div class="metric-row"><span class="sym-chip">ETH</span><b id="qDdETH">—</b></div>
+              </div>
+              <small id="qDrawdownBasis">账户权益回撤（%）＋分标的已实现回撤（USDT）</small>
+            </article>
+
+            <article class="metric-block">
+              <div class="card-kicker">⑤ 胜率与盈亏比 <span>· 不只看胜率</span></div>
+              <b class="quality-value" id="qWinRate">—</b>
+              <div class="metric-rows">
+                <div class="metric-row"><span>盈亏比</span><b id="qProfitFactor">—</b></div>
+                <div class="metric-row"><span>平均盈利 / 亏损</span><b id="qAvgWinLoss">—</b></div>
+                <div class="metric-row"><span>盈利 / 亏损笔数</span><b id="qWinLossCount">—</b></div>
+              </div>
+              <small>盈亏比 = 总盈利 ÷ 总亏损；胜率按带已实现盈亏的成交腿统计，必须与盈亏比同时看</small>
+            </article>
+
+            <article class="metric-block">
+              <div class="card-kicker">⑥ 交易成本 <span>· 逐项单列</span></div>
+              <b class="quality-value" id="qCostTotal">—</b>
+              <div class="metric-rows">
+                <div class="metric-row"><span>挂单手续费</span><b id="qFeeMaker">—</b></div>
+                <div class="metric-row"><span>吃单手续费</span><b id="qFeeTaker">—</b></div>
+                <div class="metric-row"><span>资金费</span><b id="qFeeFunding">—</b></div>
+                <div class="metric-row"><span>滑点估算</span><b id="qSlippage">—</b></div>
+              </div>
+              <small id="qCostBasis">USDT · 手续费取自逐笔成交，资金费与滑点口径见下</small>
+            </article>
+          </div>
+
+          <div class="table-panel sym-detail-panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">分标的拆分</p>
+                <h2>分标的明细</h2>
+                <p class="subline">BTC 与 ETH 各自一行，绝不混加；每行都可独立核对净盈亏、胜率、盈亏比、开仓名义与边际。</p>
+              </div>
+            </div>
+            <div class="table-head cols-sym">
+              <span>标的</span><span>净盈亏(USDT)</span><span>胜率</span><span>盈亏比</span>
+              <span>盈利/亏损笔</span><span>开仓名义(USDT)</span><span>单笔边际</span>
+              <span>已实现回撤(USDT)</span><span>挂单/吃单手续费</span>
+            </div>
+            <div class="table-body" id="symDetailBox">
+              <div class="empty-state"><span>○</span><div><b>等待账户数据</b><small>连接 Testnet 后按标的拆分</small></div></div>
+            </div>
+          </div>
+          <div class="quality-detail-grid">
+            <article class="panel quality-detail-panel">
+              <div class="panel-head"><div><p class="eyebrow">原因</p><h2>原因记录</h2></div><span class="tag" id="qStrategyMode">—</span></div>
+              <div class="quality-list" id="qualityReasons"><div class="empty-state"><span>○</span><div><b>等待汇总</b><small>读取运行记录中的信号与策略原因</small></div></div></div>
+            </article>
+            <article class="panel quality-detail-panel">
+              <div class="panel-head"><div><p class="eyebrow">下一步改进</p><h2>接下来怎么做</h2></div><span class="tag safe">只观察，不自动改策略</span></div>
+              <ol class="quality-actions" id="qualityActions"><li>等待质量快照</li></ol>
+            </article>
+          </div>
+        </section>
+
         <div class="table-panel pos-panel">
           <div class="panel-head">
-            <div><p class="eyebrow">POSITION / BINANCE NET + LOTS</p><h2>当前仓位</h2><p class="subline">数量与保证金用交易所口径（USDT），与币安网页端逐位对应；小字为对应的币数量。每个标的各自一行策略仓，各自一行币安净仓，BTC 和 ETH 不混加。</p></div>
+            <div><p class="eyebrow">持仓 / 币安净仓与策略腿</p><h2>当前仓位</h2><p class="subline">数量与保证金用交易所口径（USDT），与币安网页端逐位对应；小字为对应的币数量。所有时间为北京时间（UTC+8）：信号K线在收盘判定，下一根K线开盘才执行。每个标的各自一行策略仓，各自一行币安净仓，BTC 和 ETH 不混加。</p></div>
             <span class="tag" id="posMarginTag">保证金 —</span>
-            <span class="tag" id="posSideTag">FLAT</span>
+            <span class="tag" id="posSideTag">空仓</span>
           </div>
-          <div class="table-head cols-pos"><span>标的</span><span>来源</span><span>方向</span><span>数量(USDT)</span><span>保证金</span><span>开仓价</span><span>时间</span><span>原因</span><span>浮盈</span></div>
+          <div class="table-head cols-pos"><span>标的</span><span>来源</span><span>方向</span><span>数量(USDT)</span><span>保证金</span><span>开仓价</span><span>信号K线 · 北京时间</span><span>原因</span><span>浮盈</span></div>
           <div class="table-body" id="posBox">
             <div class="empty-state"><span>○</span><div><b>空仓</b><small>当前无持仓</small></div></div>
           </div>
@@ -96,7 +205,7 @@
 
         <div class="lower-grid">
           <article class="panel">
-            <div class="panel-head"><div><p class="eyebrow">OPEN ORDERS</p><h2>当前委托</h2></div><span class="tag" id="openOrdersCount">0</span></div>
+            <div class="panel-head"><div><p class="eyebrow">当前挂单</p><h2>当前委托</h2></div><span class="tag" id="openOrdersCount">0</span></div>
             <div class="kv-list" id="openOrdersBox">
               <div class="empty-state"><span>○</span><div><b>无挂单</b><small>追价完成后不留挂单</small></div></div>
             </div>
@@ -105,25 +214,25 @@
 
         <div class="table-panel">
           <div class="panel-head">
-            <div><p class="eyebrow">ORDERS / BINANCE API</p><h2>历史委托 · 策略成交</h2><p class="subline">显示后端查询窗口内已成交的策略单，撤单不显示。盈亏按该委托下逐笔成交汇总：已实现 − 手续费。</p></div>
+            <div><p class="eyebrow">历史委托 / 币安接口</p><h2>历史委托 · 策略成交</h2><p class="subline">显示后端查询窗口内已成交的策略单，撤单不显示。盈亏按该委托下逐笔成交汇总：已实现 − 手续费。</p></div>
             <div class="hist-tools" aria-label="历史委托显示条数">
               <button type="button" class="hist-limit-btn is-on" data-limit="10">10</button>
               <button type="button" class="hist-limit-btn" data-limit="20">20</button>
             </div>
           </div>
-          <div class="table-head cols-o10"><span>时间 · UTC+8</span><span>标的</span><span>方向 / 类型</span><span>委托号</span><span>来源</span><span>委托 / 均价</span><span>委托量</span><span>成交量</span><span>盈亏</span><span>状态</span></div>
+          <div class="table-head cols-o10"><span>时间 · 北京时间</span><span>标的</span><span>方向 / 类型</span><span>委托号</span><span>来源</span><span>委托 / 均价</span><span>委托量</span><span>成交量</span><span>盈亏</span><span>状态</span></div>
           <div class="table-body" id="histOrdersBox"></div>
         </div>
 
         <div class="table-panel">
           <div class="panel-head">
-            <div><p class="eyebrow">FILLS / BINANCE API</p><h2>历史成交 · 策略成交</h2><p class="subline">按委托号合并后端查询窗口内的策略成交，一笔委托一行。开仓腿已实现通常为 0；平仓腿才有已实现盈亏。</p></div>
+            <div><p class="eyebrow">历史成交 / 币安接口</p><h2>历史成交 · 策略成交</h2><p class="subline">按委托号合并后端查询窗口内的策略成交，一笔委托一行。开仓腿已实现通常为 0；平仓腿才有已实现盈亏。</p></div>
             <div class="hist-tools" aria-label="历史成交显示条数">
               <button type="button" class="hist-limit-btn is-on" data-limit="10">10</button>
               <button type="button" class="hist-limit-btn" data-limit="20">20</button>
             </div>
           </div>
-          <div class="table-head cols-t9"><span>时间 · UTC+8</span><span>标的</span><span>订单号 / 成交ID</span><span>来源</span><span>方向 / 角色</span><span>价格 × 数量</span><span>已实现</span><span>手续费</span><span>盈亏</span></div>
+          <div class="table-head cols-t9"><span>时间 · 北京时间</span><span>标的</span><span>订单号 / 成交ID</span><span>来源</span><span>方向 / 角色</span><span>价格 × 数量</span><span>已实现</span><span>手续费</span><span>盈亏</span></div>
           <div class="table-body" id="histTradesBox"></div>
         </div>
 
@@ -133,11 +242,11 @@
       <section class="view" id="view-account">
         <div class="section-head">
           <div>
-            <p class="eyebrow">BINANCE FUTURES TESTNET</p>
+            <p class="eyebrow">币安合约测试网</p>
             <h2>账户连接与密钥</h2>
             <p class="subline">密钥只提交到本机后端并保存在本地 secrets 文件，不会发送到聊天或主网。</p>
           </div>
-          <span class="tag paused">TESTNET ONLY</span>
+          <span class="tag paused">仅测试网</span>
         </div>
 
         <div class="account-grid">
@@ -152,11 +261,11 @@
             <p class="form-note" id="accountResult">尚未提交密钥。请确认使用的是重新生成的 Testnet Key。</p>
           </form>
           <div class="account-state">
-            <div class="card-kicker">CONNECTION STATE</div>
+            <div class="card-kicker">连接状态</div>
             <div class="connection-big" id="accountConnection">未配置</div>
             <div class="account-line"><span>账户余额</span><b id="accountBalance">—</b></div>
             <div class="account-line"><span>交易所仓位</span><b id="accountPosition">—</b></div>
-            <div class="account-line"><span>交易权限</span><b class="blocked">Paper / Testnet</b></div>
+            <div class="account-line"><span>交易权限</span><b class="blocked">纸面 / 测试网</b></div>
             <div class="account-line"><span>对账状态</span><b id="reconcileState">—</b></div>
             <div class="account-line"><span>运行模式</span><b id="accountMode">—</b></div>
           </div>
@@ -164,6 +273,6 @@
       </section>
     </main>
   </div>
-  <script src="/app.js?v=32"></script>
+  <script src="/app.js?v=39"></script>
 </body>
 </html>

@@ -1254,6 +1254,33 @@ class BinanceTestnetClient:
         )
         return raw if isinstance(raw, list) else []
 
+    async def income(
+        self,
+        symbol: Optional[str] = None,
+        *,
+        income_type: Optional[str] = None,
+        limit: int = 100,
+        start_time: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """账户收支明细 (GET /fapi/v1/income) —— 只读查询.
+
+        资金费 (incomeType=FUNDING_FEE) 只有这里能拿到: userTrades 的
+        commission 不含资金费, 所以成本必须分两处取, 不能混成一个数。
+        """
+        symbol = symbol or self.symbol
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "limit": max(1, min(int(limit), 1000)),
+        }
+        if income_type:
+            params["incomeType"] = income_type
+        if start_time:
+            params["startTime"] = int(start_time)
+        raw = await self._request(
+            "GET", "/fapi/v1/income", params, signed=True
+        )
+        return raw if isinstance(raw, list) else []
+
     async def market_close(self, symbol: Optional[str] = None) -> OrderResult:
         """平掉当前全部仓位 (单向净仓或双向两边)."""
         symbol = symbol or self.symbol

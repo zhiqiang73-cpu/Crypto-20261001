@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import datetime
 import json
 import logging
 import os
@@ -24,28 +26,352 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
 # ---------------------------------------------------------------------------
-# 统计起点
+# 记录起点（用户要求：历史清零，系统从某一刻起重新记录）
 #
-# 用户要求：「赚了多少」与胜率等**统计指标**从 2026-10-02 起算。
+# 优先级：config/record_start.json > 环境变量 STATS_START_DATE > 默认值。
+# 时间按本机时区（北京时间 UTC+8）解释，支持 "YYYY-MM-DD" 或
+# "YYYY-MM-DD HH:MM"，精确到分钟。
 #
-# ⚠ 起算日只作用于统计指标（/api/account/summary）。历史委托与历史成交
-# 必须返回**完整**历史 —— 它们曾经错误地复用了这个过滤，导致起算日之前的
-# 委托/成交在页面上凭空消失。不要再把它们接回来。
+# ⚠ 交易所的委托/成交记录无法删除，只能按起点过滤显示；本地运行日志另行
+#   归档重置（见 runtime/shadow/_archive_reset_*）。持仓、余额、挂单是
+#   实时状态，不受记录起点影响。
 #
-# 日期按本机时区的当日 00:00 解释，可用环境变量 STATS_START_DATE 覆盖。
+# 历史教训：起算日曾经只作用于统计指标，而委托/成交复用它会「凭空消失」。
+# 现在的语义是明确的「记录起点」：用户要求页面上从此刻起只显示新记录，
+# 因此 /api/binance/orders 与 /api/binance/trades 也按同一起点过滤。
 # ---------------------------------------------------------------------------
-STATS_START_DATE = os.getenv("STATS_START_DATE", "2026-10-02")
+DEFAULT_RECORD_START = "2026-10-02"
+RECORD_START_FILE = os.path.join(ROOT, "config", "record_start.json")
+
+
+def record_start_text() -> str:
+    """记录起点原文：配置文件优先，其次环境变量，最后默认值。"""
+    try:
+        with open(RECORD_START_FILE, encoding="utf-8") as fh:
+            value = str((json.load(fh) or {}).get("record_start") or "").strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return os.getenv("STATS_START_DATE", DEFAULT_RECORD_START)
+
+
+def parse_local_ms(text: str) -> int:
+    """本机时区 "YYYY-MM-DD[ HH:MM[:SS]]" → 毫秒；无法解析返回 0。"""
+    from datetime import datetime as _dt
+
+    raw = str(text or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return int(_dt.strptime(raw, fmt).timestamp() * 1000)
+        except Exception:
+            continue
+    return 0
 
 
 def stats_start_ms() -> int:
-    """统计起点的毫秒时间戳；日期无效时返回 0，表示不过滤。"""
+    """记录起点的毫秒时间戳；无法解析时返回 0，表示不过滤。"""
+    return parse_local_ms(record_start_text())
+
+
+def record_start_label() -> str:
+    """记录起点的展示文案（北京时间）。"""
+    ms = stats_start_ms()
+    if not ms:
+        return "不限"
     from datetime import datetime as _dt
 
+    return _dt.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
+
+
+def _trade_row_ms(row: Dict[str, Any]) -> int:
+    """运行记录 deployed_trades.csv 的「时间」列 → 毫秒。
+
+    ⚠ 该列由运行器 shadow/deploy.py 的 _fmt() 写成 **UTC**
+    （datetime.fromtimestamp(..., tz=timezone.utc)），不是北京时间。
+    面板内部统一用毫秒时间戳比较，展示时才换算为北京时间；这里必须按
+    UTC 解析，否则北京时间会被当成 UTC，记录起点的过滤会整体偏移 8 小时。
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    raw = str(row.get("时间") or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return int(
+                _dt.strptime(raw, fmt).replace(tzinfo=_tz.utc).timestamp() * 1000
+            )
+        except Exception:
+            continue
+    return 0
+
+
+def _quality_context(start_ms: int = 0) -> Dict[str, Any]:
+    """读取本地运行记录，提供前端风险质量卡的可审计上下文。
+
+    这里只读 runtime/shadow；不修改状态、不清理日志，也不把观察行冒充成交。
+    start_ms > 0 时只统计记录起点之后的行，使回撤与原因记录从起点重新累计。
+    """
+    from collections import Counter
+
+    state_path = os.path.join(ROOT, "runtime", "shadow", "deployed_state.json")
+    trade_path = os.path.join(ROOT, "runtime", "shadow", "deployed_trades.csv")
+    heartbeat_path = os.path.join(ROOT, "runtime", "shadow", "runner_heartbeat.json")
+    state: Dict[str, Any] = {}
+    heartbeat: Dict[str, Any] = {}
+    reasons: Counter[str] = Counter()
+    equity: list[float] = []
     try:
-        d = _dt.strptime(STATS_START_DATE.strip(), "%Y-%m-%d")
+        with open(state_path, encoding="utf-8") as fh:
+            state = json.load(fh)
     except Exception:
-        return 0
-    return int(d.timestamp() * 1000)
+        pass
+    try:
+        with open(heartbeat_path, encoding="utf-8") as fh:
+            heartbeat = json.load(fh)
+    except Exception:
+        pass
+    try:
+        with open(trade_path, encoding="utf-8", newline="") as fh:
+            rows = list(csv.DictReader(fh))
+            if start_ms:
+                rows = [r for r in rows if _trade_row_ms(r) >= start_ms]
+            for row in rows[-300:]:
+                note = str(row.get("说明") or "").strip()
+                if note and note not in {"观察", "同向持仓"}:
+                    reasons[note] += 1
+                try:
+                    value = float(str(row.get("权益") or "").replace(",", ""))
+                    if value > 0:
+                        equity.append(value)
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        pass
+    max_drawdown = 0.0
+    peak = 0.0
+    for value in equity:
+        peak = max(peak, value)
+        if peak > 0:
+            max_drawdown = max(max_drawdown, (peak - value) / peak)
+    strategies = [str(x) for x in (heartbeat.get("strategies") or [])]
+    return {
+        "recorded_max_drawdown": max_drawdown,
+        "recorded_equity_points": len(equity),
+        "recent_reasons": [
+            {"text": text, "count": count}
+            for text, count in reasons.most_common(4)
+        ],
+        "active_strategies": strategies,
+        "five_minute_disabled": not any("5" in x.lower() for x in strategies),
+        "halted": bool(state.get("halted")),
+        "missed_bars": int(state.get("missed_bars") or 0),
+        "missed_signals": int(state.get("missed_signals") or 0),
+        "source": "runtime/shadow/deployed_state.json + deployed_trades.csv + runner_heartbeat.json",
+    }
+
+
+def _split_fees(rows: list) -> tuple:
+    """手续费按 maker / taker 拆开，两项单列而不是只给合计。"""
+    maker = taker = 0.0
+    for t in rows:
+        fee = float(t.get("commission", 0) or 0)
+        if t.get("maker"):
+            maker += fee
+        else:
+            taker += fee
+    return maker, taker
+
+
+def _open_notional(rows: list) -> float:
+    """开仓名义金额合计（不依赖复利）。
+
+    币安逐笔成交里平仓腿才带 realizedPnl，开仓腿 realizedPnl 为 0，
+    因此以 realizedPnl == 0 的成交腿近似开仓名义，作为单笔净边际的分母。
+    """
+    total = 0.0
+    for t in rows:
+        if abs(float(t.get("realizedPnl", 0) or 0)) > 1e-9:
+            continue
+        total += abs(float(t.get("price", 0) or 0) * float(t.get("qty", 0) or 0))
+    return total
+
+
+def _realized_curve_drawdown(rows: list) -> Dict[str, Any]:
+    """按成交时间累加净额（已实现 − 手续费），取峰值回撤（USDT）。"""
+    points = [
+        (
+            int(t.get("time", 0) or 0),
+            float(t.get("realizedPnl", 0) or 0)
+            - float(t.get("commission", 0) or 0),
+        )
+        for t in rows
+    ]
+    points.sort(key=lambda x: x[0])
+    cum = peak = mdd = 0.0
+    for _, net in points:
+        cum += net
+        peak = max(peak, cum)
+        mdd = max(mdd, peak - cum)
+    return {"realized_max_drawdown": mdd, "realized_net_cum": cum, "samples": len(points)}
+
+
+async def _funding_fee(client, start_ms: int) -> Optional[float]:
+    """资金费合计：读交易所 income 明细（FUNDING_FEE）。读不到返回 None。"""
+    fn = getattr(client, "income", None)
+    if fn is None:
+        return None
+    total = 0.0
+    ok = False
+    for symbol in TRADE_SYMBOLS:
+        try:
+            rows = await fn(
+                symbol=symbol,
+                income_type="FUNDING_FEE",
+                limit=1000,
+                start_time=start_ms or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("funding %s: %s", symbol, exc)
+            continue
+        ok = True
+        for r in rows or []:
+            total += float(r.get("income", 0) or 0)
+    return total if ok else None
+
+
+def _slippage_estimate(positions: Optional[Dict[str, Any]] = None,
+                       start_ms: int = 0) -> Dict[str, Any]:
+    """执行滑点：交易所实际成交价 vs 策略账本参考价。
+
+    只读本机 runtime/shadow，不改交易链路。两条口径，逐笔精确配对，
+    绝不用时间猜测把不相干的成交和信号硬凑在一起：
+
+    1. 台账口径：deployed_orders.jsonl 里带 signal_price 的委托
+       （下单时写入的虚拟仓参考价）逐笔对比成交均价。
+    2. 持仓口径：当前持仓用交易所 entry_price 对比账本 entry.px，
+       这是此刻真实存在的执行偏差，可立即核对。
+
+    两条都拿不到时返回 None，并在口径说明里写清原因，不编造数字。
+    start_ms > 0 时只统计记录起点之后的持仓，避免把清零前的开仓滑点算进新账。
+    """
+    total = 0.0
+    matched = 0
+    considered = 0
+
+    # 1) 台账口径（逐笔精确）
+    try:
+        with open(
+            os.path.join(ROOT, "runtime", "shadow", "deployed_orders.jsonl"),
+            encoding="utf-8",
+        ) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                action = str(o.get("action") or "")
+                if "LONG" not in action and "SHORT" not in action:
+                    continue
+                try:
+                    fill = float(o.get("avg_price") or 0)
+                    qty = float(o.get("filled") or 0)
+                    ref = float(o.get("signal_price") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if fill <= 0 or qty <= 0:
+                    continue
+                considered += 1
+                if ref <= 0:
+                    continue
+                direction = 1 if "LONG" in action else -1
+                total += (fill - ref) * direction * qty
+                matched += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+    if matched:
+        return {
+            "slippage_est": total,
+            "slippage_matched": matched,
+            "slippage_candidates": considered,
+            "slippage_basis": (
+                f"台账逐笔口径：成交均价 − 策略参考价（{matched}/{considered} 笔）"
+            ),
+        }
+
+    # 2) 持仓口径（当前持仓，交易所 entry_price vs 账本 entry.px）
+    state: Dict[str, Any] = {}
+    try:
+        with open(
+            os.path.join(ROOT, "runtime", "shadow", "deployed_state.json"),
+            encoding="utf-8",
+        ) as fh:
+            state = json.load(fh)
+    except Exception:  # noqa: BLE001
+        state = {}
+    books = state.get("strategies") or {}
+    hold_total = 0.0
+    hold_matched = 0
+    for symbol in TRADE_SYMBOLS:
+        pos = (positions or {}).get(symbol) or {}
+        try:
+            ex_px = float(pos.get("entry_price") or 0)
+            ex_qty = abs(float(pos.get("quantity") or 0))
+        except (TypeError, ValueError):
+            continue
+        if ex_px <= 0 or ex_qty <= 0:
+            continue
+        ref_px = 0.0
+        ref_qty = 0.0
+        for book in books.values():
+            entry = book.get("entry") or {}
+            if str(entry.get("symbol") or "") != symbol:
+                continue
+            try:
+                q = abs(float(entry.get("qty") or 0))
+                p = float(entry.get("px") or 0)
+                entry_ms = int(entry.get("ms") or 0)
+            except (TypeError, ValueError):
+                continue
+            if start_ms and entry_ms and entry_ms < start_ms:
+                # 清零前开的仓不计入新账（持仓本身保留）。
+                continue
+            if q > 0 and p > 0:
+                ref_px += p * q
+                ref_qty += q
+        if ref_qty <= 0:
+            continue
+        ref = ref_px / ref_qty
+        side = str(pos.get("side") or "FLAT").upper()
+        direction = 1 if side == "LONG" else (-1 if side == "SHORT" else 0)
+        if not direction:
+            continue
+        hold_total += (ex_px - ref) * direction * ex_qty
+        hold_matched += 1
+
+    if hold_matched:
+        return {
+            "slippage_est": hold_total,
+            "slippage_matched": hold_matched,
+            "slippage_candidates": hold_matched,
+            "slippage_basis": (
+                f"持仓口径：交易所开仓价 − 账本参考价（{hold_matched} 个标的，"
+                "逐笔台账参考价自下次运行器重启后开始记录）"
+            ),
+        }
+
+    return {
+        "slippage_est": None,
+        "slippage_matched": 0,
+        "slippage_candidates": considered,
+        "slippage_basis": (
+            f"暂不可测：记录起点之后暂无带参考价的台账成交（台账 {considered} 笔）"
+            "，也没有起点之后新开的持仓可比对"
+        ),
+    }
 
 
 try:
@@ -57,6 +383,7 @@ from config.review import (
     PANEL_HOST,
     PANEL_HTML,
     PANEL_PORT,
+    PANEL_STATIC_DIR,
     SETTLE_CONFIG,
     VALID_SAMPLE_TARGET,
 )
@@ -199,6 +526,17 @@ def create_app(
         if not PANEL_HTML.exists():
             return web.Response(text="panel html missing", status=404)
         return web.FileResponse(PANEL_HTML)
+
+    async def static_asset(request):
+        """前端静态资源与 /api/* 同源，避免跨端口与缓存不一致。"""
+        name = os.path.basename(request.match_info.get("name") or "")
+        allowed = {"app.js", "styles.css", "index.html"}
+        if name not in allowed:
+            return web.Response(text="not found", status=404)
+        path = PANEL_STATIC_DIR / name
+        if not path.exists():
+            return web.Response(text="not found", status=404)
+        return web.FileResponse(path)
 
     # ------------------------------------------------------------------ live
     async def api_live(request):
@@ -967,12 +1305,20 @@ def create_app(
             orders = annotate_orders(
                 orders, strategy_order_ids=load_strategy_order_ids()
             )
+            # 记录起点：用户要求历史清零，交易所记录无法删除，只能过滤显示。
+            start = stats_start_ms()
+            if start:
+                orders = [
+                    o for o in orders
+                    if int(o.get("updateTime") or o.get("time") or 0) >= start
+                ]
             counts = summarize(orders)
             return web.json_response({
                 "connected": True,
                 "orders": orders,
                 "scope": "recent_7d", "limit": limit,
                 "truncated": len(orders) >= limit,
+                "record_start": record_start_label(),
                 "source_counts": counts,
                 "source_labels": SOURCE_LABELS,
             })
@@ -1007,12 +1353,19 @@ def create_app(
             trades = annotate_trades(
                 trades, parents, strategy_order_ids=load_strategy_order_ids()
             )
+            # 记录起点：与委托同一起点，避免「委托已清零、成交还在」。
+            start = stats_start_ms()
+            if start:
+                trades = [
+                    t for t in trades if int(t.get("time") or 0) >= start
+                ]
             counts = summarize(trades)
             return web.json_response({
                 "connected": True,
                 "trades": trades,
                 "scope": "recent_7d", "limit": limit,
                 "truncated": len(trades) >= limit,
+                "record_start": record_start_label(),
                 "source_counts": counts,
                 "source_labels": SOURCE_LABELS,
             })
@@ -1055,11 +1408,16 @@ def create_app(
                 losses = sum(1 for p in pnls if p < 0)
                 gross_win = sum(p for p in pnls if p > 0)
                 gross_loss = -sum(p for p in pnls if p < 0)
+                avg_win = (gross_win / wins) if wins else None
+                avg_loss = (gross_loss / losses) if losses else None
+                maker_fee, taker_fee = _split_fees(rows)
+                open_notional = _open_notional(rows)
+                net = realized - commission
                 return {
                     "trade_count": len(rows),
                     "realized_pnl": realized,
                     "commission": commission,
-                    "net_pnl": realized - commission,
+                    "net_pnl": net,
                     "closed_trades": wins + losses,
                     "wins": wins,
                     "losses": losses,
@@ -1067,6 +1425,24 @@ def create_app(
                     "profit_factor": (
                         (gross_win / gross_loss) if gross_loss > 0 else None
                     ),
+                    # 只看胜率会误导：同时给出平均盈利/平均亏损与盈亏比。
+                    "avg_win": avg_win,
+                    "avg_loss": avg_loss,
+                    "payoff_ratio": (
+                        (avg_win / avg_loss) if (avg_win and avg_loss) else None
+                    ),
+                    # 交易成本单列：maker / taker 分开。
+                    "maker_fee": maker_fee,
+                    "taker_fee": taker_fee,
+                    # 单笔净边际分母用开仓名义金额，不依赖复利。
+                    "open_notional": open_notional,
+                    "unit_edge_bps": (
+                        (net / open_notional * 10000) if open_notional else None
+                    ),
+                    # 按标的分组的已实现权益曲线回撤（USDT）。
+                    "realized_max_drawdown": _realized_curve_drawdown(rows)[
+                        "realized_max_drawdown"
+                    ],
                 }
 
             start = stats_start_ms()
@@ -1111,9 +1487,62 @@ def create_app(
                     (pos_by_symbol.get(sym) or {}).get("unrealized_pnl", 0) or 0
                 )
                 by_symbol[sym] = item
+            # 本地权益回撤与原因记录同样从记录起点重新累计。
+            quality_ctx = _quality_context(start)
+            # 单笔净边际：分母用开仓名义金额（不依赖复利），口径与分标的完全一致。
+            edge_bps = scoped["unit_edge_bps"]
+            maker_fee, taker_fee = _split_fees(scoped_rows)
+            funding_fee = await _funding_fee(client, start)
+            slippage = _slippage_estimate(pos_by_symbol, start)
+            drawdown = {
+                # 账户权益口径：运行器落盘的权益曲线峰值回撤。
+                "account_recorded": quality_ctx["recorded_max_drawdown"],
+                "account_basis": "runtime/shadow/deployed_trades.csv 权益字段（运行记录口径）",
+                # 按标的分组：各自已实现净额曲线回撤，绝不混加。
+                "by_symbol": {
+                    sym: (by_symbol.get(sym) or {}).get("realized_max_drawdown")
+                    for sym in by_symbol
+                },
+                "by_symbol_basis": "各标的已实现净额（已实现 − 手续费）按成交时间的峰值回撤，USDT",
+            }
+            costs = {
+                "maker_fee": maker_fee,
+                "taker_fee": taker_fee,
+                "total_fee": maker_fee + taker_fee,
+                "funding_fee": funding_fee,
+                "funding_basis": (
+                    "交易所 income 明细 incomeType=FUNDING_FEE"
+                    if funding_fee is not None
+                    else "当前客户端未接入资金费查询，暂不可得"
+                ),
+                "slippage_est": slippage["slippage_est"],
+                "slippage_matched": slippage["slippage_matched"],
+                "slippage_candidates": slippage["slippage_candidates"],
+                "slippage_basis": slippage["slippage_basis"],
+            }
+            reasons = list(quality_ctx["recent_reasons"])
+            if quality_ctx["five_minute_disabled"]:
+                reasons.insert(0, {
+                    "text": "当前运行器仅启用 BTC/ETH 15m；5m 已停用，避免趋势中无正常出口导致灾难止损",
+                    "count": 1,
+                })
+            actions = [
+                "继续固定 15m-only 测试网窗口，不在盈利后临时改参数或扩大仓位",
+                "累计至少 4 周或 30 个完整平仓样本，再评估单笔净边际和跨 BTC/ETH 一致性",
+                "补齐逐笔开平仓配对与权益曲线，当前边际为成交腿近似、回撤为本地记录口径",
+            ]
+            if quality_ctx["halted"]:
+                actions.insert(0, "运行器处于熔断状态：先人工核对交易所净仓与本地账本，再决定是否恢复")
             return web.json_response({
                 "connected": True,
-                "stats_start": STATS_START_DATE,
+                # 记录起点：stats_start 保留为日期，record_start 是精确到分钟的文案。
+                "stats_start": record_start_label()[:10],
+                "record_start": record_start_label(),
+                "record_start_ms": start,
+                "record_start_note": (
+                    "历史清零后重新记录：委托、成交、成本、回撤与明细均自该时刻起"
+                    "统计；持仓、余额、挂单为实时状态，不受影响。"
+                ),
                 "scope": "recent_7d", "history_limit": 200,
                 "truncated": len(all_trades) >= 200,
                 "wallet_balance": float(
@@ -1135,6 +1564,30 @@ def create_app(
                     "quantity": float(getattr(pos, "quantity", 0) or 0),
                     "entry_price": float(getattr(pos, "entry_price", 0) or 0),
                 },
+                "quality": {
+                    "realized_net_pnl": float(scoped["net_pnl"]),
+                    "unrealized_pnl": float(upnl),
+                    "unit_edge_bps": edge_bps,
+                    "unit_edge_basis": "开仓名义金额口径：净额 ÷ 开仓腿名义 × 10000（不依赖复利）",
+                    "open_notional": float(scoped.get("open_notional") or 0),
+                    "recorded_max_drawdown": quality_ctx["recorded_max_drawdown"],
+                    "drawdown": drawdown,
+                    "drawdown_basis": drawdown["account_basis"],
+                    # 胜率与盈亏比必须一起看，不能只报胜率。
+                    "win_rate": float(scoped.get("win_rate") or 0),
+                    "profit_factor": scoped.get("profit_factor"),
+                    "payoff_ratio": scoped.get("payoff_ratio"),
+                    "wins": scoped.get("wins"),
+                    "losses": scoped.get("losses"),
+                    "avg_win": scoped.get("avg_win"),
+                    "avg_loss": scoped.get("avg_loss"),
+                    # 交易成本单列：maker / taker / 资金费 / 滑点估算。
+                    "costs": costs,
+                    "window": record_start_label(),
+                    "reasons": reasons,
+                    "next_actions": actions,
+                    "context": quality_ctx,
+                },
             })
         except Exception as exc:
             return web.json_response({
@@ -1143,6 +1596,7 @@ def create_app(
 
     # routes
     app.router.add_get("/", index)
+    app.router.add_get("/{name:app\\.js|styles\\.css|index\\.html}", static_asset)
     app.router.add_get("/api/live", api_live)
     app.router.add_get("/api/market", api_market)
     app.router.add_get("/api/health", api_health)
