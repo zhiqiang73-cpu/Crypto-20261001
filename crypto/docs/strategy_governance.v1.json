@@ -1,0 +1,48 @@
+{
+  "schema_version": "strategy_governance.v1",
+  "contract_version": "2026-10-03.1",
+  "fact_source_order": [
+    "运行时代码与已落盘心跳/状态",
+    "config/strategies/*.json 策略卡",
+    "shadow/signals.py、shadow/indicators.py、shadow/engine.py 指标与信号实现",
+    "frontend/ 与 review/ 面板展示",
+    "docs/ 与 outputs/ 历史说明"
+  ],
+  "active_runtime_keys": ["kdj15", "eth15"],
+  "research_only_runtime_keys": ["kdj5", "eth5"],
+  "symbols": ["BTCUSDT", "ETHUSDT"],
+  "active_timeframe": "15m",
+  "research_timeframe": "5m",
+  "signal": {
+    "kdj": [9, 3, 3],
+    "macd": [12, 26, 9],
+    "k_long_max": null,
+    "k_short_min": null,
+    "require_macd": true,
+    "closed_bar_only": true,
+    "confirm_next": false
+  },
+  "risk": {
+    "risk_r": 0.03,
+    "atr_multiplier_k": 2.0,
+    "leverage": 10,
+    "daily_loss_limit": 0.03,
+    "max_drawdown": 0.10,
+    "disaster_atr": 3.0
+  },
+  "market": {
+    "market": "testnet",
+    "rest_host": "testnet.binancefuture.com"
+  },
+  "implementation_files": [
+    "shadow/strategy_books.py",
+    "shadow/signals.py",
+    "shadow/indicators.py",
+    "shadow/engine.py",
+    "shadow/deploy.py",
+    "config/strategies/deployed_kdj_extreme_v1.json",
+    "config/strategies/deployed_kdj_eth_extreme_v1.json",
+    "config/strategies/deployed_kdj_5m_extreme_v1.json",
+    "config/strategies/deployed_kdj_eth_5m_extreme_v1.json"
+  ]
+}

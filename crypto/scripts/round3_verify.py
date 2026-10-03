@@ -2,7 +2,7 @@
 """第三轮离线可重复验收入口 — 不加载密钥、不下单、不连测试网账户。
 
 用法:
-  cd /Users/zengyun/Downloads/我的AI/crypto
+  cd /Users/zengyun/我的AI/crypto
   python3 scripts/round3_verify.py
 """
 from __future__ import annotations

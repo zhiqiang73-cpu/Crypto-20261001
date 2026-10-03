@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Append hourly tick + reliability/opportunity critique (read-only).
 set -euo pipefail
-ROOT="/Users/zengyun/Downloads/我的AI/crypto"
+ROOT="/Users/zengyun/我的AI/crypto"
 "$ROOT/scripts/observe_hourly_snapshot.sh" >/dev/null
 python3 - <<'PY'
 import json, urllib.request
@@ -10,9 +10,9 @@ from pathlib import Path
 from collections import Counter
 CST=timezone(timedelta(hours=8))
 now=datetime.now(CST)
-raw=Path('/Users/zengyun/Downloads/我的AI/crypto/docs/observe_hourly_raw.jsonl')
-log=Path('/Users/zengyun/Downloads/我的AI/crypto/docs/observe_hourly_log.md')
-audit_path=Path('/Users/zengyun/Downloads/我的AI/crypto/runtime/review/decision_audit.jsonl')
+raw=Path('/Users/zengyun/我的AI/crypto/docs/observe_hourly_raw.jsonl')
+log=Path('/Users/zengyun/我的AI/crypto/docs/observe_hourly_log.md')
+audit_path=Path('/Users/zengyun/我的AI/crypto/runtime/review/decision_audit.jsonl')
 lines=raw.read_text().strip().splitlines()
 cur=json.loads(lines[-1])
 t0=json.loads(lines[0]) if lines else cur

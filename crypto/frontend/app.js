@@ -15,8 +15,8 @@
   let currentView = "trading";
   let timer = null;
   let markSocket = null;
-  // 面板历史只展示北京时间 2026-10-02 的策略自动单。
-  const HISTORY_DAY = "2026-10-02";
+  // 历史窗口由 /api/account/summary.stats_start 下发；前端不定义统计起点。
+  let historyDay = null;
   const HISTORY_LIMITS = [10, 20];
   const historyLimitKey = "crypto.histLimit";
   let historyLimit = 10;
@@ -59,7 +59,7 @@
 
   const isHistoryRow = (row) =>
     String(row.source || "") === "strategy" &&
-    beijingDay(row.time ?? row.updateTime) === HISTORY_DAY;
+    (!historyDay || beijingDay(row.time ?? row.updateTime) === historyDay);
 
   const isFilledOrder = (row) =>
     isHistoryRow(row) && Number(row.executedQty || 0) > 0;
@@ -234,7 +234,7 @@
   // ------------------------------------------------------------- 实时行情
   //
   // WS 地址**由后端下发**, 不再硬编码。
-  // 2026-10-02 事故: 前端曾写死主网 WS 地址, 与测试网下单错位。
+  // 历史事故：前端曾写死主网 WS 地址, 与测试网下单错位。
   // 现在拿不到后端下发的地址就只重试, 绝不退回主网 ——
   // 宁可暂时无行情, 也不显示另一个市场的价格。
   let marketWsUrl = null;
@@ -477,6 +477,7 @@
       setPnl($("mRealBTC"), (bySym.BTCUSDT || {}).net_pnl ?? 0);
       setPnl($("mRealETH"), (bySym.ETHUSDT || {}).net_pnl ?? 0);
       if ($("realHint")) {
+        historyDay = s.stats_start || null;
         $("realHint").textContent =
           `净 = 已实现 − 手续费 · 自 ${s.stats_start || "—"} 起`;
       }
@@ -534,12 +535,10 @@
         text: "开多",
         cls: "is-long",
         sub: d.require_macd
-          ? "金叉且 MACD 红柱"
+          ? "金叉且 MACD 绿柱"
           : d.require_break
             ? "金叉且价格突破"
-            : d.signal_needs_k_extreme
-              ? "金叉且 K<30"
-              : "金叉",
+            : d.signal_rule || "金叉",
       };
     }
     if (d.signal_short) {
@@ -547,12 +546,10 @@
         text: "开空",
         cls: "is-short",
         sub: d.require_macd
-          ? "死叉且 MACD 绿柱"
+          ? "死叉且 MACD 红柱"
           : d.require_break
             ? "死叉且价格突破"
-            : d.signal_needs_k_extreme
-              ? "死叉且 K>70"
-              : "死叉",
+            : d.signal_rule || "死叉",
       };
     }
     if (cross.gold) {
@@ -563,12 +560,10 @@
           d.macd_note ||
           d.break_note ||
           (d.require_macd
-            ? "MACD 不是红柱"
+            ? "MACD 不是绿柱"
             : d.require_break
               ? "未涨破上一根高点"
-              : d.signal_needs_k_extreme
-                ? "K 还没到 30"
-                : "观察"),
+              : d.signal_rule || "观察"),
       };
     }
     if (cross.dead) {
@@ -579,12 +574,10 @@
           d.macd_note ||
           d.break_note ||
           (d.require_macd
-            ? "MACD 不是绿柱"
+            ? "MACD 不是红柱"
             : d.require_break
               ? "未跌破上一根低点"
-              : d.signal_needs_k_extreme
-                ? "K 还没到 70"
-                : "观察"),
+              : d.signal_rule || "观察"),
       };
     }
     const above = Number(d.K) > Number(d.D);
@@ -688,10 +681,12 @@
     if (!orderBox && !tradeBox) return;
     syncHistoryLimitButtons();
     try {
-      const [od, td] = await Promise.all([
+      const [od, td, summary] = await Promise.all([
         api("/api/binance/orders?limit=200"),
         api("/api/binance/trades?limit=200"),
+        api("/api/account/summary"),
       ]);
+      historyDay = summary && summary.stats_start ? summary.stats_start : historyDay;
       if (!od.connected) {
         if (orderBox) orderBox.innerHTML = empty("币安未连接", od.reason || "请到账户连接页配置密钥");
       }

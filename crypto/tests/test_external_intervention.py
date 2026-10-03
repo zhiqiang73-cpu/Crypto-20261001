@@ -26,6 +26,8 @@ from shadow.external_watch import (KIND_INCREASE, KIND_REDUCE, apply_external,
 
 
 def _state():
+    # kdj5/eth5 是 2026-10-03 停用后留在 state 里的遗留条目：
+    # 不参与净仓、不被干预流程触碰，但按真实状态保留在夹具里。
     return {
         "strategies": {
             "kdj15": {"last_ts": 111, "entry": {"side": 1, "qty": 0.19}},
@@ -90,10 +92,11 @@ class TestApplyExternal(unittest.TestCase):
         self.assertTrue(watch["hold"])
         self.assertFalse(watch["paused"])
         self.assertIsNone(st["strategies"]["kdj15"]["entry"])
-        self.assertIsNone(st["strategies"]["kdj5"]["entry"])
         self.assertIsNone(st["entry"])
         # 只清 entry，不动 last_ts —— 否则历史 K 线会被重放并立刻反手
         self.assertEqual(st["strategies"]["kdj15"]["last_ts"], 111)
+        # 已停用的 5m 账本不参与净仓，人工干预也不去动它
+        self.assertEqual(st["strategies"]["kdj5"]["entry"]["qty"], 0.191)
         self.assertEqual(st["strategies"]["kdj5"]["last_ts"], 222)
         # 另一个标的完全不受影响
         self.assertIsNotNone(st["strategies"]["eth15"]["entry"])

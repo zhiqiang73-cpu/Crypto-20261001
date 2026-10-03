@@ -1,8 +1,7 @@
 """KDJ(9,3,3) 信号的唯一来源：仅用已收盘的相邻两根 K/D 值。
 
-15m：当根收盘交叉，且 MACD 能量柱方向与交叉方向一致，下一根开盘下限价单。
-     交叉方向与能量柱背离 → 丢弃，不平仓、不反手。
-5m：金叉且 K<30 做多 / 死叉且 K>70 做空，当根收盘即可开仓。
+15m 与 5m 同一套规则：当根收盘交叉，且 MACD 能量柱方向与交叉方向一致，
+下一根开盘下限价单。交叉方向与能量柱背离 → 丢弃，不平仓、不反手。
 """
 from __future__ import annotations
 
@@ -13,7 +12,7 @@ from typing import Optional, Tuple
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 
 # 2026-10-02 用户新规则：15m 的方向过滤从「价格突破上一根高低点」换成
-# 「MACD 能量柱正负」。红柱(>0)只许做多，绿柱(<0)只许做空，背离一律丢弃。
+# 「MACD 能量柱正负」。绿柱(>0)只许做多，红柱(<0)只许做空，背离一律丢弃。
 # BREAK_ATR_MULT 与 price_breaks() 保留兼容历史测试，已无规格使用。
 BREAK_ATR_MULT = 0.15
 
@@ -37,8 +36,8 @@ def entry_signal(k_previous: float, d_previous: float,
                  ) -> Tuple[bool, bool, bool, bool]:
     """返回 (做多, 做空, 金叉, 死叉)。
 
-    5m 策略传 k_long_max=30、k_short_min=70：金叉且 K<30 做多，死叉且 K>70 做空。
-    15m 不传阈值：交叉只是前提，还要过 macd_gate（能量柱方向）。
+    k_long_max / k_short_min 是已停用的旧 5m K 极值过滤：2026-10-03 起四条规格
+    统一改用 macd_gate 的能量柱方向。参数与分支仅为历史测试/研究对比保留。
     """
     gold, dead = crossing(k_previous, d_previous, k_current, d_current)
     sig_long = bool(gold and (k_long_max is None or k_current < k_long_max))
@@ -63,7 +62,7 @@ def price_breaks(close: float, prev_high: float, prev_low: float, atr: float,
 
 
 def macd_side(hist) -> int:
-    """能量柱方向：红柱(>0) → +1，绿柱(<0) → −1，0 或非有限值 → 0（不放行）。"""
+    """能量柱方向：绿柱(>0) → +1，红柱(<0) → −1，0 或非有限值 → 0（不放行）。"""
     try:
         value = float(hist)
     except (TypeError, ValueError):
@@ -91,8 +90,8 @@ def macd_gate(sig_long: bool, sig_short: bool, hist, *,
     if side == 0:
         return False, False, "MACD 能量柱为 0 或不可用，丢弃不操作"
     if want == 1:
-        return False, False, "金叉但 MACD 是绿柱，方向背离，丢弃不操作"
-    return False, False, "死叉但 MACD 是红柱，方向背离，丢弃不操作"
+        return False, False, "金叉但 MACD 是红柱，方向背离，丢弃不操作"
+    return False, False, "死叉但 MACD 是绿柱，方向背离，丢弃不操作"
 
 
 def confirmed_signal(
