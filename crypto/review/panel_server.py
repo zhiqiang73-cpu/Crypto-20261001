@@ -40,6 +40,10 @@ sys.path.insert(0, ROOT)
 # 现在的语义是明确的「记录起点」：用户要求页面上从此刻起只显示新记录，
 # 因此 /api/binance/orders 与 /api/binance/trades 也按同一起点过滤。
 # ---------------------------------------------------------------------------
+# 净仓对齐死区：与 shadow/deploy.py::SYNC_MIN_DELTA 同口径（2 个最小步长）。
+# 步长取整会让账本与交易所偶尔差一个步长，那种差值不构成「不属于同一笔仓」。
+MIN_SYNC_STEP = 0.002
+
 DEFAULT_RECORD_START = "2026-10-02"
 RECORD_START_FILE = os.path.join(ROOT, "config", "record_start.json")
 
@@ -173,6 +177,40 @@ def _quality_context(start_ms: int = 0) -> Dict[str, Any]:
         "missed_signals": int(state.get("missed_signals") or 0),
         "source": "runtime/shadow/deployed_state.json + deployed_trades.csv + runner_heartbeat.json",
     }
+
+
+def shadow_ledger_claim(symbol: str, exchange_signed: float) -> str:
+    """交易所这笔净仓是否属于 shadow runner 的策略账本？属于则返回原因。
+
+    2026-10-04：面板的 legacy executor 只认它自己的账本，看不到 runner 的仓位，
+    因此把 runner 的 BTC/ETH 仓当成「孤儿仓」。面板上点「清孤儿仓 / 立即平仓」
+    会真的把策略仓平掉。
+
+    这里只做**只读**归属判定，证据来自 runner 自己的状态文件：
+      方向一致 且 数量差 ≤ 2 个最小步长  → 认定归 runner，面板不得平。
+    证据不足返回空串（不阻断），以免误伤面板自己的仓。
+
+    判定刻意保守：宁可不拦，也不误判方向相反的仓位。
+    """
+    if abs(exchange_signed) < 1e-9:
+        return ""
+    path = os.path.join(ROOT, "runtime", "shadow", "deployed_state.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            st = json.load(fh)
+    except Exception:  # noqa: BLE001  读不到就不拦（保底不误伤）
+        return ""
+    try:
+        ledger = float((desired_nets(st) or {}).get(symbol) or 0.0)
+    except Exception:  # noqa: BLE001
+        return ""
+    if abs(ledger) < 1e-9 or ledger * exchange_signed <= 0:
+        return ""
+    if abs(ledger - exchange_signed) > 2 * MIN_SYNC_STEP:
+        return ""
+    return (f"{symbol} 这笔净仓归 shadow runner 策略账本"
+            f"（账本 {ledger:+.4f} / 交易所 {exchange_signed:+.4f}）。"
+            f"面板不会平掉策略仓；要平请走运行器流程或人工确认。")
 
 
 def _split_fees(rows: list) -> tuple:
@@ -852,7 +890,26 @@ def create_app(
         at = request_external_resume(symbol, now=now_ms())
         return web.json_response({"ok": True, "symbol": symbol, "requested_ms": at})
 
-    async def api_trading_flatten_orphan(_request):
+    async def api_trading_flatten_orphan(request):
+        # 归属闸门：属于 shadow runner 的仓位，面板不得平掉。
+        client0 = review.executor.client
+        symbol0 = getattr(client0, "symbol", None) or "BTCUSDT"
+        if client0.configured:
+            try:
+                pos0 = await client0.get_position(symbol0)
+                signed0 = float(getattr(pos0, "quantity", 0) or 0) * (
+                    1.0 if (getattr(pos0, "side", "FLAT") or "").upper() == "LONG"
+                    else -1.0 if (getattr(pos0, "side", "FLAT") or "").upper() == "SHORT"
+                    else 0.0)
+                blocked = shadow_ledger_claim(symbol0, signed0)
+                if blocked:
+                    return web.json_response(
+                        {"ok": False, "stage": "ownership_gate",
+                         "error": "shadow_owned_position", "detail": blocked},
+                        status=409,
+                    )
+            except Exception as exc:  # noqa: BLE001  闸门自身出错不阻断既有流程
+                logger.warning("flatten_orphan 归属判定失败: %s", exc)
         out = await review.executor.flatten_orphan()
         return web.json_response(out)
 
@@ -949,11 +1006,19 @@ def create_app(
                 "reconciliation": recon,
             }, status=502)
 
-    async def api_testnet_flatten_now(_request):
+    async def api_testnet_flatten_now(request):
         """平掉当前观测到的 Testnet BTCUSDT 仓位，并强制重新对账。
 
         平仓后必须对账，否则本地账本会与交易所脱节并永久阻塞开仓。
+
+        归属闸门（2026-10-04）：若该仓位归 shadow runner 策略账本，默认拒绝；
+        只有请求体显式带 {"force": true} 才放行——避免面板误点平掉策略仓。
         """
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001  无 body / 非 JSON 都按未强制处理
+            body = {}
+        force = bool((body or {}).get("force"))
         client = review.executor.client
         if not client.configured:
             return web.json_response(
@@ -973,6 +1038,17 @@ def create_app(
                     "position_after": {"side": "FLAT", "quantity": 0.0},
                     "reconciliation": recon,
                 })
+            # 归属闸门：属于 shadow runner 的仓位必须显式强制才允许平。
+            signed_now = qty if side == "LONG" else (-qty if side == "SHORT" else 0.0)
+            blocked = shadow_ledger_claim(getattr(client, "symbol", None) or "BTCUSDT",
+                                          signed_now)
+            if blocked and not force:
+                return web.json_response(
+                    {"ok": False, "stage": "ownership_gate",
+                     "error": "shadow_owned_position", "detail": blocked,
+                     "hint": '确认要由面板强平时，请带 {"force": true} 重发。'},
+                    status=409,
+                )
             close = await client.place_limit_chase(
                 "SHORT" if side == "LONG" else "LONG", qty, reduce_only=True,
                 tag="usr",
