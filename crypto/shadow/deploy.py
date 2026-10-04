@@ -45,9 +45,11 @@ from shadow.strategy_books import (SPEC_15M, SPEC_5M, SPECS, TRADE_SYMBOLS,
 from trading.cost_model import (net_break_even_price, stop_price_from_avg,
                                stop_is_tighter)
 from trading.protective_orders import (ProtectionState,
-                                       algo_ident, algo_trigger,
+                                       algo_alive, algo_ident, algo_side,
+                                       algo_trigger,
                                        cancel_algo_by_id,
                                        find_take_profit,
+                                       is_take_profit_type,
                                        place_take_profit,
                                        fetch_open_algo_orders,
                                        find_protective_stop,
@@ -1247,14 +1249,44 @@ async def manage_take_profit(client: BinanceTestnetClient, st: dict, *,
         print(f"[{symbol} 止盈] 查询失败，本轮不动作: {exc}")
         return None
 
-    existing = find_take_profit(orders, side=side, trigger=level,
-                                tolerance=max(tick, 0.0))
-    if existing is not None:
-        tp = rec.setdefault("tp_orders", [])
-        aid = algo_ident(existing)
-        if not any(str(t.get("algo_id")) == aid for t in tp):
-            tp.append({"algo_id": aid, "trigger": algo_trigger(existing),
-                       "qty": qty, "stage": idx, "filled": False})
+    # ⚠ 匹配必须按 algoId，不能按触发价。
+    # 触发价是用「当前 ATR」重算的，而 1H ATR 每根 K 线都在变（实测一次
+    # 漂移 6.90）。用 tick 级容差按价格匹配就永远匹配不上，于是每轮都当成
+    # 「没有止盈单」再下一张 —— 实测每标的一轮就多一张，两张各占一半、
+    # 合起来把**整仓**平掉，分批设计直接废掉。
+    # 正确口径：触发价在挂出那一刻固定，之后按 algoId 认单。
+    want = "SELL" if side > 0 else "BUY"
+    live = [o for o in orders
+            if is_take_profit_type(o) and algo_alive(o) and algo_side(o) == want]
+    recorded = [t for t in (rec.get("tp_orders") or [])
+                if int(t.get("stage") or 0) == idx and not t.get("filled")]
+    recorded_ids = {str(t.get("algo_id") or "") for t in recorded}
+    keep = next((o for o in live if algo_ident(o) in recorded_ids), None)
+
+    if keep is None and live:
+        # 账本丢了记录（进程重启且状态文件被清）时，认养最接近目标价的那张，
+        # 而不是再下一张。带宽取 0.5×ATR，足够吸收 ATR 的正常漂移。
+        near = min(live, key=lambda o: abs(algo_trigger(o) - level))
+        if abs(algo_trigger(near) - level) <= max(0.5 * float(atr_1h), tick * 5):
+            keep = near
+
+    if keep is not None:
+        keep_id = algo_ident(keep)
+        # 同一批次只允许留一张。重复止盈单会叠加成整仓平仓，必须清掉。
+        for o in live:
+            if algo_ident(o) == keep_id:
+                continue
+            print(f"[{symbol} 止盈去重] 撤销重复止盈单 {algo_ident(o)} "
+                  f"触发价 {algo_trigger(o):.2f}（保留 {keep_id}）")
+            await cancel_algo_by_id(client, symbol, algo_ident(o))
+        rec["tp_orders"] = [t for t in (rec.get("tp_orders") or [])
+                            if int(t.get("stage") or 0) != idx
+                            or t.get("filled")]
+        rec.setdefault("tp_orders", []).append({
+            "algo_id": keep_id, "trigger": algo_trigger(keep),
+            "qty": float(keep.get("quantity") or qty),
+            "stage": idx, "filled": False,
+        })
         return None
 
     if not _protective_attempt_ok(f"{symbol}:tp"):

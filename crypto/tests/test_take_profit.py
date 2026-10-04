@@ -285,5 +285,84 @@ class TestTrailingStop(unittest.TestCase):
         self.assertAlmostEqual(target, AVG - 1.5 * ATR, delta=0.11)
 
 
+class TestTakeProfitNoDuplicateOnAtrDrift(unittest.TestCase):
+    """回归：止盈目标价随 ATR 漂移时，绝不能重复下单。
+
+    实测事故（2026-10-04 20:00）：1H ATR 漂移 6.90，目标价从 85309.40 变成
+    85302.50；原实现用 tick 级容差按**价格**匹配，永远匹配不上，于是每轮都
+    当成「没有止盈单」再下一张。每标的堆到两张、各占一半，合起来把**整仓**
+    平掉 —— 分批设计被废掉，剩余仓位也没得跟随。
+    """
+
+    def setUp(self):
+        _PROTECTIVE_ATTEMPT.clear()
+
+    def test_not_replaced_when_target_drifts(self):
+        ex = FakeExchange()
+        st = make_state()
+        _run(manage_take_profit(ex, st, symbol="BTCUSDT", ex_side=0.296,
+                                entry_px=AVG, atr_1h=ATR, execute=True))
+        self.assertEqual(ex.place_calls, 1)
+        # ATR 漂移 → 目标价变了，但已有止盈单必须被认出来，不能重下
+        _run(manage_take_profit(ex, st, symbol="BTCUSDT", ex_side=0.296,
+                                entry_px=AVG, atr_1h=ATR * 1.05, execute=True))
+        _run(manage_take_profit(ex, st, symbol="BTCUSDT", ex_side=0.296,
+                                entry_px=AVG, atr_1h=ATR * 0.93, execute=True))
+        self.assertEqual(ex.place_calls, 1,
+                         f"目标价漂移不得重复下单，实际下了 {ex.place_calls} 张")
+        self.assertEqual(len(ex.algo), 1)
+
+    def test_duplicates_are_canceled_keeping_one(self):
+        """已经堆出的重复止盈单必须被清掉，只留一张。"""
+        ex = FakeExchange()
+        st = make_state()
+        a = ex.seed(trig=AVG + 2 * ATR, otype="TAKE_PROFIT_MARKET", qty="0.1479")
+        b = ex.seed(trig=AVG + 2 * ATR - 6.90, otype="TAKE_PROFIT_MARKET",
+                    qty="0.1479")
+        rec = st.setdefault("protection", {}).setdefault("BTCUSDT", {})
+        rec["tp_orders"] = [
+            {"algo_id": a["algoId"], "trigger": AVG + 2 * ATR, "qty": 0.1479,
+             "stage": 0, "filled": False},
+            {"algo_id": b["algoId"], "trigger": AVG + 2 * ATR - 6.90,
+             "qty": 0.1479, "stage": 0, "filled": False},
+        ]
+        _run(manage_take_profit(ex, st, symbol="BTCUSDT", ex_side=0.296,
+                                entry_px=AVG, atr_1h=ATR, execute=True))
+        self.assertEqual(ex.place_calls, 0, "去重不该新下单")
+        self.assertEqual(len(ex.algo), 1, "重复止盈单必须被清到只剩一张")
+        self.assertEqual(len(rec["tp_orders"]), 1)
+
+    def test_total_tp_quantity_never_exceeds_intended_fraction(self):
+        """止盈数量合计必须等于设定的比例，而不是整仓。"""
+        ex = FakeExchange()
+        st = make_state()
+        for _ in range(4):
+            _run(manage_take_profit(ex, st, symbol="BTCUSDT", ex_side=0.296,
+                                    entry_px=AVG, atr_1h=ATR, execute=True))
+        total = sum(float(o["quantity"]) for o in ex.algo.values()
+                    if o["orderType"] == "TAKE_PROFIT_MARKET")
+        frac = TP_STAGES[0][1]
+        self.assertLessEqual(total, 0.296 * frac + 1e-4,
+                             f"止盈合计 {total} 超过设定比例 {frac}，会把整仓平掉")
+
+    def test_adopts_existing_tp_when_state_lost(self):
+        """状态文件丢了记录时，认养现存止盈单，而不是再下一张。"""
+        ex = FakeExchange()
+        st = make_state()
+        ex.seed(trig=AVG + 2 * ATR, otype="TAKE_PROFIT_MARKET", qty="0.148")
+        _run(manage_take_profit(ex, st, symbol="BTCUSDT", ex_side=0.296,
+                                entry_px=AVG, atr_1h=ATR, execute=True))
+        self.assertEqual(ex.place_calls, 0, "应认养现存单")
+        self.assertEqual(len(ex.algo), 1)
+
+    def test_places_when_truly_missing(self):
+        """确实没有止盈单时才下单。"""
+        ex = FakeExchange()
+        st = make_state()
+        _run(manage_take_profit(ex, st, symbol="BTCUSDT", ex_side=0.296,
+                                entry_px=AVG, atr_1h=ATR, execute=True))
+        self.assertEqual(ex.place_calls, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
