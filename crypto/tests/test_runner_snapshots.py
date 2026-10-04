@@ -114,6 +114,48 @@ class TestChaseNote(unittest.TestCase):
                          "maker 被动1次 成交价=84626.00 总单数=15")
 
 
+class TestEmptyTradeLogGetsHeader(unittest.TestCase):
+    """0 字节的台账文件也必须补表头。
+
+    2026-10-04：系统重置脚本留下空文件，而 log_row 只判「文件是否存在」，
+    于是表头永远缺失 → scripts/monitor_shadow.sh 每小时 KeyError('动作') 崩一次。
+    """
+
+    def _row_count(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return list(csv.reader(fh))
+
+    def test_zero_byte_file_still_gets_the_header(self):
+        tmp = tempfile.TemporaryDirectory()
+        old_log = deploy.TRADE_LOG
+        path = os.path.join(tmp.name, "deployed_trades.csv")
+        open(path, "w").close()                     # 0 字节空文件
+        deploy.TRADE_LOG = path
+        try:
+            deploy.log_row(["x"] * len(deploy.COLS))
+            rows = self._row_count(path)
+        finally:
+            deploy.TRADE_LOG = old_log
+            tmp.cleanup()
+        self.assertEqual(rows[0], deploy.COLS, "空文件必须补上表头")
+        self.assertEqual(len(rows), 2)
+
+    def test_existing_file_with_content_is_not_duplicated(self):
+        tmp = tempfile.TemporaryDirectory()
+        old_log = deploy.TRADE_LOG
+        path = os.path.join(tmp.name, "deployed_trades.csv")
+        deploy.TRADE_LOG = path
+        try:
+            deploy.log_row(["a"] * len(deploy.COLS))
+            deploy.log_row(["b"] * len(deploy.COLS))
+            rows = self._row_count(path)
+        finally:
+            deploy.TRADE_LOG = old_log
+            tmp.cleanup()
+        self.assertEqual(rows[0], deploy.COLS)
+        self.assertEqual(len(rows), 3, "表头只能写一次")
+
+
 class TestMarginSkipRow(unittest.TestCase):
     def test_margin_skip_row_is_twelve_columns_with_msg_in_note(self):
         # 2026-10-04: 该行曾只给 11 列，msg 错位写进「权益」列

@@ -32,15 +32,26 @@ if os.path.exists(state_p):
 
 rows = []
 if os.path.exists(trade_p):
+    # 2026-10-04：曾因 CSV 无表头 / 半行而 KeyError('动作')，整条监控崩掉。
+    # 这里先验列名、再逐行容错，坏数据只报一行、不抛异常。
     try:
-        rows = list(csv.DictReader(open(trade_p, encoding="utf-8")))
-    except Exception:
-        pass
+        with open(trade_p, encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            fields = reader.fieldnames or []
+            if "动作" in fields and "权益" in fields:
+                rows = [r for r in reader
+                        if isinstance(r.get("动作"), str)
+                        and isinstance(r.get("权益"), str)]
+            else:
+                print(f"[{now}] trade_log_invalid: 缺少动作/权益列 "
+                      f"(fields={fields[:4]})")
+    except Exception as exc:  # noqa: BLE001  监控不因台账坏而崩
+        print(f"[{now}] trade_log_invalid: {type(exc).__name__}: {exc}")
 
-opened = [r for r in rows if r["动作"].startswith("开")]
-closed = [r for r in rows if r["动作"] == "反手平仓"]
-halt = [r for r in rows if r["动作"] == "熔断"]
-eq = rows[-1]["权益"] if rows else "?"
+opened = [r for r in rows if r.get("动作", "").startswith("开")]
+closed = [r for r in rows if r.get("动作") == "反手平仓"]
+halt = [r for r in rows if r.get("动作") == "熔断"]
+eq = rows[-1].get("权益") if rows else "?"
 print(f"[{now}] running={running} 权益={eq} 开仓={len(opened)} 平仓={len(closed)} "
       f"熔断={len(halt)} halted={state.get('halted')} 最后K线={state.get('last_ts')}")
 PY

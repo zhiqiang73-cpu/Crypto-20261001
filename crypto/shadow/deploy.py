@@ -232,11 +232,21 @@ def _chase_note(r) -> str:
 
 
 def log_row(row: list) -> None:
+    """追加一行到交易台账；必要时先补表头。
+
+    ⚠ 表头判据必须是「文件不存在 **或 size==0**」。
+    2026-10-04：系统重置脚本留下了 0 字节的空文件，只判 exists 就不会写表头，
+    于是全部记录都没有列名，所有按列名读该 CSV 的读者（scripts/monitor_shadow.sh、
+    review/panel_server.py、review/chart_data.py）一起抛 KeyError，监控每小时崩一次。
+    """
     os.makedirs(OUT, exist_ok=True)
-    new = not os.path.exists(TRADE_LOG)
+    try:
+        need_header = os.path.getsize(TRADE_LOG) == 0
+    except OSError:
+        need_header = True          # 不存在 / 不可读 → 当作空
     with open(TRADE_LOG, "a", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        if new:
+        if need_header:
             w.writerow(COLS)
         w.writerow(row)
 
