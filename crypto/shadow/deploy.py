@@ -241,6 +241,22 @@ def log_row(row: list) -> None:
         w.writerow(row)
 
 
+def margin_skip_row(*, now_ms: int, symbol: str, ex: float, mark: float,
+                    msg: str) -> list:
+    """「保证金不足跳过」的台账行。
+
+    必须严格 12 列、与 COLS 一一对齐：此前少了一列，msg 落到「权益」列，
+    线上 monitor.log 出现 权益=保证金不足，跳过开仓...。
+    """
+    return [_fmt(now_ms),
+            f"{symbol_short(symbol)} 保证金不足跳过",
+            "多" if ex > 0 else ("空" if ex < 0 else "空仓"),
+            f"{abs(ex):.4f}", f"{mark:.2f}",
+            "", "", "",          # 净盈亏 / K / D
+            "", "", "",          # ATR_1H / 倍数 / 权益（跳过时没有权益可填）
+            msg]                 # 说明
+
+
 def record_order(r, *, action: str) -> None:
     """把策略自己下的委托号追加到台账。
 
@@ -573,11 +589,8 @@ async def sync_net(client: BinanceTestnetClient, st: dict, execute: bool, *,
                     now_ms = int(time.time() * 1000)
                     if should_report_skip(symbol, f"{desired:+.4f}|{side}", now_ms):
                         print(f"[{symbol} 净仓跳过] {msg}")
-                        log_row([_fmt(now_ms),
-                                 f"{symbol_short(symbol)} 保证金不足跳过",
-                                 "多" if ex > 0 else ("空" if ex < 0 else "空仓"),
-                                 f"{abs(ex):.4f}", f"{mark:.2f}", "", "", "",
-                                 "", "", msg])
+                        log_row(margin_skip_row(now_ms=now_ms, symbol=symbol,
+                                                ex=ex, mark=mark, msg=msg))
                     return OrderResult(
                         ok=False, symbol=symbol,
                         side="BUY" if delta > 0 else "SELL",
