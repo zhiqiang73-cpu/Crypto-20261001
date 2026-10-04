@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import tempfile
@@ -111,6 +112,29 @@ class TestChaseNote(unittest.TestCase):
                              passive=1)
         self.assertEqual(deploy._chase_note(r),
                          "maker 被动1次 成交价=84626.00 总单数=15")
+
+
+class TestMarginSkipRow(unittest.TestCase):
+    def test_margin_skip_row_is_twelve_columns_with_msg_in_note(self):
+        # 2026-10-04: 该行曾只给 11 列，msg 错位写进「权益」列
+        # （monitor.log 实测 权益=保证金不足，跳过开仓...）。
+        tmp = tempfile.TemporaryDirectory()
+        old_log = deploy.TRADE_LOG
+        deploy.TRADE_LOG = os.path.join(tmp.name, "deployed_trades.csv")
+        try:
+            deploy.log_row(deploy.margin_skip_row(
+                now_ms=1759500000000, symbol="BTCUSDT", ex=0.0, mark=60000.0,
+                msg="保证金不足，跳过开仓：需 100.00 > 可用 50.00"))
+            with open(deploy.TRADE_LOG, encoding="utf-8") as fh:
+                rows = list(csv.reader(fh))
+        finally:
+            deploy.TRADE_LOG = old_log
+            tmp.cleanup()
+        self.assertEqual(rows[0], deploy.COLS)
+        row = rows[1]
+        self.assertEqual(len(row), 12)
+        self.assertEqual(row[10], "")
+        self.assertIn("保证金不足", row[11])
 
 
 if __name__ == "__main__":
