@@ -18,9 +18,12 @@ import argparse
 import asyncio
 import copy
 import csv
+import fcntl
 import hashlib
 import json
 import os
+import shutil
+import sys
 import time
 import traceback
 from datetime import datetime, timezone
@@ -28,6 +31,7 @@ from typing import Optional
 
 import numpy as np
 
+from shadow.alerts import notify
 from shadow.engine import (ATR_MULT_K, BREAK_EVEN_TRIGGER_ATR, DISASTER_ATR,
                            GATE_FEE_RATE, LEVERAGE, MIN_QTY, NORMAL_STOP_ATR,
                            RISK_R, floor_step)
@@ -73,6 +77,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 OUT = os.path.join(ROOT, "runtime", "shadow")
 TRADE_LOG = os.path.join(OUT, "deployed_trades.csv")
 STATE = os.path.join(OUT, "deployed_state.json")
+# 状态备份：save_state 每次把**上一个可解析的版本**轮转到这里。
+# 主文件损坏时 load_state 回退到它，避免启动崩溃循环（2026-10-04 验收 B2）。
+STATE_BAK = STATE + ".bak"
 # 进程启动时刻（≈ 本模块导入时刻）。心跳据此区分「同一个进程跑了多久」
 # 与「进程被重启过」——旧进程会一直报同一个 started_ms。
 PROCESS_STARTED_MS = int(time.time() * 1000)
@@ -141,6 +148,9 @@ TRAIL_ATR = 1.0
 # 止盈/止损单的下单退避（共用）
 PROTECTIVE_RETRY_INTERVAL_MS = 30_000
 _PROTECTIVE_ATTEMPT: dict = {}
+# 连续拉 K 线失败计数。用于识别「进程活着但业务已经死了」——
+# 网络/DNS 长期故障时，循环照转、心跳照更新，但信号根本没在处理。
+_FETCH_FAIL_STREAK: dict = {}
 
 
 def _protective_attempt_ok(symbol: str) -> bool:
@@ -434,21 +444,147 @@ def record_order(r, *, action: str) -> None:
         pass
 
 
+def _default_state() -> dict:
+    return {"last_ts": 0, "peak": 0.0, "day": None, "day_start_eq": 0.0,
+            "halted": False, "entry": None}
+
+
+def _state_file_ok(path: str) -> bool:
+    """文件存在、非空、且能解析成 dict。用于判断「这份状态值得备份」。"""
+    try:
+        if os.path.getsize(path) <= 0:
+            return False
+        with open(path, encoding="utf-8") as fh:
+            return isinstance(json.load(fh), dict)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _recover_state() -> dict:
+    """主状态文件不可用：留证 → 回退备份 → 都没有才用默认值。"""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    quarantined = f"{STATE}.corrupt-{stamp}"
+    try:
+        os.replace(STATE, quarantined)
+        detail = f"损坏文件保留为 {os.path.basename(quarantined)}"
+    except OSError as exc:
+        detail = f"损坏文件改名失败: {exc}"
+    if _state_file_ok(STATE_BAK):
+        try:
+            with open(STATE_BAK, encoding="utf-8") as fh:
+                st = json.load(fh)
+            notify("CRITICAL", "state_recovered_from_backup",
+                   "状态文件损坏，已从备份恢复",
+                   f"{detail}；已回退 {os.path.basename(STATE_BAK)}")
+            return migrate_state(st)
+        except Exception as exc:  # noqa: BLE001
+            detail += f"；备份也读不了: {exc}"
+    notify("CRITICAL", "state_reset_to_default",
+           "状态文件损坏且无可用备份，已重置为默认状态",
+           f"{detail}；账本已丢失，请人工核对交易所实仓与保护单")
+    return migrate_state(_default_state())
+
+
 def load_state() -> dict:
-    if os.path.exists(STATE):
-        with open(STATE, encoding="utf-8") as fh:
-            st = json.load(fh)
-    else:
-        st = {"last_ts": 0, "peak": 0.0, "day": None, "day_start_eq": 0.0,
-              "halted": False, "entry": None}
-    return migrate_state(st)
+    """读状态。**损坏时必须自愈，绝不能把进程带崩。**
+
+    2026-10-04 验收（B2）：旧实现只兜底「文件不存在」，文件**损坏**直接抛
+    JSONDecodeError → 进程退出 → launchd KeepAlive 立刻拉起 → 再崩，形成
+    永不放弃的崩溃循环，而且没有任何人会知道。
+    """
+    if not os.path.exists(STATE):
+        return migrate_state(_default_state())
+    if _state_file_ok(STATE):
+        try:
+            with open(STATE, encoding="utf-8") as fh:
+                return migrate_state(json.load(fh))
+        except Exception as exc:  # noqa: BLE001 校验通过后被改写（竞态）
+            print(f"[状态] 读取失败（校验后竞态）: {type(exc).__name__}: {exc}")
+    print("[状态] ⚠️ 主状态文件不可解析，进入恢复流程")
+    return _recover_state()
 
 
 def save_state(st: dict) -> None:
+    """写状态。**原子替换 + fsync 落盘 + 轮转备份。**
+
+    2026-10-04 验收（B2 上游成因）：旧实现用 os.replace 保证目录项替换原子，
+    但**没有 fsync**，断电时数据可能仍在页缓存，状态文件会变成空文件或截断的
+    JSON。同一仓库的 position_manager.py / journal.py 都做了 fsync，只有最
+    关键的状态链漏了。
+    """
     os.makedirs(OUT, exist_ok=True)
-    with open(STATE + ".tmp", "w", encoding="utf-8") as fh:
+    tmp = STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(st, fh, ensure_ascii=False, indent=2)
-    os.replace(STATE + ".tmp", STATE)
+        fh.flush()
+        os.fsync(fh.fileno())
+    # 只在现有文件**可解析**时轮转备份，避免把损坏内容覆盖掉好备份。
+    if _state_file_ok(STATE):
+        try:
+            shutil.copy2(STATE, STATE_BAK)
+        except OSError as exc:
+            print(f"[状态] 备份失败（不阻断）: {exc}")
+    os.replace(tmp, STATE)
+    # rename 本身也要 fsync 目录，否则掉电后可能「数据落了但名字没落」。
+    try:
+        dfd = os.open(OUT, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+# 单实例锁。用 flock 而不是 pidfile：内核在进程死亡时自动释放，
+# kill -9 不会留下死锁 —— 这正是无人值守场景需要的语义。
+LOCK = os.path.join(OUT, "trader.lock")
+_LOCK_FH = None
+
+
+def acquire_single_instance_lock() -> bool:
+    """独占单实例锁。拿不到返回 False（调用方应以非零码退出）。
+
+    2026-10-04 验收（B1）：全仓没有任何互斥机制。两个 trader 会各自判断
+    信号、各自下单；clientAlgoId 含 pid，所以交易所不会替你去重；两个进程
+    还会同时写 deployed_state.json，后写者静默覆盖先写者。
+    """
+    global _LOCK_FH
+    os.makedirs(OUT, exist_ok=True)
+    try:
+        fh = open(LOCK, "a+", encoding="utf-8")
+    except OSError as exc:
+        print(f"[拒绝启动] 无法打开锁文件 {LOCK}: {exc}")
+        return False
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        holder = ""
+        try:
+            fh.seek(0)
+            holder = (fh.read() or "").strip()[:200]
+        except OSError:
+            pass
+        fh.close()
+        msg = (f"已有运行器实例持有单实例锁；持有者={holder or '未知'}；"
+               f"本进程 pid={os.getpid()} 退出，避免重复下单")
+        print(f"[拒绝启动] {msg}")
+        notify("CRITICAL", "duplicate_instance_blocked",
+               "检测到重复启动，已拒绝第二个实例", msg)
+        return False
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(json.dumps(
+            {"pid": os.getpid(),
+             "started": datetime.now().isoformat(timespec="seconds"),
+             "argv": sys.argv}, ensure_ascii=False))
+        fh.flush()
+        os.fsync(fh.fileno())
+    except OSError:
+        pass
+    _LOCK_FH = fh          # 必须持有引用：句柄一关，锁就释放
+    return True
 
 
 def save_reading(rec: dict, path: Optional[str] = None) -> None:
@@ -1109,6 +1245,9 @@ async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
     except Exception as exc:  # noqa: BLE001 查不到 ≠ 没有，按未确认处理
         set_protection_state(st, symbol, state="UNKNOWN",
                              note=f"openAlgoOrders 查询失败: {exc}")
+        notify("WARNING", f"protection_query_fail_{symbol}",
+               f"{symbol} 保护单查询失败，保护状态未知",
+               f"{type(exc).__name__}: {exc}")
         return {"action": "保护单查询失败", "note": str(exc)}
 
     # 目标价是 avg ± N×ATR 算出来的，而 1H ATR 每根 K 线都在变。若拿精确
@@ -1182,6 +1321,9 @@ async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
     # 未确认：按未保护处理，并禁止开新仓
     set_protection_state(st, symbol, state=res.state.value,
                          note=f"{verb}未确认: {res.error}")
+    notify("CRITICAL", f"protection_unconfirmed_{symbol}",
+           f"{symbol} 保护单{verb}未确认，该标的已禁止开新仓",
+           f"仓位仍由软件止损兜底；原因: {res.error}")
     # UNKNOWN 不是失败：请求可能已落地但确认查询遇到 429/网络问题。
     # 持久化同一 clientAlgoId，下一轮按 ID 回查/重试，禁止重复下单。
     rec = st.setdefault("protection", {}).setdefault(symbol, {})
@@ -1679,8 +1821,15 @@ def _fetch_symbol_bars(symbol: str, now: int):
         b1h = (_closed_bars(fetch("1h", 300, symbol), 60 * 60 * 1000, now)
                if not old or old["slot1h"] != slot1h else old["b1h"])
     except Exception as exc:  # noqa: BLE001
-        print(f"[{symbol}] 拉 K 线失败: {exc}")
+        n = int(_FETCH_FAIL_STREAK.get(symbol, 0)) + 1
+        _FETCH_FAIL_STREAK[symbol] = n
+        print(f"[{symbol}] 拉 K 线失败（连续 {n} 次）: {exc}")
+        notify("WARNING" if n < 20 else "CRITICAL",
+               f"kline_fetch_fail_{symbol}",
+               f"{symbol} 连续 {n} 次拉 K 线失败，该标的信号处理已停摆",
+               f"最后错误: {type(exc).__name__}: {exc}")
         return None
+    _FETCH_FAIL_STREAK.pop(symbol, None)
     atr1h = atr_wilder(b1h["high"], b1h["low"], b1h["close"], 14)
     pack = {
         "15m": (b15, _align_atr(b15["ts"], SPEC_15M.interval_ms, b1h, atr1h)),
@@ -2065,6 +2214,10 @@ async def main() -> int:
     ap.add_argument("--once", action="store_true")
     args = ap.parse_args()
 
+    # 单实例闸门（2026-10-04 验收 B1）。只在下单模式取锁，避免挡住只读观察脚本。
+    if args.execute and not acquire_single_instance_lock():
+        return 2
+
     client = BinanceTestnetClient()
     if not client.configured:
         print("未配置 Testnet 密钥"); return 1
@@ -2073,6 +2226,9 @@ async def main() -> int:
     if mode.value == "live":
         print("拒绝启动: TRADING_MODE=live 被安全闸门阻断"); return 1
     print(f"运行模式: {mode.value}")
+    notify("INFO", "runner_started", "交易运行器已启动",
+           f"pid={os.getpid()} mode={mode.value} "
+           f"{'真实下单' if args.execute else '仅观察'} interval={args.interval}s")
 
     # ---- 市场一致性闸门 ----------------------------------------------------
     # 2026-10-02 事故的硬性防复发措施: 行情腿与下单腿必须同市场。
@@ -2110,6 +2266,9 @@ async def main() -> int:
         except Exception as exc:  # noqa: BLE001 对账失败不阻断启动，但会记录
             print(f"[启动对账] 失败（不阻断启动，主循环仍会逐轮修复）："
                   f"{type(exc).__name__}: {exc}")
+            notify("WARNING", "startup_reconcile_failed",
+                   "启动保护单对账失败，保护状态未知",
+                   f"{type(exc).__name__}: {exc}")
             print(traceback.format_exc())
 
     if args.execute:
