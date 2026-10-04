@@ -1095,6 +1095,14 @@ async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
     book = book_for_symbol(st, symbol)
     prev = dict((book or {}).get("exchange_stop") or {})
     prev_id = str(prev.get("algo_id") or "")
+    ps = protection_state(st, symbol)
+    pending_cid = str(ps.get("pending_client_algo_id") or "")
+    pending_trigger = float(ps.get("pending_trigger") or 0.0)
+    # 下单可能已落地但确认查询遇到 429。后续重试复用同一 clientAlgoId，
+    # 避免每个退避周期都产生一张新的保护单。
+    if (pending_cid and pending_trigger > 0 and
+            abs(pending_trigger - target) > max(float(_tick), 0.01)):
+        pending_cid = ""
 
     try:
         orders = await fetch_open_algo_orders(client, symbol)
@@ -1137,12 +1145,14 @@ async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
     if prev_id:
         res = await tighten_protective_stop(
             client, symbol=symbol, side=side, new_trigger=target,
-            old_algo_id=prev_id, quantity=abs(ex_side), close_position=True)
+            old_algo_id=prev_id, quantity=abs(ex_side), close_position=True,
+            client_algo_id=pending_cid or None)
         verb = "收紧"
     else:
         res = await place_protective_stop(
             client, symbol=symbol, side=side, trigger_price=target,
-            quantity=abs(ex_side), close_position=True)
+            quantity=abs(ex_side), close_position=True,
+            client_algo_id=pending_cid or None)
         verb = "建立"
 
     if res.protects:
@@ -1155,6 +1165,9 @@ async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
             note=(f"{verb}保护单成功，触发价 {res.trigger_price:.2f}"
                   + (f"；旧单撤销未确认 {res.error}" if res.error else "")),
             algo_id=res.algo_id, trigger=res.trigger_price)
+        rec = st.setdefault("protection", {}).setdefault(symbol, {})
+        rec.pop("pending_client_algo_id", None)
+        rec.pop("pending_trigger", None)
         detail = (f"{symbol} {verb}交易所保护单：{('多' if side > 0 else '空')} "
                   f"触发价 {res.trigger_price:.2f}（{abs(ex_side):.4f}）"
                   f"{'，已由交易所接管止损' if not res.error else ''}")
@@ -1169,6 +1182,12 @@ async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
     # 未确认：按未保护处理，并禁止开新仓
     set_protection_state(st, symbol, state=res.state.value,
                          note=f"{verb}未确认: {res.error}")
+    # UNKNOWN 不是失败：请求可能已落地但确认查询遇到 429/网络问题。
+    # 持久化同一 clientAlgoId，下一轮按 ID 回查/重试，禁止重复下单。
+    rec = st.setdefault("protection", {}).setdefault(symbol, {})
+    if res.client_algo_id:
+        rec["pending_client_algo_id"] = res.client_algo_id
+        rec["pending_trigger"] = float(target)
     print(f"[{symbol} ⚠️ 保护单{verb}未确认] {res.error}；"
           f"该标的暂停开新仓，软件止损继续兜底")
     return {"action": f"保护单{verb}未确认", "note": res.error,
