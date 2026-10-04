@@ -1338,28 +1338,39 @@ async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
 
 async def clear_ledger_if_stop_fired(client: BinanceTestnetClient, st: dict, *,
                                      symbol: str, ex_side: float) -> bool:
-    """交易所已空仓、但账本还记着仓位时，判断是不是保护单打掉的，是就清账本。
+    """交易所已空仓时，判定「是不是我们自己的保护单打掉的」，并收拾状态。
 
     必要性：保护单由交易所触发成交，运行器不是下单方。若不处理，账本仍记着
     多头，净仓同步会认为「目标有仓、实际空仓」，把仓位**补回来** —— 正是要
     杜绝的行为。
 
-    判定必须具体：只有「账本里记的那张保护单已不在 openAlgoOrders 里」才认定
-    是保护单成交。查不到就**不清**，宁可下一轮再判，也不误清账本。
+    判定必须具体：只有「账本/状态里记的那些单已不在 openAlgoOrders 里」才
+    认定是自己的单成交。查不到就**不清**，宁可下一轮再判，也不误清账本。
+
+    两种进入形态（都会收拾，区别只在要不要报「成交」）：
+      A. 账本还记着仓 + 我们的单没了  → 保护单成交：清账本 + 告警 + 记 FLAT
+      B. 账本已空 + 状态残留          → 清理残留：记 FLAT（不重复告警）
+
+    形态 B 是 2026-10-04 实测事故的余波：成交判定当时排在 apply_external
+    之后，账本已被当作「人工减仓」清空，于是形态 A 的守卫永远返回 False，
+    而形态 B 当时压根不存在 —— 残留的 PROTECTED 会一直留着。残留有害：
+    过期的 best_price 会让**下一笔多头仓**在首轮就 max(旧高价, 现价) 判为
+    已盈利，立刻武装保本止损。
     """
     if abs(ex_side) >= MIN_QTY:
         return False
     book = book_for_symbol(st, symbol)
-    if not book or not book.get("entry"):
-        return False
-    # 止损单与所有止盈单都算「我们自己的单」。仓位归零时，只要还有任何一张
-    # 在挂，就说明不是被它们打掉的（可能是人工平仓），不擅自清账本。
-    ours = {str((book.get("exchange_stop") or {}).get("algo_id") or "")}
-    for t in (protection_state(st, symbol).get("tp_orders") or []):
+    has_entry = bool(book and book.get("entry"))
+    ps = protection_state(st, symbol)
+    # 止损单、止盈单、以及状态里记着的单号，都算「我们自己的单」。
+    ours = {str((book.get("exchange_stop") or {}).get("algo_id") or "")} \
+        if book else set()
+    for t in (ps.get("tp_orders") or []):
         ours.add(str(t.get("algo_id") or ""))
+    ours.add(str(ps.get("algo_id") or ""))
     ours.discard("")
     if not ours:
-        return False
+        return False        # 没有任何属于我们的单 → 无从判断
     try:
         orders = await fetch_open_algo_orders(client, symbol)
     except Exception as exc:  # noqa: BLE001
@@ -1367,18 +1378,59 @@ async def clear_ledger_if_stop_fired(client: BinanceTestnetClient, st: dict, *,
         return False
     if any(algo_ident(o) in ours for o in orders):
         return False        # 我们的单还在，仓位是别的原因变空的 → 不擅自清
+
+    if not has_entry:
+        # 形态 B：账本早空了，只是状态没收拾。静默清理，避免重复告警。
+        _mark_flat(st, symbol,
+                   float(ps.get("trigger") or ps.get("fired_trigger") or 0.0),
+                   announce=False)
+        print(f"[{symbol} 保护状态] 已空仓但状态残留，清理为 FLAT")
+        return False
+
+    # 形态 A：保护单成交。
     rec = dict(book.get("exchange_stop") or {})
     trig = float(rec.get("trigger") or 0.0)
     clear_symbol_books(st, symbol)
     if symbol == "BTCUSDT":
         st["entry"] = None
-    set_protection_state(st, symbol, state="PROTECTED",
-                         note=f"保护单已触发成交（触发价 {trig:.2f}），账本已清零")
-    print(f"[{symbol} 保护单已成交] 触发价 {trig:.2f}；账本清零，不补回，等下一根信号")
+    _mark_flat(st, symbol, trig, announce=True)
     log_row([_fmt(0), f"{symbol_short(symbol)} 保护单成交",
              "", "", f"{trig:.2f}", "", "", "", "", "", "",
              f"{symbol} 交易所保护单触发平仓，账本清零"])
     return True
+
+
+def _mark_flat(st: dict, symbol: str, trigger: float, *,
+               announce: bool) -> None:
+    """把保护状态记为 FLAT 并清掉属于**上一笔仓位**的残留字段。
+
+    状态记 FLAT 而不是 PROTECTED：仓位已经没了，再声称「受保护」是假的。
+    protection_blocked 只拦截 PROTECTED/UNKNOWN/UNPROTECTED，FLAT 不会误挡新仓。
+
+    必须清掉 algo_id / tp_orders / best_price —— 否则下一笔仓位会拿着上一笔的
+    死亡单号去「收紧」，或误判止盈批次，或因过期 best_price 立刻武装保本。
+    """
+    rec = protection_state(st, symbol)
+    rec.update({
+        "state": "FLAT",
+        "note": (f"保护单已触发成交（触发价 {trigger:.2f}），账本已清零"
+                 if announce else "已空仓，清理上一笔的残留保护状态"),
+        "algo_id": "",
+        "trigger": 0.0,
+        "tp_orders": [],
+        "tp_filled": 0,
+        "best_price": 0.0,
+        "fired_at": int(time.time() * 1000),
+        "fired_trigger": float(trigger or 0.0),
+        "fired_kind": "exchange_stop",
+    })
+    if announce:
+        print(f"[{symbol} 保护单已成交] 触发价 {trigger:.2f}；"
+              f"账本清零，不补回，等下一根信号")
+        # 止损成交是无人值守时必须知道的事件 —— 此前它只打一行 stdout。
+        notify("CRITICAL", f"stop_fired_{symbol}",
+               f"{symbol} 保护单已触发平仓（触发价 {trigger:.2f}）",
+               f"交易所净额已归零，账本已清零且不补回；等待下一根信号")
 
 
 async def manage_take_profit(client: BinanceTestnetClient, st: dict, *,
@@ -1912,6 +1964,23 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
     pos = await client.get_position(symbol)
     ex_side = _signed_qty(pos)
     entry_px = float(getattr(pos, "entry_price", 0.0) or 0.0)
+
+    # 交易所保护单已成交 → **必须先于人工干预判定**。
+    #
+    # 2026-10-04 实测事故：BTC 保护单 20:47 触发平仓，但本判定原先排在
+    # apply_external 之后 —— 账本已被当作「人工减仓」清空，前置守卫
+    # `if not book.get("entry")` 直接返回 False，保护单成交判定**永远不可能
+    # 生效**：成交被误记成人工干预，没有正确归属，也没有任何告警。
+    #
+    # 顺序原则：**先认出自己的动作，再怀疑别人。**
+    # 开销可忽略：有仓时首行就返回；只有「已空仓但账本还记着仓」才会查单。
+    try:
+        if await clear_ledger_if_stop_fired(client, st, symbol=symbol,
+                                           ex_side=ex_side):
+            return
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{symbol} 保护单成交判定] 异常: {exc}")
+
     # 人工干预检测：必须排在信号处理与净仓同步之前。
     # 2026-10-02 19:47 用户在网页手动平仓, 11/35 秒后被运行器原样补回 ——
     # 就是因为这里没有区分「谁动的仓」。
@@ -1998,14 +2067,6 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
         except Exception as exc:  # noqa: BLE001 保护单管理失败不得拖垮整个标的
             print(f"[{symbol} 保护单] 管理异常: {type(exc).__name__}: {exc}")
             ex_stop_state = "UNKNOWN"
-
-    # 交易所保护单已成交 → 账本清零，绝不补回
-    try:
-        if await clear_ledger_if_stop_fired(client, st, symbol=symbol,
-                                           ex_side=ex_side):
-            return
-    except Exception as exc:  # noqa: BLE001
-        print(f"[{symbol} 保护单成交判定] 异常: {exc}")
 
     # 分批止盈：按 TP_STAGES 逐批挂单
     if ex_side != 0.0 and TP_ENABLED and execute:
