@@ -114,6 +114,52 @@ class TestChaseNote(unittest.TestCase):
                          "maker 被动1次 成交价=84626.00 总单数=15")
 
 
+class TestHeartbeatExposesLoadedParams(unittest.TestCase):
+    """心跳必须写明进程**实际加载**的参数。
+
+    2026-10-04：RISK_R 从 0.03 改成 0.01 后，从心跳/面板完全看不出线上进程
+    其实还在跑旧的 0.03（编辑不热加载）。有了这组字段，比对一眼即可发现
+    「进程配置 ≠ 磁盘配置」。
+    """
+
+    def _heartbeat(self):
+        tmp = tempfile.TemporaryDirectory()
+        old_out, old_hb = deploy.OUT, deploy.HEARTBEAT
+        deploy.OUT = tmp.name
+        deploy.HEARTBEAT = os.path.join(tmp.name, "runner_heartbeat.json")
+        try:
+            deploy.save_heartbeat(status="running", execute=True)
+            with open(deploy.HEARTBEAT, encoding="utf-8") as fh:
+                return json.load(fh)
+        finally:
+            deploy.OUT, deploy.HEARTBEAT = old_out, old_hb
+            tmp.cleanup()
+
+    def test_params_block_matches_loaded_module_constants(self):
+        rec = self._heartbeat()
+        params = rec.get("params") or {}
+        self.assertEqual(params.get("risk_r"), deploy.RISK_R)
+        self.assertEqual(params.get("margin_budget_per_trade"),
+                         deploy.MARGIN_BUDGET_PER_TRADE)
+        self.assertEqual(params.get("leverage"), deploy.LEVERAGE)
+        self.assertEqual(params.get("max_layers"),
+                         {spec.id: spec.max_layers for spec in deploy.SPECS})
+
+    def test_heartbeat_carries_pid_start_time_and_fingerprint(self):
+        rec = self._heartbeat()
+        self.assertEqual(rec.get("pid"), os.getpid())
+        self.assertEqual(rec.get("started_ms"), deploy.PROCESS_STARTED_MS)
+        self.assertTrue(rec.get("params_fingerprint"))
+
+    def test_fingerprint_is_stable_and_changes_with_params(self):
+        base = deploy.runtime_params()
+        self.assertEqual(deploy.params_fingerprint(base),
+                         deploy.params_fingerprint(dict(base)))
+        changed = dict(base, risk_r=base.get("risk_r", 0) + 1)
+        self.assertNotEqual(deploy.params_fingerprint(base),
+                            deploy.params_fingerprint(changed))
+
+
 class TestEmptyTradeLogGetsHeader(unittest.TestCase):
     """0 字节的台账文件也必须补表头。
 

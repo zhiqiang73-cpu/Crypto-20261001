@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import copy
 import csv
+import hashlib
 import json
 import os
 import time
@@ -54,6 +55,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 OUT = os.path.join(ROOT, "runtime", "shadow")
 TRADE_LOG = os.path.join(OUT, "deployed_trades.csv")
 STATE = os.path.join(OUT, "deployed_state.json")
+# 进程启动时刻（≈ 本模块导入时刻）。心跳据此区分「同一个进程跑了多久」
+# 与「进程被重启过」——旧进程会一直报同一个 started_ms。
+PROCESS_STARTED_MS = int(time.time() * 1000)
 # 策略「此刻的读数」快照 —— 供面板展示, 便于用户拿它和图表逐项核对。
 READING = os.path.join(OUT, "latest_reading.json")
 READING_5M = os.path.join(OUT, "latest_reading_5m.json")
@@ -329,9 +333,35 @@ def save_reading(rec: dict, path: Optional[str] = None) -> None:
         pass
 
 
+def runtime_params() -> dict:
+    """本进程**实际加载**的关键参数快照。
+
+    2026-10-04：RISK_R 被改成 0.01 之后，从心跳/面板完全看不出线上进程其实还
+    加载着旧的 0.03（编辑不热加载）。把这些值写进心跳，比对一眼即可发现
+    「进程跑的配置 ≠ 磁盘上的配置」。
+    """
+    return {
+        "risk_r": RISK_R,
+        "margin_budget_per_trade": MARGIN_BUDGET_PER_TRADE,
+        "leverage": LEVERAGE,
+        "atr_mult_k": ATR_MULT_K,
+        "disaster_atr": DISASTER_ATR,
+        "block_on_daily_loss": BLOCK_ON_DAILY_LOSS,
+        "halt_on_max_drawdown": HALT_ON_MAX_DRAWDOWN,
+        "max_layers": {spec.id: spec.max_layers for spec in SPECS},
+    }
+
+
+def params_fingerprint(params: dict) -> str:
+    """参数快照的短指纹；同样的配置得到同样的指纹。"""
+    blob = json.dumps(params, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+
 def save_heartbeat(*, status: str, execute: bool, detail: str = "") -> None:
     """原子写入运行器心跳，供面板判断是否因进程退出而暂停。"""
     os.makedirs(OUT, exist_ok=True)
+    params = runtime_params()
     rec = {
         "status": status,
         "mode": "testnet_orders" if execute else "observation_only",
@@ -342,6 +372,11 @@ def save_heartbeat(*, status: str, execute: bool, detail: str = "") -> None:
         "symbols": list(TRADE_SYMBOLS),
         "interval_sec": 15,
         "strategies": [spec.id for spec in SPECS],
+        # 进程身份与「实际加载的参数」——用来分辨旧进程仍在跑旧配置。
+        "pid": os.getpid(),
+        "started_ms": PROCESS_STARTED_MS,
+        "params": params,
+        "params_fingerprint": params_fingerprint(params),
     }
     try:
         with open(HEARTBEAT + ".tmp", "w", encoding="utf-8") as fh:
