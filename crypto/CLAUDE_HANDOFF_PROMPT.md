@@ -1,4 +1,4 @@
-# Claude 本地继续开发提示词：BTCUSDT 量化交易系统
+> **更新 2026-10-04 11:06 CST**：`RISK_R` 已改为 **0.01**（见 `docs/maintenance/HANDOFF_TO_CLAUDE.md` / `CLAUDE_NOTIFY_RISK_R.md`）。用户要求先**不要重启** trader。\n\n# Claude 本地继续开发提示词：BTCUSDT 量化交易系统
 
 你现在接手一个已经完成第一阶段搭建的本地 BTCUSDT 量化交易系统。请**不要从零重写**，也**不要只做静态页面**。你的任务是：先完整审计现有代码与运行状态，再按优先级修复真实存在的交易正确性问题。
 
