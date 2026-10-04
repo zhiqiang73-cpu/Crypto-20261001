@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import Any, Dict, Optional
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -43,6 +44,11 @@ sys.path.insert(0, ROOT)
 # 净仓对齐死区：与 shadow/deploy.py::SYNC_MIN_DELTA 同口径（2 个最小步长）。
 # 步长取整会让账本与交易所偶尔差一个步长，那种差值不构成「不属于同一笔仓」。
 MIN_SYNC_STEP = 0.002
+
+# 账本缓存：完整持仓周期要按 ≤7 天分窗拉多页成交与资金费，若每次刷新都全量
+# 重拉会明显加重 REST 负担（此前已因轮询过密被交易所限流）。默认 30 秒内复用。
+LEDGER_TTL_MS = 30_000
+_LEDGER_CACHE: Dict[str, Any] = {"at_ms": 0, "data": None}
 
 DEFAULT_RECORD_START = "2026-10-02"
 RECORD_START_FILE = os.path.join(ROOT, "config", "record_start.json")
@@ -161,6 +167,9 @@ def _quality_context(start_ms: int = 0) -> Dict[str, Any]:
     return {
         "recorded_max_drawdown": max_drawdown,
         "recorded_equity_points": len(equity),
+        # 日亏额度与峰值：从运行器状态文件带出，供前端风控状态条使用。
+        "day_start_eq": float(state.get("day_start_eq") or 0) or None,
+        "peak": float(state.get("peak") or 0) or None,
         "recent_reasons": [
             {"text": text, "count": count}
             for text, count in reasons.most_common(4)
@@ -211,75 +220,6 @@ def shadow_ledger_claim(symbol: str, exchange_signed: float) -> str:
     return (f"{symbol} 这笔净仓归 shadow runner 策略账本"
             f"（账本 {ledger:+.4f} / 交易所 {exchange_signed:+.4f}）。"
             f"面板不会平掉策略仓；要平请走运行器流程或人工确认。")
-
-
-def _split_fees(rows: list) -> tuple:
-    """手续费按 maker / taker 拆开，两项单列而不是只给合计。"""
-    maker = taker = 0.0
-    for t in rows:
-        fee = float(t.get("commission", 0) or 0)
-        if t.get("maker"):
-            maker += fee
-        else:
-            taker += fee
-    return maker, taker
-
-
-def _open_notional(rows: list) -> float:
-    """开仓名义金额合计（不依赖复利）。
-
-    币安逐笔成交里平仓腿才带 realizedPnl，开仓腿 realizedPnl 为 0，
-    因此以 realizedPnl == 0 的成交腿近似开仓名义，作为单笔净边际的分母。
-    """
-    total = 0.0
-    for t in rows:
-        if abs(float(t.get("realizedPnl", 0) or 0)) > 1e-9:
-            continue
-        total += abs(float(t.get("price", 0) or 0) * float(t.get("qty", 0) or 0))
-    return total
-
-
-def _realized_curve_drawdown(rows: list) -> Dict[str, Any]:
-    """按成交时间累加净额（已实现 − 手续费），取峰值回撤（USDT）。"""
-    points = [
-        (
-            int(t.get("time", 0) or 0),
-            float(t.get("realizedPnl", 0) or 0)
-            - float(t.get("commission", 0) or 0),
-        )
-        for t in rows
-    ]
-    points.sort(key=lambda x: x[0])
-    cum = peak = mdd = 0.0
-    for _, net in points:
-        cum += net
-        peak = max(peak, cum)
-        mdd = max(mdd, peak - cum)
-    return {"realized_max_drawdown": mdd, "realized_net_cum": cum, "samples": len(points)}
-
-
-async def _funding_fee(client, start_ms: int) -> Optional[float]:
-    """资金费合计：读交易所 income 明细（FUNDING_FEE）。读不到返回 None。"""
-    fn = getattr(client, "income", None)
-    if fn is None:
-        return None
-    total = 0.0
-    ok = False
-    for symbol in TRADE_SYMBOLS:
-        try:
-            rows = await fn(
-                symbol=symbol,
-                income_type="FUNDING_FEE",
-                limit=1000,
-                start_time=start_ms or None,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("funding %s: %s", symbol, exc)
-            continue
-        ok = True
-        for r in rows or []:
-            total += float(r.get("income", 0) or 0)
-    return total if ok else None
 
 
 def _slippage_estimate(positions: Optional[Dict[str, Any]] = None,
@@ -435,7 +375,7 @@ from config.strategy_registry import load_registry, upsert_strategy
 from engine.scorer import FactorScoringEngine
 from models.review import SettleStatus, TradeRecord, now_ms
 from models.signals import DimensionScores, StrategyHorizon
-from review import meta_review, overrides, review_loop
+from review import cycle_pnl, meta_review, overrides, review_loop
 from review.order_sources import (SOURCE_LABELS, annotate_orders, annotate_trades,
                                   load_strategy_order_ids, summarize)
 from shadow.strategy_books import (SPEC_5M, SPEC_ETH_5M, TRADE_SYMBOLS,
@@ -1465,8 +1405,13 @@ def create_app(
     async def api_account_summary(_request):
         """账户汇总: 余额 + 已实现/未实现盈亏 + 手续费 + 胜率与盈亏比.
 
-        顶层是最近七天内且在起算日之后；available_history 是最近七天最多200笔。
-        不能将默认近七天窗口伪称「全部历史」或「累计收益」。
+        口径（2026-10-04 审计后修正）: 顶层是**自记录起点起的完整持仓周期**。
+        每一笔 = 一次从空仓到再次空仓的完整交易（开仓/加层/减仓/反手/平仓
+        配对），净额 = 已实现 − 手续费 + 资金费。不再是「每标的最近 200 笔
+        成交腿」——那会把分批平仓算成多笔交易、并漏掉窗口外的开仓手续费。
+
+        覆盖度由 coverage 字段给出：数据起点、是否被截断、以及有没有被窗口
+        切成两半的持仓（orphan_closes）。
         """
         client = review.executor.client
         if not client.configured:
@@ -1479,68 +1424,37 @@ def create_app(
             upnl = float(getattr(bal, "total_unrealized_pnl", 0) or 0)
             if not upnl:
                 upnl = float(getattr(pos, "unrealized_pnl", 0) or 0)
-            all_trades = []
-            try:
-                all_trades = await _rows_for_symbols(client, "user_trades", 200)
-            except Exception as exc:
-                return web.json_response({"connected": False,
-                                          "reason": f"成交查询失败: {type(exc).__name__}: {exc}"})
-
-            def bucket(rows):
-                pnls = [float(t.get("realizedPnl", 0) or 0) for t in rows]
-                realized = sum(pnls)
-                commission = sum(float(t.get("commission", 0) or 0) for t in rows)
-                wins = sum(1 for p in pnls if p > 0)
-                losses = sum(1 for p in pnls if p < 0)
-                gross_win = sum(p for p in pnls if p > 0)
-                gross_loss = -sum(p for p in pnls if p < 0)
-                avg_win = (gross_win / wins) if wins else None
-                avg_loss = (gross_loss / losses) if losses else None
-                maker_fee, taker_fee = _split_fees(rows)
-                open_notional = _open_notional(rows)
-                net = realized - commission
-                return {
-                    "trade_count": len(rows),
-                    "realized_pnl": realized,
-                    "commission": commission,
-                    "net_pnl": net,
-                    "closed_trades": wins + losses,
-                    "wins": wins,
-                    "losses": losses,
-                    "win_rate": (wins / (wins + losses)) if (wins + losses) else 0.0,
-                    "profit_factor": (
-                        (gross_win / gross_loss) if gross_loss > 0 else None
-                    ),
-                    # 只看胜率会误导：同时给出平均盈利/平均亏损与盈亏比。
-                    "avg_win": avg_win,
-                    "avg_loss": avg_loss,
-                    "payoff_ratio": (
-                        (avg_win / avg_loss) if (avg_win and avg_loss) else None
-                    ),
-                    # 交易成本单列：maker / taker 分开。
-                    "maker_fee": maker_fee,
-                    "taker_fee": taker_fee,
-                    # 单笔净边际分母用开仓名义金额，不依赖复利。
-                    "open_notional": open_notional,
-                    "unit_edge_bps": (
-                        (net / open_notional * 10000) if open_notional else None
-                    ),
-                    # 按标的分组的已实现权益曲线回撤（USDT）。
-                    "realized_max_drawdown": _realized_curve_drawdown(rows)[
-                        "realized_max_drawdown"
-                    ],
-                }
-
+            # 完整持仓周期账本：分页取全部成交（不再用每标的 200 笔上限，
+            # 那会把开仓腿截断在窗口之外、漏掉开仓手续费），再按开仓/加层/
+            # 减仓/反手/平仓配成完整交易，最后按时间把资金费归属到周期。
+            # 因此下面每一个「笔」= 一个完整持仓周期，而不是一笔成交腿。
             start = stats_start_ms()
-            scoped = bucket(
-                [t for t in all_trades if int(t.get("time", 0) or 0) >= start]
-            ) if start else bucket(all_trades)
-            every = bucket(all_trades)
-            # 分标的拆分：用户要求 BTCUSDT 与 ETHUSDT 各自统计，不混加。
-            scoped_rows = (
-                [t for t in all_trades if int(t.get("time", 0) or 0) >= start]
-                if start else list(all_trades)
-            )
+            now_ms = int(time.time() * 1000)
+            cached = _LEDGER_CACHE.get("data")
+            if cached is None or now_ms - int(_LEDGER_CACHE.get("at_ms") or 0) > LEDGER_TTL_MS:
+                # 回看 7 天：足以接上跨记录起点的持仓，又不会把窗口拉太长。
+                try:
+                    from review.order_sources import load_strategy_order_ids
+                    strat_orders = set(load_strategy_order_ids())
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("策略委托台账读取失败，全部记为未识别: %s", exc)
+                    strat_orders = set()
+                cached = await cycle_pnl.build_ledger(
+                    client, TRADE_SYMBOLS, start, context_days=7,
+                    strategy_orders=strat_orders,
+                )
+                _LEDGER_CACHE["data"] = cached
+                _LEDGER_CACHE["at_ms"] = now_ms
+            ledger = cached
+            if ledger["errors"] and not ledger["per_symbol"]:
+                first = next(iter(ledger["errors"].values()))
+                return web.json_response(
+                    {"connected": False, "reason": f"成交查询失败: {first}"}
+                )
+
+            scoped = dict(ledger["total"])
+            every = dict(scoped)
+
             pos_by_symbol: Dict[str, Any] = {}
             for sym in TRADE_SYMBOLS:
                 try:
@@ -1559,15 +1473,11 @@ def create_app(
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("summary position %s: %s", sym, exc)
             by_symbol: Dict[str, Any] = {}
-            extra = {
-                str(t.get("symbol") or "") for t in scoped_rows
-            } - set(TRADE_SYMBOLS)
+            extra = set(ledger["per_symbol"]) - set(TRADE_SYMBOLS)
             for sym in list(TRADE_SYMBOLS) + sorted(s for s in extra if s):
-                rows = [
-                    t for t in scoped_rows
-                    if str(t.get("symbol") or "") == sym
-                ]
-                item = bucket(rows)
+                item = dict(ledger["per_symbol"].get(sym) or {})
+                if not item:
+                    item = dict(cycle_pnl.summarize([]))
                 item["symbol"] = sym
                 item["unrealized_pnl"] = float(
                     (pos_by_symbol.get(sym) or {}).get("unrealized_pnl", 0) or 0
@@ -1576,9 +1486,7 @@ def create_app(
             # 本地权益回撤与原因记录同样从记录起点重新累计。
             quality_ctx = _quality_context(start)
             # 单笔净边际：分母用开仓名义金额（不依赖复利），口径与分标的完全一致。
-            edge_bps = scoped["unit_edge_bps"]
-            maker_fee, taker_fee = _split_fees(scoped_rows)
-            funding_fee = await _funding_fee(client, start)
+            edge_bps = scoped.get("unit_edge_bps")
             slippage = _slippage_estimate(pos_by_symbol, start)
             drawdown = {
                 # 账户权益口径：运行器落盘的权益曲线峰值回撤。
@@ -1589,17 +1497,17 @@ def create_app(
                     sym: (by_symbol.get(sym) or {}).get("realized_max_drawdown")
                     for sym in by_symbol
                 },
-                "by_symbol_basis": "各标的已实现净额（已实现 − 手续费）按成交时间的峰值回撤，USDT",
+                "by_symbol_basis": "各标的按完整持仓周期净额（已实现 − 手续费 + 资金费）在平仓时刻推进的峰值回撤，USDT",
             }
             costs = {
-                "maker_fee": maker_fee,
-                "taker_fee": taker_fee,
-                "total_fee": maker_fee + taker_fee,
-                "funding_fee": funding_fee,
+                "maker_fee": float(scoped.get("maker_fee") or 0),
+                "taker_fee": float(scoped.get("taker_fee") or 0),
+                "total_fee": float(scoped.get("commission") or 0),
+                "funding_fee": float(scoped.get("funding_fee") or 0),
+                "funding_orphan": float(scoped.get("funding_orphan") or 0),
                 "funding_basis": (
-                    "交易所 income 明细 incomeType=FUNDING_FEE"
-                    if funding_fee is not None
-                    else "当前客户端未接入资金费查询，暂不可得"
+                    "交易所 income 明细 incomeType=FUNDING_FEE，按时间归属到当时"
+                    "持仓的完整周期；归属不上的记为 funding_orphan 单列"
                 ),
                 "slippage_est": slippage["slippage_est"],
                 "slippage_matched": slippage["slippage_matched"],
@@ -1615,7 +1523,7 @@ def create_app(
             actions = [
                 "继续固定 15m-only 测试网窗口，不在盈利后临时改参数或扩大仓位",
                 "累计至少 4 周或 30 个完整平仓样本，再评估单笔净边际和跨 BTC/ETH 一致性",
-                "补齐逐笔开平仓配对与权益曲线，当前边际为成交腿近似、回撤为本地记录口径",
+                "单笔口径已改为完整持仓周期（开仓/加层/减仓/反手/平仓配对 + 资金费归属），继续累计完整平仓样本再评估边际",
             ]
             if quality_ctx["halted"]:
                 actions.insert(0, "运行器处于熔断状态：先人工核对交易所净仓与本地账本，再决定是否恢复")
@@ -1629,8 +1537,15 @@ def create_app(
                     "历史清零后重新记录：委托、成交、成本、回撤与明细均自该时刻起"
                     "统计；持仓、余额、挂单为实时状态，不受影响。"
                 ),
-                "scope": "recent_7d", "history_limit": 200,
-                "truncated": len(all_trades) >= 200,
+                # 口径：自记录起点起的**完整持仓周期**，不再是「最近 7 天
+                # 每标的 200 笔成交腿」。coverage 说明数据从哪开始、有没有被
+                # 截断、有没有被窗口切成两半的持仓。
+                "scope": "record_start_full_cycles",
+                "history_limit": None,
+                "truncated": bool((scoped.get("coverage") or {}).get("truncated")),
+                "coverage": scoped.get("coverage"),
+                "funding_rows": scoped.get("funding_rows"),
+                "funding_note": scoped.get("funding_note"),
                 "wallet_balance": float(
                     getattr(bal, "total_wallet_balance", 0) or 0
                 ),
@@ -1654,7 +1569,7 @@ def create_app(
                     "realized_net_pnl": float(scoped["net_pnl"]),
                     "unrealized_pnl": float(upnl),
                     "unit_edge_bps": edge_bps,
-                    "unit_edge_basis": "开仓名义金额口径：净额 ÷ 开仓腿名义 × 10000（不依赖复利）",
+                    "unit_edge_basis": "开仓名义金额口径：净额（已实现 − 手续费 + 资金费）÷ 开仓名义 × 10000，按完整持仓周期统计（不依赖复利）",
                     "open_notional": float(scoped.get("open_notional") or 0),
                     "recorded_max_drawdown": quality_ctx["recorded_max_drawdown"],
                     "drawdown": drawdown,
@@ -1706,6 +1621,61 @@ def create_app(
                 "reason": f"{type(exc).__name__}: {exc}",
             }, status=502)
 
+    async def api_equity_curve(_request):
+        """只读：运行器记录口径的权益曲线。
+
+        取自 runtime/shadow/deployed_trades.csv 的「权益」列，与
+        quality.recorded_max_drawdown 同一口径。不修改任何状态、不联网。
+        """
+        path = os.path.join(ROOT, "runtime", "shadow", "deployed_trades.csv")
+        points: list = []
+        try:
+            with open(path, encoding="utf-8", newline="") as fh:
+                for row in csv.DictReader(fh):
+                    try:
+                        value = float(str(row.get("权益") or "").replace(",", ""))
+                    except (TypeError, ValueError):
+                        continue
+                    if value <= 0:
+                        continue
+                    points.append({
+                        "t": _trade_row_ms(row),
+                        "equity": value,
+                        "action": str(row.get("动作") or ""),
+                    })
+        except FileNotFoundError:
+            points = []
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response(
+                {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+            )
+        # 同一根 K 线会有 BTC/ETH 两行；时间戳还可能乱序，
+        # 直接按行画曲线会来回折返，所以先按时间排序再按时刻去重。
+        points.sort(key=lambda item: item["t"])
+        dedup: list = []
+        for item in points:
+            if dedup and dedup[-1]["t"] == item["t"]:
+                dedup[-1] = item
+            else:
+                dedup.append(item)
+        points = dedup
+        peak = 0.0
+        max_dd = 0.0
+        for item in points:
+            peak = max(peak, item["equity"])
+            if peak > 0:
+                max_dd = max(max_dd, (peak - item["equity"]) / peak)
+        return web.json_response({
+            "ok": True,
+            "points": points,
+            "count": len(points),
+            "first": points[0]["equity"] if points else None,
+            "last": points[-1]["equity"] if points else None,
+            "peak": peak or None,
+            "max_drawdown": max_dd,
+            "basis": "deployed_trades.csv 权益字段（运行记录口径）",
+        })
+
     # routes
     app.router.add_get("/", index)
     app.router.add_get(
@@ -1724,6 +1694,7 @@ def create_app(
     app.router.add_get("/api/binance/orders", api_binance_orders)
     app.router.add_get("/api/binance/trades", api_binance_trades)
     app.router.add_get("/api/account/summary", api_account_summary)
+    app.router.add_get("/api/equity/curve", api_equity_curve)
     app.router.add_post("/api/strategies", api_strategy_add)
     app.router.add_post("/api/settle/run", api_settle_run)
     app.router.add_post("/api/review/run", api_review_run)

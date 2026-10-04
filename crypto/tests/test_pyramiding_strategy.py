@@ -162,6 +162,71 @@ class TestVirtualPyramiding(unittest.TestCase):
 class TestProcessStrategyPyramiding(unittest.TestCase):
     """确保运行器把 StrategySpec.max_layers 真正传入虚拟账本。"""
 
+    def _apply(self, book, *, long=False, short=False, px=100.0, ms=1,
+               block=False, max_layers=3):
+        return apply_virtual_signal(
+            book, sig_long=long, sig_short=short, qty=0.1, px=px, atr=10.0,
+            ms=ms, block=block, min_qty=0.001, max_layers=max_layers,
+            meta={"reason": "测试有效信号", "symbol": "BTCUSDT"},
+        )
+
+    def test_portfolio_budget_is_tighter_than_per_symbol_budget(self):
+        """BTC+ETH 合计 80% 时，后来者只能用剩下的额度（先到先得）。"""
+        book = {"entry": None}
+        base = dict(equity=5_000.0, px=100.0)
+        # 单标的 70% → 350；组合 80% → 400
+        # 其它标的没占额度 → 用更紧的单标的 350
+        qty, note = deploy.apply_margin_budget(book, 9999.0, side=1, **base,
+                                              others_margin=0.0)
+        self.assertAlmostEqual(qty, 350.0, places=6)
+        self.assertIn("保证金预算封顶", note)
+        # 其它标的已占 1000 USDT → 组合剩余 3000 USDT → 数量 300，比 350 更紧
+        qty, note = deploy.apply_margin_budget(book, 9999.0, side=1, **base,
+                                              others_margin=1_000.0)
+        self.assertAlmostEqual(qty, 300.0, places=6)
+        self.assertIn("组合预算封顶", note)
+        # 其它标的已占满组合 80% → 本标的拿不到任何额度
+        qty, note = deploy.apply_margin_budget(book, 9999.0, side=1, **base,
+                                              others_margin=4_000.0)
+        self.assertEqual(qty, 0.0)
+        self.assertIn("组合保证金已满", note)
+
+    def test_single_symbol_can_still_reach_three_layers(self):
+        """只有一个标的持仓时，组合 80% 不得挡住它跑满 3 层。"""
+        book = empty_book()
+        for i, px in enumerate((84_831.0, 84_900.0, 85_000.0), start=1):
+            qty = [0.201, 0.100, 0.100][i - 1]
+            capped, _ = deploy.apply_margin_budget(
+                book, qty, side=1, equity=5_000.0, px=px, others_margin=0.0)
+            self.assertAlmostEqual(capped, qty, places=6)
+            self._apply(book, long=True, px=px, ms=i)
+        self.assertEqual(layer_count(book["entry"]), 3)
+
+    def test_other_symbol_margin_sums_only_the_other_symbol(self):
+        from shadow.strategy_books import other_symbol_margin
+
+        btc = empty_book()
+        self._apply(btc, long=True, px=100.0, ms=1)     # 0.1 × 100 / 10 = 1
+        eth = empty_book()
+        eth["entry"] = {"side": 1, "qty": 2.0, "px": 200.0, "atr": 1.0, "ms": 1}
+        st = {"strategies": {"kdj15": btc, "eth15": eth}}
+        self.assertAlmostEqual(other_symbol_margin(st, "BTCUSDT", 10.0), 40.0)
+        self.assertAlmostEqual(other_symbol_margin(st, "ETHUSDT", 10.0), 1.0)
+
+    def test_btc_and_eth_use_same_layer_risk_schedule(self):
+        from shadow.strategy_books import SPEC_ETH_15M
+
+        self.assertEqual(SPEC_15M.layer_risk_r, (0.01, 0.005, 0.005))
+        self.assertEqual(SPEC_ETH_15M.layer_risk_r, SPEC_15M.layer_risk_r)
+        self.assertEqual(deploy.MARGIN_BUDGET_PER_TRADE, 0.70)
+
+    def test_layer_schedule_is_first_one_percent_then_half_percent(self):
+        schedule = SPEC_15M.layer_risk_r
+        self.assertIsNotNone(schedule)
+        self.assertAlmostEqual(schedule[0], 0.01)
+        self.assertAlmostEqual(schedule[1], 0.005)
+        self.assertAlmostEqual(schedule[2], 0.005)
+
     def _bars(self):
         n = 8
         ts = np.arange(n, dtype=np.int64) * SPEC_15M.interval_ms + 1_800_000_000_000

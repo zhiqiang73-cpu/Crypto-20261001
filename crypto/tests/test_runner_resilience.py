@@ -179,7 +179,7 @@ class TestStepIsolatesSymbolFailures(unittest.TestCase):
 class TestMarginBudgetClamp(unittest.TestCase):
     """风险定量只回答"想下多少"；容量上限回答"能下多少"；取小。
 
-    权益 5000、预算 35%、10x、价格 100 ⇒ 单标的整仓名义上限 17500 ⇒ 数量上限 175。
+    权益 5000、预算 70%、10x、价格 100 ⇒ 单标的整仓名义上限 35000 ⇒ 数量上限 350。
     """
 
     EQUITY, PX = 5_000.0, 100.0
@@ -202,7 +202,7 @@ class TestMarginBudgetClamp(unittest.TestCase):
 
     def test_same_direction_add_only_gets_the_remaining_room(self):
         entry = {"side": 1, "qty": 100.0}
-        qty, note = self._clamp(100.0, entry=entry, side=1)
+        qty, note = self._clamp(300.0, entry=entry, side=1)
         self.assertAlmostEqual(qty, self.CAP - 100.0, places=6)
         self.assertIn("保证金预算封顶", note)
 
@@ -218,14 +218,29 @@ class TestMarginBudgetClamp(unittest.TestCase):
         self.assertAlmostEqual(qty, self.CAP, places=6)
 
     def test_budget_zero_disables_the_clamp(self):
+        """两层预算都设为 0 才完全不封顶；任一层 >0 就仍然生效。"""
+        old = deploy.MARGIN_BUDGET_PER_TRADE
+        old_port = deploy.PORTFOLIO_MARGIN_BUDGET
+        deploy.MARGIN_BUDGET_PER_TRADE = 0.0
+        deploy.PORTFOLIO_MARGIN_BUDGET = 0.0
+        try:
+            qty, note = self._clamp(999.0)
+        finally:
+            deploy.MARGIN_BUDGET_PER_TRADE = old
+            deploy.PORTFOLIO_MARGIN_BUDGET = old_port
+        self.assertEqual(qty, 999.0)
+        self.assertEqual(note, "")
+
+    def test_portfolio_budget_alone_still_clamps(self):
+        """单标的预算为 0 时，组合预算仍必须挡住超额。"""
         old = deploy.MARGIN_BUDGET_PER_TRADE
         deploy.MARGIN_BUDGET_PER_TRADE = 0.0
         try:
             qty, note = self._clamp(999.0)
         finally:
             deploy.MARGIN_BUDGET_PER_TRADE = old
-        self.assertEqual(qty, 999.0)
-        self.assertEqual(note, "")
+        self.assertAlmostEqual(qty, 400.0, places=6)
+        self.assertIn("组合预算封顶", note)
 
 
 # ------------------------------------------------------- 3. 下单失败必须回滚账本

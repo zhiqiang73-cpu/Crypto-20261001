@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BTC 量化控制台</title>
-  <link rel="stylesheet" href="/styles.css?v=20" />
+  <link rel="stylesheet" href="/styles.css?v=25" />
 </head>
 <body>
   <div class="app-shell">
@@ -48,6 +48,17 @@
 
       <!-- ================= 第 1 页 · 交易总览 ================= -->
       <section class="view active" id="view-trading">
+        <div class="risk-strip" id="riskStrip" aria-label="风控状态条">
+          <span class="rs-pill" id="rsMode"><i class="dot amber"></i>读取中…</span>
+          <span class="rs-item"><span class="rs-k">当日盈亏</span><b id="rsDayPnl">—</b></span>
+          <span class="rs-item"><span class="rs-k">日亏额度</span><b id="rsDayLoss">—</b><span class="rs-lim">/ 3%</span></span>
+          <span class="rs-item"><span class="rs-k">回撤</span><b id="rsDrawdown">—</b><span class="rs-lim">/ 10%</span></span>
+          <span class="rs-item"><span class="rs-k">halted</span><b id="rsHalted">—</b></span>
+          <span class="rs-item"><span class="rs-k">心跳</span><b id="rsHeartbeat">—</b></span>
+          <span class="rs-item"><span class="rs-k">错过 K 线</span><b id="rsMissed">—</b></span>
+          <span class="rs-stamp" id="rsStamp">—</span>
+        </div>
+
         <div class="notice-bar"><span class="notice-icon">i</span><div><strong>数据口径</strong><span>钱包余额、持仓与挂单为交易所实时状态；委托与逐笔成交只显示「记录起点」之后的记录（各最多 200 条），起点之前的历史已清零。逐笔成交不等于完整平仓笔数。</span></div><span id="runnerState" class="notice-status">检查运行器…</span></div>
 
         <div class="notice-bar is-alert" id="externalBar" hidden>
@@ -59,33 +70,107 @@
           <button class="mini-btn" id="externalResumeBtn">确认恢复自动开仓</button>
         </div>
 
-        <div class="hero-grid">
-          <article class="hero-card">
-            <div class="card-kicker">币安标记价格 <span>· 实时推送</span></div>
-            <div class="hero-price" id="markPrice">连接中…</div>
-            <div class="price-change positive" id="priceChange">等待币安行情推送 <span>公开行情</span></div>
+        <div class="sh"><span class="sh-no">01</span><h3>市场</h3><span class="sh-rule"></span><span class="sh-meta" id="mktSource">Binance USDⓈ-M</span></div>
+        <div class="hero-board">
+          <div class="hero-l">
+            <span class="hero-k">BTCUSDT · 标记价格 <em>实时推送</em></span>
+            <span class="hero-v" id="markPrice">连接中…</span>
+            <span class="price-change positive" id="priceChange">等待币安行情推送 <span>公开行情</span></span>
+          </div>
+          <div class="hero-r">
+            <svg class="spark" id="mktSpark" viewBox="0 0 200 56" preserveAspectRatio="none" aria-hidden="true"></svg>
+            <span class="hero-meta" id="mktRange">—</span>
+          </div>
+        </div>
+        <div class="strip">
+          <span class="rs-item"><span class="rs-k">ETHUSDT</span><b id="ethMark">—</b></span>
+          <span class="rs-item"><span class="rs-k">买一 / 卖一</span><b id="mktSpread">—</b></span>
+          <span class="rs-item"><span class="rs-k">资金费年化</span><b id="mktFunding">—</b></span>
+          <span class="rs-stamp" id="mktStamp">—</span>
+        </div>
+
+        <div class="sh"><span class="sh-no">02</span><h3>账户</h3><span class="sh-rule"></span><span class="sh-meta" id="acctMeta">USDT 本位 · 币安测试网</span></div>
+        <div class="kpis k4">
+          <article class="kpi">
+            <span class="k">钱包余额</span>
+            <span class="kpi-v" id="mWallet">—</span>
+            <span class="kpi-d">USDT · 币安账户</span>
           </article>
-          <article class="metric-card">
-            <div class="card-kicker">钱包余额</div>
-            <div class="metric-value" id="mWallet">—</div>
-            <div class="metric-foot">USDT <span>币安账户</span></div>
+          <article class="kpi">
+            <span class="k">未实现盈亏</span>
+            <span class="sym-pnl-list">
+              <span class="sym-pnl-row"><span class="sym-chip">BTC</span><b class="sym-pnl-value" id="mUnrealBTC">—</b></span>
+              <span class="sym-pnl-row"><span class="sym-chip">ETH</span><b class="sym-pnl-value" id="mUnrealETH">—</b></span>
+            </span>
+            <span class="kpi-d">USDT · 分标的 <span id="posHint">无持仓</span></span>
           </article>
-          <article class="metric-card">
-            <div class="card-kicker">未实现盈亏</div>
-            <div class="sym-pnl-list">
-              <div class="sym-pnl-row"><span class="sym-chip">BTC</span><b class="sym-pnl-value" id="mUnrealBTC">—</b></div>
-              <div class="sym-pnl-row"><span class="sym-chip">ETH</span><b class="sym-pnl-value" id="mUnrealETH">—</b></div>
+          <article class="kpi accent-card">
+            <span class="k">已实现盈亏 · 查询窗口</span>
+            <span class="sym-pnl-list">
+              <span class="sym-pnl-row"><span class="sym-chip">BTC</span><b class="sym-pnl-value" id="mRealBTC">—</b></span>
+              <span class="sym-pnl-row"><span class="sym-chip">ETH</span><b class="sym-pnl-value" id="mRealETH">—</b></span>
+            </span>
+            <span class="kpi-d">USDT · 净盈亏 <span id="realHint">币安逐笔成交</span></span>
+          </article>
+          <article class="kpi">
+            <span class="k">当前回撤</span>
+            <span class="kpi-v" id="acctDrawdown">—</span>
+            <span class="kpi-d">权益峰值回撤 <span id="acctDrawdownBasis">运行记录口径</span></span>
+          </article>
+        </div>
+
+        <div class="panel equity-panel">
+          <div class="panel-head">
+            <div><p class="eyebrow">运行记录口径</p><h2>权益曲线</h2></div>
+            <span class="tag" id="equityMeta">读取中</span>
+          </div>
+          <svg class="equity-svg" id="equitySvg" viewBox="0 0 640 130" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <div class="equity-foot">
+            <span id="equityRange">—</span>
+            <span id="equityPeak">—</span>
+            <span id="equityDd">—</span>
+            <span id="equityStep">—</span>
+          </div>
+        </div>
+
+        <div class="sh"><span class="sh-no">03</span><h3>告警分级</h3><span class="sh-rule"></span><span class="sh-meta">L0 不着色 · 只有 L3 用满饱和红</span></div>
+        <div class="ladder" id="alertLadder">
+          <div class="lv lv-l0" id="lvRow0"><i class="dot"></i><span class="lv-tag">L0</span><span class="lv-text">正常运行</span><span class="lv-body" id="lvBody0">读取中…</span></div>
+          <div class="lv lv-l1" id="lvRow1"><i class="dot"></i><span class="lv-tag">L1</span><span class="lv-text">信息</span><span class="lv-body" id="lvBody1">—</span></div>
+          <div class="lv lv-l2" id="lvRow2"><i class="dot"></i><span class="lv-tag">L2</span><span class="lv-text">注意</span><span class="lv-body" id="lvBody2">—</span></div>
+          <div class="lv lv-l3" id="lvRow3"><i class="dot"></i><span class="lv-tag">L3</span><span class="lv-text">危险</span><span class="lv-body" id="lvBody3">—</span></div>
+        </div>
+
+        <div class="table-panel pos-panel">
+          <div class="panel-head">
+            <div><p class="eyebrow">持仓 / 币安净仓与策略腿</p><h2>当前仓位</h2><p class="subline">数量与保证金用交易所口径（USDT），与币安网页端逐位对应；小字为对应的币数量。所有时间为北京时间（UTC+8）：信号K线在收盘判定，下一根K线开盘才执行。每个标的各自一行策略仓，各自一行币安净仓，BTC 和 ETH 不混加。</p></div>
+            <span class="tag" id="posMarginTag">保证金 —</span>
+            <span class="tag" id="posSideTag">空仓</span>
+          </div>
+          <div class="table-head cols-pos"><span>标的</span><span>来源</span><span>方向</span><span>数量(USDT)</span><span>保证金</span><span>开仓价</span><span>信号K线 · 北京时间</span><span>原因</span><span>浮盈</span></div>
+          <div class="table-body" id="posBox">
+            <div class="empty-state"><span>○</span><div><b>空仓</b><small>当前无持仓</small></div></div>
+          </div>
+          <p class="pos-footnote">同一标的两行的<b>数量应完全相等</b>；一旦不等即为外部干预、漏单或部分成交，需查对账。两行<b>开仓价</b>口径不同：策略腿为下单时的<b>参考价</b>，币安净仓为交易所<b>成交均价</b>（分批成交的加权结果），两者之差会等比投影到<b>浮盈</b>；<b>保证金</b>策略腿按「名义价值 ÷ 杠杆」估算、净仓为交易所逐仓实际占用。逐位核对账户以币安净仓行为准。</p>
+        </div>
+
+        <div class="lower-grid">
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">当前挂单</p><h2>当前委托</h2></div><span class="tag" id="openOrdersCount">0</span></div>
+            <div class="kv-list" id="openOrdersBox">
+              <div class="empty-state"><span>○</span><div><b>无挂单</b><small>追价完成后不留挂单</small></div></div>
             </div>
-            <div class="metric-foot">USDT · 分标的 <span id="posHint">无持仓</span></div>
           </article>
-          <article class="metric-card accent-card">
-            <div class="card-kicker">已实现盈亏 · 查询窗口</div>
-            <div class="sym-pnl-list">
-              <div class="sym-pnl-row"><span class="sym-chip">BTC</span><b class="sym-pnl-value" id="mRealBTC">—</b></div>
-              <div class="sym-pnl-row"><span class="sym-chip">ETH</span><b class="sym-pnl-value" id="mRealETH">—</b></div>
-            </div>
-            <div class="metric-foot">USDT · 净盈亏 <span id="realHint">币安逐笔成交</span></div>
-          </article>
+        </div>
+
+        <div class="sh"><span class="sh-no">06</span><h3>信号判定</h3><span class="sh-rule"></span><span class="sh-meta" id="sigRule">KDJ(9,3,3) + MACD(12,26,9)</span></div>
+        <div class="table-panel sig-panel">
+          <div class="table-head sig-head">
+            <span>策略</span><span>标的 / 周期</span><span>KDJ 位置</span><span>MACD 柱</span><span>交叉</span><span>闸门</span><span>结果</span>
+          </div>
+          <div class="table-body" id="signalBox">
+            <div class="empty-state"><span>○</span><div><b>等待读数</b><small>运行器尚未落盘 latest_reading</small></div></div>
+          </div>
         </div>
 
         <section class="quality-section" aria-label="核心指标看板">
@@ -191,28 +276,6 @@
             </article>
           </div>
         </section>
-
-        <div class="table-panel pos-panel">
-          <div class="panel-head">
-            <div><p class="eyebrow">持仓 / 币安净仓与策略腿</p><h2>当前仓位</h2><p class="subline">数量与保证金用交易所口径（USDT），与币安网页端逐位对应；小字为对应的币数量。所有时间为北京时间（UTC+8）：信号K线在收盘判定，下一根K线开盘才执行。每个标的各自一行策略仓，各自一行币安净仓，BTC 和 ETH 不混加。</p></div>
-            <span class="tag" id="posMarginTag">保证金 —</span>
-            <span class="tag" id="posSideTag">空仓</span>
-          </div>
-          <div class="table-head cols-pos"><span>标的</span><span>来源</span><span>方向</span><span>数量(USDT)</span><span>保证金</span><span>开仓价</span><span>信号K线 · 北京时间</span><span>原因</span><span>浮盈</span></div>
-          <div class="table-body" id="posBox">
-            <div class="empty-state"><span>○</span><div><b>空仓</b><small>当前无持仓</small></div></div>
-          </div>
-          <p class="pos-footnote">同一标的两行的<b>数量应完全相等</b>；一旦不等即为外部干预、漏单或部分成交，需查对账。两行<b>开仓价</b>口径不同：策略腿为下单时的<b>参考价</b>，币安净仓为交易所<b>成交均价</b>（分批成交的加权结果），两者之差会等比投影到<b>浮盈</b>；<b>保证金</b>策略腿按「名义价值 ÷ 杠杆」估算、净仓为交易所逐仓实际占用。逐位核对账户以币安净仓行为准。</p>
-        </div>
-
-        <div class="lower-grid">
-          <article class="panel">
-            <div class="panel-head"><div><p class="eyebrow">当前挂单</p><h2>当前委托</h2></div><span class="tag" id="openOrdersCount">0</span></div>
-            <div class="kv-list" id="openOrdersBox">
-              <div class="empty-state"><span>○</span><div><b>无挂单</b><small>追价完成后不留挂单</small></div></div>
-            </div>
-          </article>
-        </div>
 
         <div class="table-panel">
           <div class="panel-head">
@@ -339,6 +402,6 @@
     </main>
   </div>
   <script src="/chart.js?v=4"></script>
-  <script src="/app.js?v=40"></script>
+  <script src="/app.js?v=46"></script>
 </body>
 </html>

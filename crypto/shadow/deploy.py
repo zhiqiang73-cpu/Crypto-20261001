@@ -34,13 +34,14 @@ from shadow.engine import (ATR_MULT_K, BREAK_EVEN_TRIGGER_ATR, DISASTER_ATR,
 from shadow.indicators import atr_wilder, boll, kdj, macd
 from shadow.signals import (confirmed_signal, entry_signal, macd_gate,
                             macd_side, price_breaks)
-from shadow.live import ENDPOINTS, MARKET, fetch
+from shadow.live import ENDPOINTS, MARKET, fetch, latest_mark_price, start_market_stream
 from shadow.strategy_books import (SPEC_15M, SPEC_5M, SPECS, TRADE_SYMBOLS,
                                    apply_virtual_signal, clear_symbol_books,
                                    contra_5m_qty, desired_net, migrate_state,
                                    reconcile_symbol_books, reduce_only_for_delta,
-                                   signal_reason, specs_for_symbol,
-                                   symbol_short, trend_side)
+                                   signal_reason, specs_for_symbol, layer_count,
+                                   other_symbol_margin, symbol_short,
+                                   trend_side)
 from shadow.external_watch import (apply_external, classify_external,
                                    clear_hold_on_new_signal,
                                    consume_resume_requests, external_fills,
@@ -101,8 +102,17 @@ SYNC_MIN_DELTA = MIN_QTY * 2.0
 # "想下多少"，不回答"下不下得起" —— 10× 逐仓下它常要求单仓占用 60~90% 权益的
 # 保证金（2026-10-04 实测 BTC 需 86%、ETH 需 59%，合计 145%），两个标的在数学上
 # 不可能同时持仓。这里按"该标的整仓"封顶，使两标的合计 ≤ 2×该值。
-# 0.35 → 两标的合计 70%，留 30% 缓冲给浮亏/手续费/资金费。设 0 表示不封顶。
-MARGIN_BUDGET_PER_TRADE = float(os.environ.get("MARGIN_BUDGET_PER_TRADE", "0.35"))
+# 单标的保证金预算（占权益比例）。设 0 表示不封顶。
+MARGIN_BUDGET_PER_TRADE = float(os.environ.get("MARGIN_BUDGET_PER_TRADE", "0.70"))
+
+# 组合级保证金预算（BTC+ETH 合计，占权益比例）。设 0 表示不封顶。
+#
+# 2026-10-04：单标的 70% × 两个标的 = 140% > 可用余额，两标的都会互相挤爆
+# （实测同时满 3 层需 5,570 USDT / 5,000 权益 = 111%）。改为组合级 80% 后：
+#   只做一个标的 → 该标的可用到 min(70%, 80%) = 70%，BTC 满 3 层需 68% ⇒ 放得下
+#   两个标的都做 → 先建仓的先占额度，后一个只能用剩下的，不会超出可用余额
+# 先到先得，不做事后重分配：运行器每 tick 顺序处理标的，先处理的先占。
+PORTFOLIO_MARGIN_BUDGET = float(os.environ.get("PORTFOLIO_MARGIN_BUDGET", "0.80"))
 
 # 本运行器日志的轮转上限。launchd 用 StandardOutPath 把 stdout 重定向到文件且是
 # O_APPEND, 所以重命名/替换都不起作用(我们的 fd 仍指向旧 inode, 之后的输出会写进
@@ -157,15 +167,39 @@ def should_report_skip(symbol: str, key: str, now_ms: int, *,
 
 
 def apply_margin_budget(book: dict, qty: float, *, side: int, equity: float,
-                        px: float) -> tuple:
-    """按「该标的整仓」的保证金预算给数量封顶。返回 (数量, 说明)。
+                        px: float, budget: Optional[float] = None,
+                        others_margin: float = 0.0,
+                        portfolio_budget: Optional[float] = None) -> tuple:
+    """按保证金预算给数量封顶。返回 (数量, 说明)。
+
+    两层预算，取更紧的一层作为「该标的整仓」上限：
+
+      1. 单标的预算：equity × budget
+      2. 组合预算：equity × portfolio_budget − 其它标的已占用（先到先得）
 
     同向加层时"整仓"= 已持有 + 本层，所以先扣掉已有量；反向或空仓时按整仓算
     （反手会先清掉旧层，不该被旧仓占掉额度）。
     """
-    if qty <= 0 or px <= 0 or equity <= 0 or MARGIN_BUDGET_PER_TRADE <= 0:
+    budget = MARGIN_BUDGET_PER_TRADE if budget is None else float(budget)
+    if qty <= 0 or px <= 0 or equity <= 0:
         return qty, ""
-    cap_total = equity * MARGIN_BUDGET_PER_TRADE * float(LEVERAGE) / px
+    cap_total = (equity * budget * float(LEVERAGE) / px
+                 if budget > 0 else float("inf"))
+    port_note = ""
+    pb = (PORTFOLIO_MARGIN_BUDGET if portfolio_budget is None
+          else float(portfolio_budget))
+    if pb > 0:
+        room_usdt = equity * pb - float(others_margin or 0.0)
+        if room_usdt <= 0:
+            return 0.0, (f"组合保证金已满(合计≤{equity * pb:.2f}USDT; "
+                         f"其它标的已占 {float(others_margin or 0.0):.2f})")
+        room_qty = floor_step(room_usdt * float(LEVERAGE) / px)
+        if room_qty < cap_total:
+            cap_total = room_qty
+            port_note = (f"组合预算封顶(合计≤{equity * pb:.2f}USDT; "
+                         f"其它标的已占 {float(others_margin or 0.0):.2f})")
+    if cap_total == float("inf"):
+        return qty, ""
     entry = book.get("entry") or {}
     try:
         existing = abs(float(entry.get("qty") or 0))
@@ -177,7 +211,8 @@ def apply_margin_budget(book: dict, qty: float, *, side: int, equity: float,
     room = floor_step(max(0.0, room))
     if qty <= room:
         return qty, ""
-    return room, f"保证金预算封顶(整仓≤{cap_total:.4f})"
+    note = f"保证金预算封顶(整仓≤{cap_total:.4f})"
+    return room, f"{port_note}; {note}" if port_note else note
 
 
 def symbol_book_has_position(st: dict, symbol: str) -> bool:
@@ -344,6 +379,8 @@ def runtime_params() -> dict:
     return {
         "risk_r": RISK_R,
         "margin_budget_per_trade": MARGIN_BUDGET_PER_TRADE,
+        "portfolio_margin_budget": PORTFOLIO_MARGIN_BUDGET,
+        "layer_risk_r": {spec.id: list(spec.layer_risk_r or ()) for spec in SPECS},
         "leverage": LEVERAGE,
         "atr_mult_k": ATR_MULT_K,
         "disaster_atr": DISASTER_ATR,
@@ -667,7 +704,7 @@ async def sync_net(client: BinanceTestnetClient, st: dict, execute: bool, *,
 
 def process_strategy(spec, book: dict, bars: dict, atr_al, *,
                      equity: float, block: bool, now: int, execute: bool,
-                     trend: int = 0) -> bool:
+                     trend: int = 0, others_margin: float = 0.0) -> bool:
     """处理一条策略的已收盘 K 线，只改虚拟账本。返回是否需要同步净仓。"""
     ts = bars["ts"]
     o, h, l, c = (bars[x] for x in ("open", "high", "low", "close"))
@@ -784,14 +821,24 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
             sig_long, sig_short,
             float(hist[i]) if i < len(hist) else float("nan"),
         )
+    want = 1 if sig_long else (-1 if sig_short else 0)
     qty = 0.0
     if not np.isnan(atr_al[i]) and atr_al[i] > 0:
-        qty = floor_step(equity * RISK_R / (ATR_MULT_K * float(atr_al[i])))
-    want = 1 if sig_long else (-1 if sig_short else 0)
+        # 首层 1%，第2/3层各 0.5%；5m 等未配置分层风险的策略继续沿用 RISK_R。
+        current_layers = layer_count(book.get("entry"))
+        current_side = int((book.get("entry") or {}).get("side") or 0)
+        layer_no = current_layers + 1 if want and current_side == want else 1
+        risk_schedule = spec.layer_risk_r or ()
+        layer_r = (float(risk_schedule[layer_no - 1])
+                   if 0 < layer_no <= len(risk_schedule) else RISK_R)
+        qty = floor_step(equity * layer_r / (ATR_MULT_K * float(atr_al[i])))
     qty, size_note = contra_5m_qty(
         qty, interval=spec.interval, want=want, trend=trend,
     )
-    qty, cap_note = apply_margin_budget(book, qty, side=want, equity=equity, px=px)
+    qty, cap_note = apply_margin_budget(
+        book, qty, side=want, equity=equity, px=px,
+        budget=MARGIN_BUDGET_PER_TRADE, others_margin=others_margin,
+    )
     if cap_note:
         size_note = f"{size_note}; {cap_note}" if size_note else cap_note
     reason_gold = bool(sig_long) if spec.confirm_next else gold
@@ -998,18 +1045,29 @@ def _signed_qty(pos) -> float:
 
 
 def _fetch_symbol_bars(symbol: str, now: int):
+    # 15m 信号只在收盘后变化；同一根K线不重复拉400根历史数据。
+    # 5m 已退出实盘，避免为未启用策略继续消耗REST权重。
+    slot15 = (now // (15 * 60 * 1000)) * (15 * 60 * 1000)
+    slot1h = (now // (60 * 60 * 1000)) * (60 * 60 * 1000)
+    cache = getattr(_fetch_symbol_bars, "_cache", {})
+    old = cache.get(symbol)
+    if old and old["slot15"] == slot15 and old["slot1h"] == slot1h:
+        return old["pack"]
     try:
         b15 = _closed_bars(fetch("15m", 400, symbol), SPEC_15M.interval_ms, now)
-        b5 = _closed_bars(fetch("5m", 600, symbol), SPEC_5M.interval_ms, now)
-        b1h = _closed_bars(fetch("1h", 300, symbol), 60 * 60 * 1000, now)
+        b1h = (_closed_bars(fetch("1h", 300, symbol), 60 * 60 * 1000, now)
+               if not old or old["slot1h"] != slot1h else old["b1h"])
     except Exception as exc:  # noqa: BLE001
         print(f"[{symbol}] 拉 K 线失败: {exc}")
         return None
     atr1h = atr_wilder(b1h["high"], b1h["low"], b1h["close"], 14)
-    return {
+    pack = {
         "15m": (b15, _align_atr(b15["ts"], SPEC_15M.interval_ms, b1h, atr1h)),
-        "5m": (b5, _align_atr(b5["ts"], SPEC_5M.interval_ms, b1h, atr1h)),
+        "5m": None,
     }
+    cache[symbol] = {"slot15": slot15, "slot1h": slot1h, "b1h": b1h, "pack": pack}
+    _fetch_symbol_bars._cache = cache
+    return pack
 
 
 EXTERNAL_ORDER_SCAN_LIMIT = 500
@@ -1033,6 +1091,13 @@ async def detect_external(
     watch["last_net"] = float(ex_now)
     if last_ms <= 0 or ex_before is None:
         return None
+    # 人工干预扫描不是信号数据；每15秒扫全量订单会放大签名接口权重。
+    # 另存扫描时间，不能复用 last_check_ms（它是净仓基线时间，测试和重启
+    # 对账都依赖其精确值）。60秒足以发现手动仓位变化，不改变信号时序。
+    last_scan_ms = int(watch.get("last_scan_ms") or 0)
+    if last_scan_ms > 0 and now - last_scan_ms < 60_000:
+        return None
+    watch["last_scan_ms"] = int(now)
     try:
         orders = await client.all_orders(
             symbol, start_time=last_ms, limit=EXTERNAL_ORDER_SCAN_LIMIT
@@ -1145,7 +1210,14 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
 
     # 正常止损（1.5×ATR）/ 保本止损：比灾难止损近，必须先判。
     try:
-        mark_now = float(await client.mark_price(symbol))
+        if ex_side == 0.0:
+            mark_now = 0.0
+        else:
+            mark_now = float(latest_mark_price(symbol) or 0.0)
+            if mark_now <= 0:
+                mark_now = float(getattr(pos, "mark_price", 0.0) or 0.0)
+            if mark_now <= 0:
+                mark_now = float(await client.mark_price(symbol))
         stopped = await protective_stop(
             client, st, symbol=symbol, ex_side=ex_side, entry_px=entry_px,
             atr_1h=atr_1h, mark=mark_now, execute=execute, tag=tag15,
@@ -1202,6 +1274,8 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
                 equity=equity, block=block or bool(watch.get("paused")),
                 now=now, execute=execute,
                 trend=trend_side(st, symbol),
+                # 组合级保证金预算：其它标的已占的额度先扣掉（先到先得）。
+                others_margin=other_symbol_margin(st, symbol, float(LEVERAGE)),
             )
             after = json.dumps(book.get("entry"), sort_keys=True)
             if did or before != after:
@@ -1363,6 +1437,7 @@ async def main() -> int:
     save_state(st)
     save_heartbeat(status="starting", execute=args.execute,
                    detail="市场一致性与启动预检通过")
+    start_market_stream(TRADE_SYMBOLS)
     try:
         while True:
             try:

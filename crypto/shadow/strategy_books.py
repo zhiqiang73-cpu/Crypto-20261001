@@ -32,6 +32,9 @@ class StrategySpec:
     # 同向有效交叉可分层加仓；1 表示沿用旧版「同向忽略」。
     # 它是硬上限，不是优化参数，防止趋势震荡中无限叠加杠杆。
     max_layers: int = 1
+    # 每层风险比例；None 表示所有层沿用模块级 RISK_R。
+    # BTC 15m 采用「首层 1%，后续层 0.5%」的金字塔风险预算。
+    layer_risk_r: Optional[Tuple[float, ...]] = None
 
 
 SPEC_15M = StrategySpec(
@@ -52,6 +55,7 @@ SPEC_15M = StrategySpec(
     require_break=False,
     require_macd=True,
     max_layers=3,
+    layer_risk_r=(0.01, 0.005, 0.005),
 )
 SPEC_5M = StrategySpec(
     id="kdj5",
@@ -88,6 +92,7 @@ SPEC_ETH_15M = StrategySpec(
     require_break=False,
     require_macd=True,
     max_layers=3,
+    layer_risk_r=(0.01, 0.005, 0.005),
 )
 SPEC_ETH_5M = StrategySpec(
     id="eth5",
@@ -241,6 +246,41 @@ def desired_net(st: Dict[str, Any], symbol: str = "BTCUSDT") -> float:
 
 def desired_nets(st: Dict[str, Any]) -> Dict[str, float]:
     return {symbol: desired_net(st, symbol) for symbol in TRADE_SYMBOLS}
+
+
+def book_margin(book: Dict[str, Any], leverage: float) -> float:
+    """该虚拟账本占用的保证金（按各层自己的入场价折算）。
+
+    逐层算而不是用均价：分层加仓时每层入场价不同，用均价会让「已占用」在
+    新层加入前后漂移，组合预算的判断就不稳。
+    """
+    if leverage <= 0:
+        return 0.0
+    total = 0.0
+    for layer in entry_layers((book or {}).get("entry")):
+        try:
+            qty = abs(float(layer.get("qty") or 0.0))
+            px = float(layer.get("px") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if qty > 0 and px > 0:
+            total += qty * px / leverage
+    return total
+
+
+def other_symbol_margin(st: Dict[str, Any], symbol: str,
+                        leverage: float) -> float:
+    """除本标的以外，其它标的的虚拟账本已占用的保证金。
+
+    组合级预算按「先到先得」分配：先建仓的标的先占额度，后来者只能用剩下的。
+    """
+    books = st.get("strategies") or {}
+    total = 0.0
+    for spec in SPECS:
+        if spec.symbol == symbol:
+            continue
+        total += book_margin(books.get(spec.id) or {}, leverage)
+    return total
 
 
 def clear_symbol_books(st: Dict[str, Any], symbol: str) -> None:
