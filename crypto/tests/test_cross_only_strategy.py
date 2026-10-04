@@ -48,7 +48,7 @@ class CrossOnlyTests(unittest.TestCase):
         self.assertIn('背离', cfg['entry']['divergence'])
         self.assertIn('下一根开盘', cfg['entry']['long'])
         self.assertIn('MACD', cfg['indicators'])
-        self.assertEqual(cfg['position_sizing']['r'], 0.03)
+        self.assertEqual(cfg['position_sizing']['r'], 0.01)
         self.assertEqual(cfg['runtime_key'], 'kdj15')
         self.assertIn('GTX', cfg['execution_style']['description'])
 
@@ -62,7 +62,7 @@ class CrossOnlyTests(unittest.TestCase):
         self.assertIn('MACD', cfg['indicators'])
         self.assertEqual(cfg['runtime_key'], 'kdj5')
         self.assertEqual(cfg['execution_style']['tag'], 'kd5')
-        self.assertEqual(cfg['position_sizing']['r'], 0.03)
+        self.assertEqual(cfg['position_sizing']['r'], 0.01)
 
     def test_eth_strategy_cards_match_btc_rules(self):
         eth15 = json.loads((ROOT / 'config/strategies/deployed_kdj_eth_extreme_v1.json').read_text(encoding='utf-8'))
@@ -73,7 +73,7 @@ class CrossOnlyTests(unittest.TestCase):
         self.assertIn('下一根开盘', eth15['entry']['long'])
         self.assertNotIn('K<30', eth15['entry']['long'])
         self.assertIn('MACD', eth15['indicators'])
-        self.assertEqual(eth15['position_sizing']['r'], 0.03)
+        self.assertEqual(eth15['position_sizing']['r'], 0.01)
         self.assertEqual(eth5['runtime_key'], 'eth5')
         self.assertEqual(eth5['symbol'], 'ETHUSDT')
         self.assertIn('MACD 能量柱为正', eth5['entry']['long'])
@@ -81,7 +81,7 @@ class CrossOnlyTests(unittest.TestCase):
         self.assertNotIn('K<30', eth5['entry']['long'])
         self.assertNotIn('K>70', eth5['entry']['short'])
         self.assertEqual(eth5['execution_style']['tag'], 'e5')
-        self.assertEqual(eth5['position_sizing']['r'], 0.03)
+        self.assertEqual(eth5['position_sizing']['r'], 0.01)
 
 
 if __name__ == '__main__':

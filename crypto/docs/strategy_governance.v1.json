@@ -23,7 +23,7 @@
     "confirm_next": false
   },
   "risk": {
-    "risk_r": 0.03,
+    "risk_r": 0.01,
     "atr_multiplier_k": 2.0,
     "leverage": 10,
     "daily_loss_limit": 0.03,

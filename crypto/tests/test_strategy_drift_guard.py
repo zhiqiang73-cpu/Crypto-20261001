@@ -43,7 +43,7 @@ class TestStrategyDriftGuard(unittest.TestCase):
         market = self.report["checks"]["market"]
         self.assertTrue(risk["cards_uniform_risk"])
         self.assertTrue(risk["cards_uniform_leverage"])
-        self.assertEqual(risk["risk_r"], 0.03)
+        self.assertEqual(risk["risk_r"], 0.01)
         self.assertEqual(risk["leverage"], 10)
         self.assertTrue(market["heartbeat_is_testnet"])
         self.assertTrue(market["state_is_testnet"])

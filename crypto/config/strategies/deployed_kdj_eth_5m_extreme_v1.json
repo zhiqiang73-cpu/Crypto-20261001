@@ -30,7 +30,7 @@
   },
   "position_sizing": {
     "formula": "qty = 权益_USDT × r ÷ (k × ATR_1H)",
-    "r": 0.03,
+    "r": 0.01,
     "k": 2,
     "step": 0.001,
     "note": "与 ETH 15m 同向时满仓；逆着 15m 时开一半。ETHUSDT 只下净额，不与 BTC 混仓"
@@ -40,7 +40,7 @@
     "margin": "isolated",
     "max_concurrent": 1,
     "daily_loss_stop": 0.03,
-    "max_drawdown_stop": 0.10,
+    "max_drawdown_stop": 0.1,
     "disaster_stop": "ETHUSDT 净仓浮亏 ≥ 3 × ATR_1H → 清掉 ETH 两条虚拟仓并同步净仓"
   },
   "execution_style": {

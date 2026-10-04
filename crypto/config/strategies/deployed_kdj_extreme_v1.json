@@ -31,13 +31,13 @@
   },
   "position_sizing": {
     "formula": "qty = 权益_USDT × r ÷ (k × ATR_1H)",
-    "r": 0.03,
+    "r": 0.01,
     "k": 2,
     "step": 0.001,
     "note": "按交易所最小变动单位向下取整; 不足最小名义金额则跳过",
     "per_layer": "每层数量沿用 qty = 权益_USDT × r ÷ (k × ATR_1H)，向下取整",
     "max_layers": 3,
-    "total_exposure_note": "同向最多 3 层；每层按现有 r=0.03 基准仓位计算，因此满层名义风险可达单层的 3 倍，必须先完成样本外与成本压力验证"
+    "total_exposure_note": "同向最多 3 层；每层按现有 r=0.01 基准仓位计算，因此满层名义风险可达单层的 3 倍，必须先完成样本外与成本压力验证"
   },
   "risk": {
     "leverage": 10,
