@@ -42,6 +42,17 @@ from shadow.strategy_books import (SPEC_15M, SPEC_5M, SPECS, TRADE_SYMBOLS,
                                    signal_reason, specs_for_symbol, layer_count,
                                    other_symbol_margin, symbol_short,
                                    trend_side)
+from trading.cost_model import (net_break_even_price, stop_price_from_avg,
+                               stop_is_tighter)
+from trading.protective_orders import (ProtectionState,
+                                       algo_ident, algo_trigger,
+                                       fetch_open_algo_orders,
+                                       find_protective_stop,
+                                       place_protective_stop,
+                                       reconcile_protective,
+                                       tighten_protective_stop)
+from shadow.external_guard import (ExternalWatch, fill_blocked, note_net,
+                                   scan_external)
 from shadow.external_watch import (apply_external, classify_external,
                                    clear_hold_on_new_signal,
                                    consume_resume_requests, external_fills,
@@ -86,6 +97,54 @@ COLS = ["时间", "动作", "方向", "数量", "价格", "净盈亏", "K", "D",
 # 本运行器的 clientOrderId 前缀。没有它, 账户里策略单和测试单无法区分 ——
 # 2026-10-02 用户看到 10:22 的 5 笔成交以为策略发了 5 次信号, 就是缺这个标签。
 ORDER_TAG = "kdj"
+
+# ---------------------------------------------------------------------------
+# 交易所预挂保护单（2026-10-04 接入）
+# ---------------------------------------------------------------------------
+# 背景：此前保护完全在进程内 —— 进程一死、断网、关机，交易所上没有任何
+# 保护单，仓位裸奔。实测确认 openAlgoOrders 返回空数组，与持仓同时存在。
+#
+# 接入后的分工：
+#   * 交易所保护单是**主**保护：STOP_MARKET，closePosition=true，
+#     workingType=MARK_PRICE。加层后自动跟随全部仓位，不需要重挂。
+#   * 进程内的软件止损退化为**兜底**：只有在交易所保护单未被确认
+#     （UNPROTECTED / UNKNOWN）时才真正下单，避免两边同时平仓。
+#   * 保护单未确认时禁止开新仓 —— 宁可错过信号，不能裸奔。
+EXCHANGE_STOPS_ENABLED = True
+
+# 人工干预观察状态。不能放进 st：save_state 会 json.dump 整个 st，
+# ExternalWatch 不是 JSON 可序列化的。进程重启后重建（首次扫描只记基线）。
+_EXTERNAL_WATCHES: dict = {}
+
+
+def _ext_watch(symbol: str) -> ExternalWatch:
+    ew = _EXTERNAL_WATCHES.get(symbol)
+    if ew is None:
+        ew = ExternalWatch()
+        _EXTERNAL_WATCHES[symbol] = ew
+    return ew
+
+
+def protection_state(st: dict, symbol: str) -> dict:
+    return (st.get("protection") or {}).get(symbol) or {}
+
+
+def protection_blocked(st: dict, symbol: str) -> Optional[str]:
+    """保护单未确认时返回拦截原因，用于禁止开新仓。"""
+    ps = protection_state(st, symbol)
+    if ps.get("state") in ("PROTECTED",):
+        return None
+    if ps.get("state") in ("UNPROTECTED", "UNKNOWN"):
+        return f"保护单未确认（{ps.get('state')}）：{ps.get('note', '')}"
+    return None
+
+
+def set_protection_state(st: dict, symbol: str, *, state: str, note: str,
+                         algo_id: str = '', trigger: float = 0.0) -> None:
+    st.setdefault("protection", {})[symbol] = {
+        "state": state, "note": note, "algo_id": algo_id,
+        "trigger": float(trigger or 0.0), "ts": int(time.time() * 1000),
+    }
 
 # 补记窗口: 运行器停机后最多回看多少根 15m K 线 (96 根 = 24 小时)。
 # 2026-10-02 用户在图表上看到 09:45 金叉, 而日志里那一根只有「观察」——
@@ -904,10 +963,289 @@ def book_for_symbol(st: dict, symbol: str) -> Optional[dict]:
     return None
 
 
+async def _protective_target(client: BinanceTestnetClient, st: dict, *,
+                            symbol: str, ex_side: float, entry_px: float,
+                            atr_1h: float):
+    """算出该标的此刻应该挂在哪里的保护触发价。
+
+    未到保本档 → 入场均价 ∓ 1.5×ATR_1H（需求 B 的「按实际持仓均价」）。
+    已到保本档 → 净保本价（扣掉全部成本后预计不亏的位置，需求 C）。
+
+    返回 (触发价, 是否保本档, tick)。触发价 <= 0 表示算不出来。
+    """
+    side = 1 if ex_side > 0 else -1
+    tick = await client.price_tick(symbol)
+    book = book_for_symbol(st, symbol) or {}
+    entry = book.get("entry") or {}
+    entry_ms = int(entry.get("ms") or 0)
+    armed = (entry_ms > 0
+             and int(book.get("break_even_armed_ms") or 0) == entry_ms)
+    if armed:
+        # 入场手续费与已发生资金费在账本里没有分项字段，按 taker 费率保守
+        # 估算入场费（宁可把保本价算高一点，也不要把止损放到成本线以下）。
+        be, _why = net_break_even_price(
+            avg_price=float(entry_px), side=side, quantity=abs(ex_side),
+            entry_fee_paid=0.0, funding_paid=0.0, tick=tick,
+            entry_fee_missing=True,
+        )
+        if be > 0:
+            return be, True, tick
+    px = stop_price_from_avg(
+        avg_price=float(entry_px), side=side, atr_1h=float(atr_1h),
+        multiple=NORMAL_STOP_ATR, tick=tick,
+    )
+    return px, False, tick
+
+
+async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
+                               symbol: str, ex_side: float, entry_px: float,
+                               atr_1h: float, execute: bool) -> Optional[dict]:
+    """确保交易所有一张覆盖全仓的保护单；保本激活后收紧到净保本价。
+
+    只在 execute 模式动作。返回 None 表示无需动作或已受保护；
+    返回字典表示本轮做了什么（用于日志）。
+    """
+    if not EXCHANGE_STOPS_ENABLED or not execute:
+        return None
+    if abs(ex_side) < MIN_QTY or entry_px <= 0:
+        return None
+    if not (atr_1h > 0) or not np.isfinite(float(atr_1h)):
+        return None
+    side = 1 if ex_side > 0 else -1
+
+    try:
+        target, armed, _tick = await _protective_target(
+            client, st, symbol=symbol, ex_side=ex_side, entry_px=entry_px,
+            atr_1h=atr_1h)
+    except Exception as exc:  # noqa: BLE001
+        set_protection_state(st, symbol, state="UNKNOWN",
+                             note=f"触发价计算失败: {exc}")
+        return {"action": "保护单计算失败", "note": str(exc)}
+
+    if target <= 0:
+        set_protection_state(st, symbol, state="UNKNOWN",
+                             note="触发价算不出来（均价或 ATR 非法）")
+        return None
+
+    book = book_for_symbol(st, symbol)
+    prev = dict((book or {}).get("exchange_stop") or {})
+    prev_id = str(prev.get("algo_id") or "")
+
+    try:
+        orders = await fetch_open_algo_orders(client, symbol)
+    except Exception as exc:  # noqa: BLE001 查不到 ≠ 没有，按未确认处理
+        set_protection_state(st, symbol, state="UNKNOWN",
+                             note=f"openAlgoOrders 查询失败: {exc}")
+        return {"action": "保护单查询失败", "note": str(exc)}
+
+    existing = find_protective_stop(orders, side=side, required_trigger=target)
+    if existing is not None:
+        aid = algo_ident(existing)
+        trig = algo_trigger(existing)
+        if book is not None:
+            book["exchange_stop"] = {"algo_id": aid, "trigger": trig,
+                                     "armed": armed}
+        set_protection_state(st, symbol, state="PROTECTED",
+                             note=("交易所保护单有效（保本档）" if armed
+                                   else "交易所保护单有效（初始档）"),
+                             algo_id=aid, trigger=trig)
+        return None
+
+    # 需要下单。已有旧单则先立后破；没有则首次建立。
+    if not _protective_attempt_ok(symbol):
+        # 退避期内不再下单。返回当前已知状态，让上层按未确认处理（禁止开新仓），
+        # 但不在交易所堆重复保护单。
+        ps = protection_state(st, symbol)
+        set_protection_state(st, symbol, state=ps.get("state") or "UNKNOWN",
+                             note=f"{ps.get('note', '')}（{PROTECTIVE_RETRY_INTERVAL_MS // 1000} 秒内不重试）",
+                             algo_id=ps.get("algo_id", ""),
+                             trigger=float(ps.get("trigger") or 0.0))
+        return None
+    _PROTECTIVE_ATTEMPT[symbol] = time.time() * 1000
+    if prev_id:
+        res = await tighten_protective_stop(
+            client, symbol=symbol, side=side, new_trigger=target,
+            old_algo_id=prev_id, quantity=abs(ex_side), close_position=True)
+        verb = "收紧"
+    else:
+        res = await place_protective_stop(
+            client, symbol=symbol, side=side, trigger_price=target,
+            quantity=abs(ex_side), close_position=True)
+        verb = "建立"
+
+    if res.protects:
+        if book is not None:
+            book["exchange_stop"] = {"algo_id": res.algo_id,
+                                     "trigger": res.trigger_price,
+                                     "armed": armed}
+        set_protection_state(
+            st, symbol, state="PROTECTED",
+            note=(f"{verb}保护单成功，触发价 {res.trigger_price:.2f}"
+                  + (f"；旧单撤销未确认 {res.error}" if res.error else "")),
+            algo_id=res.algo_id, trigger=res.trigger_price)
+        detail = (f"{symbol} {verb}交易所保护单：{('多' if side > 0 else '空')} "
+                  f"触发价 {res.trigger_price:.2f}（{abs(ex_side):.4f}）"
+                  f"{'，已由交易所接管止损' if not res.error else ''}")
+        print(f"[{symbol} 保护单] {detail}")
+        log_row([_fmt(0), f"{symbol_short(symbol)} 保护单{verb}",
+                 "多" if side > 0 else "空", f"{abs(ex_side):.4f}",
+                 f"{res.trigger_price:.2f}", "", "", "", "", "",
+                 "", detail])
+        return {"action": f"保护单{verb}", "note": detail,
+                "trigger": res.trigger_price, "state": "PROTECTED"}
+
+    # 未确认：按未保护处理，并禁止开新仓
+    set_protection_state(st, symbol, state=res.state.value,
+                         note=f"{verb}未确认: {res.error}")
+    print(f"[{symbol} ⚠️ 保护单{verb}未确认] {res.error}；"
+          f"该标的暂停开新仓，软件止损继续兜底")
+    return {"action": f"保护单{verb}未确认", "note": res.error,
+            "state": res.state.value}
+
+
+async def clear_ledger_if_stop_fired(client: BinanceTestnetClient, st: dict, *,
+                                     symbol: str, ex_side: float) -> bool:
+    """交易所已空仓、但账本还记着仓位时，判断是不是保护单打掉的，是就清账本。
+
+    必要性：保护单由交易所触发成交，运行器不是下单方。若不处理，账本仍记着
+    多头，净仓同步会认为「目标有仓、实际空仓」，把仓位**补回来** —— 正是要
+    杜绝的行为。
+
+    判定必须具体：只有「账本里记的那张保护单已不在 openAlgoOrders 里」才认定
+    是保护单成交。查不到就**不清**，宁可下一轮再判，也不误清账本。
+    """
+    if abs(ex_side) >= MIN_QTY:
+        return False
+    book = book_for_symbol(st, symbol)
+    if not book or not book.get("entry"):
+        return False
+    rec = dict(book.get("exchange_stop") or {})
+    algo_id = str(rec.get("algo_id") or "")
+    if not algo_id:
+        return False
+    try:
+        orders = await fetch_open_algo_orders(client, symbol)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{symbol} 保护单成交判定] 查询失败，本轮不清账本: {exc}")
+        return False
+    if any(algo_ident(o) == algo_id for o in orders):
+        return False        # 保护单还在，仓位是别的原因变空的 → 不擅自清
+    trig = float(rec.get("trigger") or 0.0)
+    clear_symbol_books(st, symbol)
+    if symbol == "BTCUSDT":
+        st["entry"] = None
+    set_protection_state(st, symbol, state="PROTECTED",
+                         note=f"保护单已触发成交（触发价 {trig:.2f}），账本已清零")
+    print(f"[{symbol} 保护单已成交] 触发价 {trig:.2f}；账本清零，不补回，等下一根信号")
+    log_row([_fmt(0), f"{symbol_short(symbol)} 保护单成交",
+             "", "", f"{trig:.2f}", "", "", "", "", "", "",
+             f"{symbol} 交易所保护单触发平仓，账本清零"])
+    return True
+
+
+async def reconcile_protection(client: BinanceTestnetClient, st: dict, *,
+                               execute: bool) -> dict:
+    """启动/重启时的保护单对账：有仓没保护就立刻补，补不上就禁止开新仓。
+
+    需求 D：进程启动时以交易所实仓 + openAlgoOrders 为唯一事实来源对账。
+    """
+    summary = {}
+    for symbol in TRADE_SYMBOLS:
+        try:
+            pos = await client.get_position(symbol)
+            ex_side = _signed_qty(pos)
+            entry_px = float(getattr(pos, "entry_price", 0.0) or 0.0)
+        except Exception as exc:  # noqa: BLE001
+            set_protection_state(st, symbol, state="UNKNOWN",
+                                 note=f"持仓查询失败: {exc}")
+            summary[symbol] = {"state": "UNKNOWN", "note": str(exc)}
+            print(f"[{symbol} 启动对账] 持仓查询失败: {exc}")
+            continue
+
+        if abs(ex_side) < MIN_QTY:
+            # 空仓：清理残留保护单（上一笔的不能留到下一笔）
+            try:
+                res = await reconcile_protective(
+                    client, symbol=symbol, side=0, quantity=0.0,
+                    required_trigger=0.0)
+                set_protection_state(st, symbol, state="PROTECTED",
+                                     note=res.action)
+                summary[symbol] = {"state": "FLAT", "note": res.action}
+                print(f"[{symbol} 启动对账] 空仓；{res.action}")
+            except Exception as exc:  # noqa: BLE001
+                set_protection_state(st, symbol, state="UNKNOWN",
+                                     note=f"残留保护单清理失败: {exc}")
+                summary[symbol] = {"state": "UNKNOWN", "note": str(exc)}
+            continue
+
+        # 有仓：算出应挂的触发价，查交易所是否已有合格保护单
+        atr_1h = float("nan")
+        try:
+            pack = _fetch_symbol_bars(symbol, int(time.time() * 1000))
+            if pack:
+                b15, atr_al = pack["15m"]
+                i = len(b15["ts"]) - 1
+                if i >= 0:
+                    atr_1h = float(atr_al[i])
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{symbol} 启动对账] ATR 取数失败: {exc}")
+
+        side = 1 if ex_side > 0 else -1
+        if not (atr_1h > 0) or not np.isfinite(atr_1h):
+            set_protection_state(st, symbol, state="UNKNOWN",
+                                 note="ATR 不可用，无法确定保护触发价")
+            summary[symbol] = {"state": "UNKNOWN", "note": "ATR 不可用"}
+            print(f"[{symbol} 启动对账] ⚠️ ATR 不可用，无法建立保护单")
+            continue
+
+        target, armed, _tick = await _protective_target(
+            client, st, symbol=symbol, ex_side=ex_side, entry_px=entry_px,
+            atr_1h=atr_1h)
+        try:
+            res = await reconcile_protective(
+                client, symbol=symbol, side=side, quantity=abs(ex_side),
+                required_trigger=target)
+        except Exception as exc:  # noqa: BLE001
+            set_protection_state(st, symbol, state="UNKNOWN",
+                                 note=f"对账失败: {exc}")
+            summary[symbol] = {"state": "UNKNOWN", "note": str(exc)}
+            continue
+
+        if res.state == ProtectionState.PROTECTED:
+            book = book_for_symbol(st, symbol)
+            if book is not None and res.stop is not None:
+                book["exchange_stop"] = {"algo_id": res.stop.algo_id,
+                                         "trigger": res.stop.trigger_price,
+                                         "armed": armed}
+            set_protection_state(st, symbol, state="PROTECTED",
+                                 note=f"{res.action}（触发价 "
+                                      f"{res.stop.trigger_price if res.stop else 0:.2f}）",
+                                 algo_id=(res.stop.algo_id if res.stop else ""),
+                                 trigger=(res.stop.trigger_price if res.stop else 0.0))
+            summary[symbol] = {"state": "PROTECTED",
+                               "trigger": (res.stop.trigger_price if res.stop else 0.0)}
+            print(f"[{symbol} 启动对账] 已受保护：{res.action}"
+                  + (f"；触发价 {res.stop.trigger_price:.2f}" if res.stop else ""))
+            continue
+
+        # 没有合格保护单 → 立刻补一张（有仓裸奔是最高优先级）
+        print(f"[{symbol} 启动对账] ⚠️ 有仓但无合格保护单，立即补挂")
+        acted = await manage_exchange_stop(
+            client, st, symbol=symbol, ex_side=ex_side, entry_px=entry_px,
+            atr_1h=atr_1h, execute=execute)
+        ps = protection_state(st, symbol)
+        summary[symbol] = {"state": ps.get("state", "UNKNOWN"),
+                           "note": ps.get("note", "")}
+        if ps.get("state") != "PROTECTED":
+            print(f"[{symbol} 启动对账] ⚠️ 保护单仍未确认，该标的禁止开新仓")
+    return summary
+
+
 async def protective_stop(client: BinanceTestnetClient, st: dict, *,
                           symbol: str, ex_side: float, entry_px: float,
                           atr_1h: float, mark: float, execute: bool,
-                          tag: str = ORDER_TAG) -> Optional[dict]:
+                          tag: str = ORDER_TAG,
+                          exchange_protected: bool = False) -> Optional[dict]:
     """正常止损（1.5×ATR_1H）与保本止损（浮盈 +1.5×ATR 后移到入场价）。
 
     与 disaster_limit_stop 的分工：本函数管更近的两档，它在更远处（3×ATR），
@@ -955,6 +1293,17 @@ async def protective_stop(client: BinanceTestnetClient, st: dict, *,
     hit = (mark <= stop_px) if ex_side > 0 else (mark >= stop_px)
     if not hit:
         return None
+
+    # 交易所保护单已确认时，平仓由交易所的 STOP_MARKET 完成。这里再发一张
+    # 穿盘口限价单会和它抢同一笔仓位：先成交的那张平掉，后一张因 reduceOnly
+    # 无仓被拒（不会反向开仓，但会白白多付一次 taker 手续费）。
+    if exchange_protected:
+        if not book.get("stop_defer_logged"):
+            print(f"[{symbol} {why}已触发] 交易所保护单已接管平仓，"
+                  f"软件止损不再重复下单")
+            book["stop_defer_logged"] = True
+        return None
+    book.pop("stop_defer_logged", None)
 
     close_side = "SHORT" if ex_side > 0 else "LONG"
     result = await client.place_limit_chase(
@@ -1085,44 +1434,44 @@ async def detect_external(
     第一次见到该标的只记基线不判定，这样运行器重启后不会把「重启前就存在
     的仓位」误判成人工干预。
     """
-    last_ms = int(watch.get("last_check_ms") or 0)
-    ex_before = watch.get("last_net")
+    # 兼容字段：重启对账与既有测试依赖 last_check_ms / last_net 的精确值，
+    # 继续按 tick 维护。它们**不再**用作扫描窗口与判定基线。
+    # ⚠ 必须先读后写：下面要用上一 tick 的值给新观察状态做种子，写反了种子
+    # 就变成当前值，等于把基线悄悄推进 —— 又回到「漏检」的老问题。
+    legacy_net = watch.get("last_net")
+    legacy_ms = int(watch.get("last_check_ms") or 0)
     watch["last_check_ms"] = int(now)
     watch["last_net"] = float(ex_now)
-    if last_ms <= 0 or ex_before is None:
-        return None
-    # 人工干预扫描不是信号数据；每15秒扫全量订单会放大签名接口权重。
-    # 另存扫描时间，不能复用 last_check_ms（它是净仓基线时间，测试和重启
-    # 对账都依赖其精确值）。60秒足以发现手动仓位变化，不改变信号时序。
-    last_scan_ms = int(watch.get("last_scan_ms") or 0)
-    if last_scan_ms > 0 and now - last_scan_ms < 60_000:
-        return None
-    watch["last_scan_ms"] = int(now)
-    try:
-        orders = await client.all_orders(
-            symbol, start_time=last_ms, limit=EXTERNAL_ORDER_SCAN_LIMIT
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"[{symbol}] 人工干预检测失败: {exc}")
-        return None
-    hits = external_fills(orders or [], since_ms=last_ms)
-    if not hits:
-        return None
-    kind = classify_external(float(ex_before), float(ex_now), min_qty=MIN_QTY)
-    if kind is None:
-        return None
-    parts = "；".join(
-        f"{o.get('side')} {o.get('executedQty')} @{o.get('avgPrice')} "
-        f"[{str(o.get('clientOrderId') or '')[:14]}]"
-        for o in hits[:4]
+
+    # ⚠ 2026-10-04 修复：旧实现每个 tick 推进 last_check_ms/last_net，却每 60
+    # 秒才扫一次订单，扫描执行时查询起点是「上一个 tick」而不是「上一次扫描」，
+    # 中间约 45 秒的窗口永远扫不到 —— 用户在非扫描 tick 手工平仓时，系统会
+    # 因为「没检出人工干预」而把仓位补回来。
+    #
+    # 现在扫描窗口 = 距上次扫描的全部时间，基线只在扫描时推进；并且净仓一变
+    # 就立刻立 pending 闸门，禁止自动补仓，直到扫描给出原因。见 external_guard。
+    ew = _ext_watch(symbol)
+    if ew.scan_net is None and legacy_net is not None:
+        # 进程重启后**续用**已落盘的基线，而不是盲目重新起算：停机期间发生的
+        # 净仓变化（无论谁造成的）下一轮就能定性，不会因为「重新起算」而漏掉。
+        # 若变化其实是本运行器自己的单子成交，扫描会认出委托号前缀并判为非
+        # 人工干预，闸门随即解除，不会误伤。
+        ew.scan_net = float(legacy_net)
+        ew.last_scan_ms = int(watch.get("last_scan_ms") or legacy_ms or 0)
+    note_net(ew, ex_now=ex_now, now=now, min_qty=MIN_QTY)
+    watch["scan_pending"] = bool(ew.pending)
+    hit = await scan_external(
+        client, symbol, ex_now=ex_now, now=now, watch=ew, min_qty=MIN_QTY,
+        classify=classify_external, fills_fn=external_fills,
     )
-    return {
-        "kind": kind,
-        "ex_before": float(ex_before),
-        "ex_after": float(ex_now),
-        "detail": (f"{symbol} 交易所净额 {float(ex_before):+.4f} → "
-                   f"{float(ex_now):+.4f}；{parts}"),
-    }
+    watch["scan_pending"] = bool(ew.pending)
+    watch["scan_reason"] = ew.last_reason
+    if hit:
+        return hit
+    if ew.pending:
+        print(f"[{symbol} 人工干预] 净仓变化未定性，已暂停自动补仓"
+              f"（{ew.last_reason}）")
+    return None
 
 
 async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
@@ -1208,6 +1557,27 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
             return True
         return False
 
+    # 交易所预挂保护单：先确保交易所有一张覆盖全仓的条件单。
+    # 顺序必须在软件止损之前 —— 后面要按它是否确认来决定要不要软件兜底下单。
+    ex_stop_state = ""
+    if ex_side != 0.0 and EXCHANGE_STOPS_ENABLED and execute:
+        try:
+            await manage_exchange_stop(
+                client, st, symbol=symbol, ex_side=ex_side,
+                entry_px=entry_px, atr_1h=atr_1h, execute=execute)
+            ex_stop_state = str(protection_state(st, symbol).get("state") or "")
+        except Exception as exc:  # noqa: BLE001 保护单管理失败不得拖垮整个标的
+            print(f"[{symbol} 保护单] 管理异常: {type(exc).__name__}: {exc}")
+            ex_stop_state = "UNKNOWN"
+
+    # 交易所保护单已成交 → 账本清零，绝不补回
+    try:
+        if await clear_ledger_if_stop_fired(client, st, symbol=symbol,
+                                           ex_side=ex_side):
+            return
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{symbol} 保护单成交判定] 异常: {exc}")
+
     # 正常止损（1.5×ATR）/ 保本止损：比灾难止损近，必须先判。
     try:
         if ex_side == 0.0:
@@ -1221,6 +1591,7 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
         stopped = await protective_stop(
             client, st, symbol=symbol, ex_side=ex_side, entry_px=entry_px,
             atr_1h=atr_1h, mark=mark_now, execute=execute, tag=tag15,
+            exchange_protected=(ex_stop_state == "PROTECTED"),
         )
     except Exception:
         rollback("正常/保本止损调用失败")
@@ -1271,7 +1642,9 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
             before = json.dumps(book.get("entry"), sort_keys=True)
             did = process_strategy(
                 spec, book, bars, atr_al,
-                equity=equity, block=block or bool(watch.get("paused")),
+                equity=equity,
+                block=(block or bool(watch.get("paused"))
+                       or bool(protection_blocked(st, symbol))),
                 now=now, execute=execute,
                 trend=trend_side(st, symbol),
                 # 组合级保证金预算：其它标的已占的额度先扣掉（先到先得）。
@@ -1288,7 +1661,11 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
     if changed:
         # 人工平仓后「等下一根信号」：账本被新信号改动即解除持有。
         clear_hold_on_new_signal(st, symbol)
-    allow_sync = not watch.get("paused") and not watch.get("hold")
+    # 自动补仓闸门（需求 D）：
+    #   1) 人工干预净仓变化未定性 → 禁止用 desired_net 自动补仓
+    #   2) 保护单未确认 → 禁止开新仓（宁可错过信号，不能裸奔）
+    allow_sync = (not watch.get("paused") and not watch.get("hold")
+                  and not watch.get("scan_pending"))
     if allow_sync and (changed or
                        abs(desired_net(st, symbol) - ex_side) >= SYNC_MIN_DELTA):
         try:
@@ -1312,6 +1689,19 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
                 print(f"[{symbol} 幽灵仓位清零] 交易所空仓但账本有仓，"
                       f"已清零该标的账本，等下一根信号")
         elif result is not None:
+            # 首笔成交一出现就补挂保护单（需求 B）——不能等下一个 tick，
+            # 追价最长 180 秒，这段窗口里新仓位必须已经有保护。
+            if ex_side != 0.0 or abs(desired_net(st, symbol)) >= MIN_QTY:
+                try:
+                    pos_after = await client.get_position(symbol)
+                    side_after = _signed_qty(pos_after)
+                    px_after = float(getattr(pos_after, "entry_price", 0.0) or 0.0)
+                    if abs(side_after) >= MIN_QTY and px_after > 0:
+                        await manage_exchange_stop(
+                            client, st, symbol=symbol, ex_side=side_after,
+                            entry_px=px_after, atr_1h=atr_1h, execute=execute)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[{symbol} 保护单] 成交后补挂异常: {exc}")
             # 部分成交对齐：委托可能只成交了一部分，账本不能继续记着没成交的部分。
             # 2026-10-04 ETH 目标 -15.854 实际只到 -7.430，账本却一直虚高。
             raw = getattr(result, "raw", None)
@@ -1416,6 +1806,23 @@ async def main() -> int:
     await client.sync_time()
     print(f"已连接 {ep.label} | 模式={'真实下单' if args.execute else '仅观察'}")
 
+    # ---- 启动保护单对账（需求 D）----------------------------------------
+    # 以交易所实仓 + openAlgoOrders 为唯一事实来源。有仓没保护就立刻补挂；
+    # 补不上就把该标的标成 UNPROTECTED，主循环会禁止它开新仓。
+    if EXCHANGE_STOPS_ENABLED:
+        try:
+            _st0 = load_state()
+            summary = await reconcile_protection(client, _st0,
+                                                 execute=args.execute)
+            save_state(_st0)
+            print("启动保护单对账结果：")
+            for _sym, _info in summary.items():
+                print(f"  {_sym}: {_info}")
+        except Exception as exc:  # noqa: BLE001 对账失败不阻断启动，但会记录
+            print(f"[启动对账] 失败（不阻断启动，主循环仍会逐轮修复）："
+                  f"{type(exc).__name__}: {exc}")
+            print(traceback.format_exc())
+
     if args.execute:
         try:
             prepared = await prepare_testnet_execution(client)
@@ -1465,3 +1872,15 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
+# 下单尝试的最小间隔（毫秒）。主循环 15 秒一轮，若验证环节因为字段解析或
+# 限流持续失败，没有退避就会**每轮都下一张新单**，在交易所堆出一串重复的
+# 保护单 —— 触发时重复平仓。只在真正需要下单时才受这个间隔约束；
+# 「查到已有合格保护单」的正常路径不受影响。
+PROTECTIVE_RETRY_INTERVAL_MS = 30_000
+_PROTECTIVE_ATTEMPT: dict = {}
+
+
+def _protective_attempt_ok(symbol: str) -> bool:
+    """距上次下单尝试是否已过退避间隔。"""
+    last = float(_PROTECTIVE_ATTEMPT.get(symbol) or 0.0)
+    return (time.time() * 1000 - last) >= PROTECTIVE_RETRY_INTERVAL_MS
