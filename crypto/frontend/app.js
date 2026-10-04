@@ -13,7 +13,11 @@
   const REFRESH_MS = 20000;
   const $ = (id) => document.getElementById(id);
 
-  const VIEW_TITLES = { trading: "交易总览", account: "账户连接" };
+  const VIEW_TITLES = {
+    trading: "交易总览",
+    account: "账户连接",
+    chart: "图片显示确认模块",
+  };
   let currentView = "trading";
   let timer = null;
   let markSocket = null;
@@ -244,8 +248,14 @@
       s.classList.toggle("active", s.id === "view-" + name)
     );
     if ($("pageTitle")) $("pageTitle").textContent = VIEW_TITLES[name] || name;
+    // 第 3 页自带渲染与刷新循环，进入时启动、离开时停止，避免后台空转取数。
+    if (name === "chart") {
+      if (window.ChartModule) window.ChartModule.enter();
+    } else if (window.ChartModule) {
+      window.ChartModule.leave();
+    }
     if (name === "trading") refreshTrading();
-    else refreshAccount();
+    else if (name === "account") refreshAccount();
   }
 
   // ------------------------------------------------------------- 实时行情
@@ -385,7 +395,7 @@
               <span class="${src.side === "LONG" ? "positive" : "negative"}">${zh}</span>
               <span>${lotUsdt == null ? "—" : `${num(lotUsdt, 2)} <small>USDT</small>`}<br><small class="net-notional">${num(src.qty, 4)} ${coin(src.symbol || sym)}</small></span>
               <span>${lotMargin == null ? "—" : `${num(lotMargin, 2)} <small>估算</small>`}</span>
-              <span>${num(src.px, 2)}</span>
+              <span>${num(src.px, 2)}<small>参考价</small></span>
               <span>${fmtKlineBeijing(src.bar_ms, src.interval)}</span>
               <span>${esc(src.reason || "—")}</span>
               <span class="${est == null ? "" : pnlClass(est)}">${est == null ? "—" : `${signed(est)} <small>估算</small>`}</span>
@@ -404,7 +414,7 @@
             <span class="${!qty ? "" : side === "LONG" ? "positive" : "negative"}">${esc(netSide)}</span>
             <span>${qty ? `${num(netUsdt, 2)} <small>USDT</small><br><small class="net-notional">${num(qty, 4)} ${coin(sym)}</small>` : "—"}</span>
             <span>${qty ? `${num(netMargin, 2)} <small>交易所</small>` : "—"}</span>
-            <span>${entry ? num(entry, 2) : "—"}</span>
+            <span>${entry ? num(entry, 2) : "—"}${entry ? "<small>成交均价</small>" : ""}</span>
             <span>—</span>
             <span>${lots.length > 1 ? "同标的两条策略合成" : (lots[0] ? `${lots[0].name} 对应净仓` : "交易所账户")}</span>
             <span class="${pnlClass(upnl)}">${signed(upnl)} <small>交易所</small></span>
@@ -1086,7 +1096,7 @@
     if (timer) clearInterval(timer);
     timer = setInterval(() => {
       if (currentView === "trading") refreshTrading();
-      else refreshAccount();
+      else if (currentView === "account") refreshAccount();
     }, REFRESH_MS);
     if (clockTimer) clearInterval(clockTimer);
     clockTimer = setInterval(renderSyncStamp, 1000);
@@ -1110,7 +1120,8 @@
     if (r)
       r.addEventListener("click", () => {
         if (currentView === "trading") refreshTrading();
-        else refreshAccount();
+        else if (currentView === "account") refreshAccount();
+        else if (window.ChartModule) window.ChartModule.refresh();
       });
 
     document.addEventListener("keydown", (e) => {
@@ -1119,7 +1130,8 @@
         !["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)
       ) {
         if (currentView === "trading") refreshTrading();
-        else refreshAccount();
+        else if (currentView === "account") refreshAccount();
+        else if (window.ChartModule) window.ChartModule.refresh();
       }
     });
 

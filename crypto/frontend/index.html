@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BTC 量化控制台</title>
-  <link rel="stylesheet" href="/styles.css?v=19" />
+  <link rel="stylesheet" href="/styles.css?v=20" />
 </head>
 <body>
   <div class="app-shell">
@@ -14,6 +14,7 @@
       <nav class="nav">
         <button class="nav-item active" data-view="trading"><span>01</span>交易总览</button>
         <button class="nav-item" data-view="account"><span>02</span>账户连接</button>
+        <button class="nav-item" data-view="chart"><span>03</span>图片显示确认模块</button>
       </nav>
       <section class="sidebar-strategies" aria-label="已配置策略">
         <div class="sidebar-section-head">
@@ -201,6 +202,7 @@
           <div class="table-body" id="posBox">
             <div class="empty-state"><span>○</span><div><b>空仓</b><small>当前无持仓</small></div></div>
           </div>
+          <p class="pos-footnote">同一标的两行的<b>数量应完全相等</b>；一旦不等即为外部干预、漏单或部分成交，需查对账。两行<b>开仓价</b>口径不同：策略腿为下单时的<b>参考价</b>，币安净仓为交易所<b>成交均价</b>（分批成交的加权结果），两者之差会等比投影到<b>浮盈</b>；<b>保证金</b>策略腿按「名义价值 ÷ 杠杆」估算、净仓为交易所逐仓实际占用。逐位核对账户以币安净仓行为准。</p>
         </div>
 
         <div class="lower-grid">
@@ -271,8 +273,72 @@
           </div>
         </div>
       </section>
+      <!-- ================= 第 3 页 · 图片显示确认模块 ================= -->
+      <section class="view" id="view-chart">
+        <div class="notice-bar">
+          <span class="notice-icon">i</span>
+          <div>
+            <strong>图片显示确认模块</strong>
+            <span>把 bot 真正使用的测试网行情画出来：KDJ(9,3,3) 的 K / D 线、MACD(12,26,9) 能量柱，以及策略的 B / S 信号。B = 金叉且 MACD 柱为正；S = 死叉且 MACD 柱为负；标记画在信号 K 线上，实际执行在其下一根 K 线开盘。方向背离的交叉已按规则丢弃。策略是单仓不加仓：已持多时再出同向 B 只画空心标记、不动作，只有对侧信号才反手。本页只读展示，不下单。</span>
+          </div>
+          <span id="chartStatus" class="chart-status">正在取数…</span>
+        </div>
+
+        <div class="panel chart-panel">
+          <div class="chart-controls">
+            <div class="seg" role="group" aria-label="标的">
+              <button type="button" class="seg-btn" data-chart-symbol="BTCUSDT">BTCUSDT</button>
+              <button type="button" class="seg-btn" data-chart-symbol="ETHUSDT">ETHUSDT</button>
+            </div>
+            <div class="seg" role="group" aria-label="周期">
+              <button type="button" class="seg-btn" data-chart-interval="15m">15m</button>
+              <button type="button" class="seg-btn" data-chart-interval="5m">5m</button>
+            </div>
+            <label class="chart-field"><span>显示根数</span>
+              <select id="chartBars">
+                <option value="120">120</option>
+                <option value="200" selected>200</option>
+                <option value="300">300</option>
+                <option value="500">500</option>
+              </select>
+            </label>
+            <label class="chart-check"><input type="checkbox" id="chartShowSignals" checked><span>显示 B / S</span></label>
+            <label class="chart-check"><input type="checkbox" id="chartShowTrades" checked><span>显示成交</span></label>
+            <label class="chart-check"><input type="checkbox" id="chartAuto" checked><span>自动刷新</span></label>
+            <button class="ghost-btn" id="chartRefreshBtn">立即刷新</button>
+          </div>
+          <div class="chart-meta" id="chartMeta">正在读取行情…</div>
+          <div class="chart-legend">
+            <span class="lg"><i class="sw-up"></i>阳线 / 绿柱(柱&gt;0)</span>
+            <span class="lg"><i class="sw-down"></i>阴线 / 红柱(柱&lt;0)</span>
+            <span class="lg"><i class="sw-k"></i>K 线 / DIF</span>
+            <span class="lg"><i class="sw-d"></i>D 线 / DEA</span>
+            <span class="lg"><i class="sw-long"></i>底纹＝推演持多</span>
+            <span class="lg"><i class="sw-short"></i>底纹＝推演持空</span>
+            <span class="lg"><i class="sw-repeat"></i>空心＝重复信号（不动作）</span>
+            <span class="chart-zoom" id="chartZoomInfo"></span>
+            <button type="button" class="ghost-btn chart-zoom-reset" id="chartZoomReset">复位视图</button>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="chartCanvas"></canvas>
+          </div>
+        </div>
+
+        <div class="table-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">窗口内信号</p>
+              <h2>B / S 信号明细</h2>
+              <p class="subline">按部署规格逐根判定：金叉且 MACD 柱为正 → B；死叉且柱为负 → S；方向背离的交叉一律丢弃。数值与图上、与运行器同源，可直接逐笔核对。</p>
+            </div>
+          </div>
+          <div class="table-body chart-signal-body" id="chartSignalBox"></div>
+        </div>
+      </section>
+
     </main>
   </div>
-  <script src="/app.js?v=39"></script>
+  <script src="/chart.js?v=4"></script>
+  <script src="/app.js?v=40"></script>
 </body>
 </html>
