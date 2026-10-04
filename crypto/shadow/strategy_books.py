@@ -284,10 +284,30 @@ def other_symbol_margin(st: Dict[str, Any], symbol: str,
 
 
 def clear_symbol_books(st: Dict[str, Any], symbol: str) -> None:
+    """仓位已平：清空账本，并**一并清掉属于上一笔仓位的止损记录**。
+
+    为什么必须清 exchange_stop（2026-10-04 实测 Bug）
+    ------------------------------------------------
+    旧实现只把 entry 置空，exchange_stop.algo_id 会永久留着上一笔的死单号。
+    后果有两层：
+
+      1. 表象：clear_ledger_if_stop_fired 的「形态 B」每 tick 都判定
+         「状态残留」并打印一行，永不停止 —— 实测刷屏。
+      2. 实质（更危险）：manage_exchange_stop 读 book["exchange_stop"] 作为
+         prev_id，非空时走**「收紧」分支**（tighten_protective_stop，先立后破、
+         要去撤一张已不存在的单），而不是「建立」分支。下一笔新仓的止损因此
+         走进异常路径；一旦旧单撤销失败被当成硬失败，res.protects 为假，
+         新仓会被判为「未受保护」并禁止开新仓 —— 止损失效。
+
+    所有调用点都发生在「仓位已平」时，所以清掉它是语义正确的：没有仓位，
+    就没有需要收紧或撤销的止损单。
+    """
     books = st.setdefault("strategies", {})
     for spec in specs_for_symbol(symbol):
         book = books.setdefault(spec.id, empty_book())
         book["entry"] = None
+        book.pop("exchange_stop", None)
+        book.pop("stop_defer_logged", None)
 
 
 def reconcile_symbol_books(st: Dict[str, Any], symbol: str,

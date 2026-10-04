@@ -1425,6 +1425,21 @@ def _mark_flat(st: dict, symbol: str, trigger: float, *,
         "fired_trigger": float(trigger or 0.0),
         "fired_kind": "exchange_stop",
     })
+    # 一并清掉策略账本里属于**上一笔仓位**的止损记录。
+    #
+    # 为什么必须在这里清（2026-10-04 实测）：
+    #   「形态 B」——账本早已为空、只剩保护状态残留——**不会**调用
+    #   clear_symbol_books，只走 _mark_flat。若这里不清 exchange_stop，
+    #   clear_ledger_if_stop_fired 里 ours 集合就永远非空，于是每个 tick 都
+    #   重新判定一次「状态残留」并打印，永不停止（实测最后 200 行里 186 行
+    #   是这一句）。
+    #   更实质的危害是：下一笔新仓的 manage_exchange_stop 会拿这个死单号走
+    #   「收紧」分支，而不是「建立」分支。
+    for _spec in specs_for_symbol(symbol):
+        _bk = (st.get("strategies") or {}).get(_spec.id)
+        if isinstance(_bk, dict):
+            _bk.pop("exchange_stop", None)
+            _bk.pop("stop_defer_logged", None)
     if announce:
         print(f"[{symbol} 保护单已成交] 触发价 {trigger:.2f}；"
               f"账本清零，不补回，等下一根信号")
