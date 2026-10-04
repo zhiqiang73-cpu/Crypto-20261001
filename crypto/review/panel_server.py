@@ -162,7 +162,12 @@ def _quality_context(start_ms: int = 0) -> Dict[str, Any]:
             for text, count in reasons.most_common(4)
         ],
         "active_strategies": strategies,
-        "five_minute_disabled": not any("5" in x.lower() for x in strategies),
+        # 2026-10-04: 原判据是 `"5" in x`，而 kdj15/eth15 里也含字符 5，
+        # 于是 5m 已停用时该标志仍为 False（误报「5m 还在跑」）。
+        # 现在问的是「运行进程上报的策略里，有没有 5m 的 id」。
+        "five_minute_disabled": not any(
+            s in FIVE_MINUTE_STRATEGY_IDS for s in strategies
+        ),
         "halted": bool(state.get("halted")),
         "missed_bars": int(state.get("missed_bars") or 0),
         "missed_signals": int(state.get("missed_signals") or 0),
@@ -395,8 +400,13 @@ from models.signals import DimensionScores, StrategyHorizon
 from review import meta_review, overrides, review_loop
 from review.order_sources import (SOURCE_LABELS, annotate_orders, annotate_trades,
                                   load_strategy_order_ids, summarize)
-from shadow.strategy_books import (TRADE_SYMBOLS, desired_net, desired_nets,
-                                   position_sources, runtime_view)
+from shadow.strategy_books import (SPEC_5M, SPEC_ETH_5M, TRADE_SYMBOLS,
+                                   desired_net, desired_nets, position_sources,
+                                   runtime_view)
+# 5m 策略的 id 取自规格定义（SPEC_5M / SPEC_ETH_5M 保留定义但不在 SPECS 里，
+# 表示「已停用」）。不要用 `"5" in strategy_id` 之类的字符串包含判断：
+# kdj15 / eth15 里也含字符 5。
+FIVE_MINUTE_STRATEGY_IDS = (SPEC_5M.id, SPEC_ETH_5M.id)
 from shadow.external_watch import request_resume as request_external_resume
 from shadow.external_watch import summarize as external_summary
 from review.journal import TradeJournal, new_trade_id
@@ -530,7 +540,7 @@ def create_app(
     async def static_asset(request):
         """前端静态资源与 /api/* 同源，避免跨端口与缓存不一致。"""
         name = os.path.basename(request.match_info.get("name") or "")
-        allowed = {"app.js", "styles.css", "index.html"}
+        allowed = {"app.js", "chart.js", "styles.css", "index.html"}
         if name not in allowed:
             return web.Response(text="not found", status=404)
         path = PANEL_STATIC_DIR / name
@@ -1594,9 +1604,37 @@ def create_app(
                 "connected": False, "reason": f"{type(exc).__name__}: {exc}"
             })
 
+    async def api_chart(request):
+        """图片显示确认模块：K 线 + KDJ + MACD + B/S 信号（只读，仅测试网）。
+
+        行情地址由 config.market_endpoints 从账户地址反推，与运行器同一条序列；
+        KDJ/MACD 直接复用 shadow/indicators.py 的同一份函数，不另立口径。
+        """
+        symbol = (request.query.get("symbol") or "BTCUSDT").upper()
+        interval = (request.query.get("interval") or "15m").lower()
+        try:
+            bars = int(request.query.get("bars") or 200)
+        except Exception:
+            bars = 200
+        try:
+            from review import chart_data
+
+            payload = await chart_data.get_chart(symbol, interval, bars)
+            return web.json_response(payload)
+        except Exception as exc:
+            return web.json_response({
+                "ok": False,
+                "module": "图片显示确认模块",
+                "symbol": symbol,
+                "interval": interval,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }, status=502)
+
     # routes
     app.router.add_get("/", index)
-    app.router.add_get("/{name:app\\.js|styles\\.css|index\\.html}", static_asset)
+    app.router.add_get(
+        "/{name:app\\.js|chart\\.js|styles\\.css|index\\.html}", static_asset
+    )
     app.router.add_get("/api/live", api_live)
     app.router.add_get("/api/market", api_market)
     app.router.add_get("/api/health", api_health)
@@ -1635,6 +1673,7 @@ def create_app(
     app.router.add_get("/api/review/convergence", api_convergence)
     app.router.add_post("/api/scheduler/run", api_scheduler_run)
     app.router.add_get("/api/daily_summaries", api_daily_summaries)
+    app.router.add_get("/api/chart", api_chart)
     return app
 
 
