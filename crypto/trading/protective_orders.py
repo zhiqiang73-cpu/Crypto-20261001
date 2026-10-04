@@ -105,6 +105,106 @@ def normalize_algo_orders(raw: Any) -> List[Dict[str, Any]]:
     return []
 
 
+# ---------------------------------------------------------------------------
+# 普通挂单（限价止盈）与 Algo 条件单的统一视图
+# ---------------------------------------------------------------------------
+# 2026-10-04：止盈腿从 TAKE_PROFIT_MARKET 改为 LIMIT + reduceOnly，以吃 maker
+# 费率（2bp）而不是 taker（4bp），并避免市价成交的滑点。代价是止盈单从
+# openAlgoOrders 搬到了 openOrders —— 两套接口的字段名、状态字、撤销端点都
+# 不一样。
+#
+# 处理办法：**把普通挂单归一化成条件单的形状**，再与条件单合并成一份列表。
+# 这样下游（find_take_profit / 去重 / 清理 / 成交对账）一行都不用改。
+#
+# 命名空间：普通挂单的 algoId 加前缀 "ord-"。币安的 algoId 是纯数字，
+# 所以永远不会撞号 —— 合并列表里的 ID 仍然唯一。
+REGULAR_ORDER_PREFIX = "ord-"
+
+
+def is_regular_order(o: Dict[str, Any]) -> bool:
+    """是不是被归一化过的普通挂单（而非 Algo 条件单）。"""
+    if str(o.get("_source") or "") == "order":
+        return True
+    return algo_ident(o).startswith(REGULAR_ORDER_PREFIX)
+
+
+def regular_order_id(o: Dict[str, Any]) -> str:
+    """取回交易所原始 orderId（去掉命名空间前缀）。"""
+    aid = algo_ident(o)
+    if aid.startswith(REGULAR_ORDER_PREFIX):
+        return aid[len(REGULAR_ORDER_PREFIX):]
+    return str(o.get("orderId") or "")
+
+
+def normalize_regular_order(o: Dict[str, Any]) -> Dict[str, Any]:
+    """把 openOrders 的一条普通挂单，映射成条件单的形状。
+
+    关键映射：
+        orderId      → algoId（加 ord- 前缀）
+        price        → triggerPrice（挂单价即「到达该价就成交」的触发语义，
+                                     find_take_profit 因此无需改动）
+        type         → orderType（"LIMIT"）
+    并保留 _source="order" 与 _raw 供撤销时区分端点。
+    """
+    oid = str(o.get("orderId") or "")
+    return {
+        "algoId": f"{REGULAR_ORDER_PREFIX}{oid}" if oid else "",
+        "clientAlgoId": str(o.get("clientOrderId") or ""),
+        "orderType": str(o.get("type") or "LIMIT").upper(),
+        "side": str(o.get("side") or "").upper(),
+        "triggerPrice": _num(o.get("price") or o.get("stopPrice")),
+        "quantity": _num(o.get("origQty") or o.get("quantity")),
+        "status": str(o.get("status") or "NEW").upper(),
+        "reduceOnly": o.get("reduceOnly"),
+        # 普通限价单永远是**部分单**：币安不允许普通单带 closePosition。
+        # 显式给出这个字段，让 covers_full_position / 去重逻辑拿到确定答案，
+        # 而不是因为字段缺失而走默认分支。
+        "closePosition": "false",
+        "_source": "order",
+        "_raw": o,
+    }
+
+
+async def fetch_open_regular_take_profits(
+    client: Any, symbol: str,
+) -> List[Dict[str, Any]]:
+    """取该标的盘口上的普通挂单中，属于**止盈**的那些。
+
+    只认 reduceOnly 的 LIMIT 单 —— 入场追价单也是普通挂单，混进来会被当成
+    止盈单，进而被去重/清理逻辑误撤。
+    """
+    try:
+        raw = await client.get_open_orders(symbol)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("查询普通挂单失败 %s: %s", symbol, exc)
+        return []
+    out: List[Dict[str, Any]] = []
+    for o in (raw or []):
+        if not isinstance(o, dict):
+            continue
+        if str(o.get("type") or "").upper() != "LIMIT":
+            continue
+        if str(o.get("reduceOnly")).lower() not in ("true", "1"):
+            continue
+        n = normalize_regular_order(o)
+        if n.get("algoId"):
+            out.append(n)
+    return out
+
+
+async def fetch_open_protective_orders(
+    client: Any, symbol: str,
+) -> List[Dict[str, Any]]:
+    """保护单的**统一视图**：Algo 条件单（止损）+ 普通挂单（限价止盈）。
+
+    止损仍在 openAlgoOrders，止盈已在 openOrders —— 只看一边必然漏。
+    漏了止盈会导致重复重挂；漏了止损会导致保护状态误判。
+    """
+    algo = await fetch_open_algo_orders(client, symbol)
+    regular = await fetch_open_regular_take_profits(client, symbol)
+    return list(algo) + list(regular)
+
+
 def _num(v: Any, default: float = 0.0) -> float:
     try:
         return float(v)
@@ -237,8 +337,17 @@ def is_stop_type(o: Dict[str, Any]) -> bool:
 
 
 def is_take_profit_type(o: Dict[str, Any]) -> bool:
-    """是不是止盈类条件单。字段缺失时**不**当止盈 —— 宁可漏认也不能误认。"""
-    return "TAKE_PROFIT" in algo_order_type(o)
+    """是不是止盈单（Algo 条件单 或 归一化后的普通挂单）。
+
+    字段缺失时**不**当止盈 —— 宁可漏认也不能误认。
+
+    2026-10-04：止盈改为 LIMIT + reduceOnly 后，普通挂单的 orderType 是
+    "LIMIT"，不含 TAKE_PROFIT 字样，必须显式识别，否则 find_take_profit
+    永远找不到已挂的止盈单，表现为「反复重挂」。
+    """
+    if "TAKE_PROFIT" in algo_order_type(o):
+        return True
+    return is_regular_order(o)
 
 
 def find_take_profit(
@@ -272,18 +381,48 @@ async def place_take_profit(
     client: Any, *, symbol: str, side: int, trigger_price: float,
     quantity: float, tag: str = "tp",
 ) -> ProtectiveOrder:
-    """挂一张部分仓位的止盈单（TAKE_PROFIT_MARKET + reduceOnly + quantity）。
+    """挂一张部分仓位的**限价**止盈单（LIMIT + reduceOnly + quantity）。
 
-    与止损单的关键差别：止损用 closePosition=true 覆盖全仓；止盈必须指定
-    数量，且**不能**同时传 closePosition（两者互斥）。
+    与止损单的关键差别：止损用 closePosition=true 覆盖全仓且必须市价；止盈
+    必须指定数量，且**不能**同时传 closePosition（两者互斥）。
+
+    2026-10-04 变更：TAKE_PROFIT_MARKET → LIMIT + reduceOnly。
+      多头的止盈价在市场**上方**，一张挂在那里的 SELL LIMIT 天然是 **maker**，
+      根本不需要触发机制。收益是双重的：
+        * 费率：taker 4bp → maker 2bp
+        * 成交价：按限价成交，不吃市价滑点
+      代价：价格没到就反转则不成交 —— 但仓位仍在，追踪止损继续兜底，
+      **下行有界**，所以这个代价是可以接受的。
+    止损**保持市价不动**：省 2bp 去换「可能没止损掉」是把确定的尾部风险
+    换成确定的小钱，这笔交易不该做。
     """
     cid = new_client_algo_id(symbol, tag)
     try:
-        res = await client.place_stop_market(
+        res = await client.place_resting_limit_order(
             exit_side_of(side), quantity, trigger_price, symbol,
-            client_order_id=cid, close_position=False,
-            order_type="TAKE_PROFIT_MARKET",
+            reduce_only=True, client_order_id=cid,
         )
+        # 币安对限价单有**价格带限制**（实测约 ±5%，超限报 -4016）。
+        # 这在实际场景里会出现：价格大幅下跌后，多头的止盈目标
+        # （entry + 2×ATR）可能落到现价上方 5% 以外，限价单直接挂不上去。
+        # 此时**降级为市价止盈** —— 多付 2bp 也比完全没有止盈强。
+        # 只在价格带错误上降级：网络类错误不能走这条路，否则会重复下单。
+        if not getattr(res, "ok", False) and "-4016" in str(
+                getattr(res, "error", "") or ""):
+            print(f"[{symbol} 止盈] 限价 {trigger_price:.2f} 超出交易所价格带，"
+                  f"降级为市价止盈（taker）")
+            # 局部导入：shadow.alerts 是零依赖叶子模块，但 trading→shadow 是
+            # 分层倒置。放在函数内导入可彻底避免导入期循环，代价只是每次多一次
+            # 字典查找（sys.modules 命中）。这是有意为之的取舍，不是疏漏。
+            from shadow.alerts import notify
+            notify("WARNING", f"tp_limit_out_of_band_{symbol}",
+                   f"{symbol} 止盈价超出限价单价格带，已降级为市价止盈",
+                   f"触发价 {trigger_price:.2f}；原因: {getattr(res, 'error', '')}")
+            res = await client.place_stop_market(
+                exit_side_of(side), quantity, trigger_price, symbol,
+                client_order_id=cid, close_position=False,
+                order_type="TAKE_PROFIT_MARKET",
+            )
     except Exception as exc:  # noqa: BLE001
         return ProtectiveOrder(
             symbol=symbol, side=side, trigger_price=float(trigger_price),
@@ -294,6 +433,12 @@ async def place_take_profit(
     ok = bool(getattr(res, "ok", False)) or str(state) in (
         "OrderState.ACKNOWLEDGED", "OrderState.FILLED", "ACKNOWLEDGED", "FILLED")
     algo_id = str(getattr(res, "algo_id", "") or "")
+    if not algo_id:
+        # 普通挂单的 OrderResult 用 order_id；统一加上命名空间前缀，
+        # 使下游的 algo_ident / 撤销分发都能正确识别来源。
+        oid = str(getattr(res, "order_id", "") or "")
+        if oid:
+            algo_id = f"{REGULAR_ORDER_PREFIX}{oid}"
     if not ok or not algo_id:
         # 下单超时/无回执时按 clientAlgoId 回查，不能盲目重复下单
         found = await _verify_by_client_id(client, symbol, cid)
@@ -329,7 +474,21 @@ async def _verify_by_client_id(client: Any, symbol: str,
 
 
 async def cancel_algo_by_id(client: Any, symbol: str, algo_id: str) -> bool:
-    """按 algoId 撤一张条件单。返回是否确认已不在挂单里。"""
+    """按单号撤一张保护单。返回是否确认已不在盘口。
+
+    **必须分发端点**：带 ord- 前缀的是普通挂单（限价止盈），走
+    /fapi/v1/order；其余是 Algo 条件单（止损），走 Algo 接口。
+    用错端点的表现是「接口返回成功但单子还在」—— 比报错更危险，
+    调用方会以为清理干净了。2026-10-04 止盈改限价后实测踩到过。
+    """
+    if str(algo_id).startswith(REGULAR_ORDER_PREFIX):
+        oid = str(algo_id)[len(REGULAR_ORDER_PREFIX):]
+        try:
+            await client.cancel_order(order_id=oid, symbol=symbol)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{symbol}] 撤挂单 {algo_id} 失败: {exc}")
+            return False
+        return await _verify_absent(client, symbol, algo_id)
     try:
         await client.cancel_algo_order(algo_id=algo_id, symbol=symbol)
     except Exception as exc:  # noqa: BLE001
@@ -339,8 +498,15 @@ async def cancel_algo_by_id(client: Any, symbol: str, algo_id: str) -> bool:
 
 
 async def _verify_absent(client: Any, symbol: str, algo_id: str) -> bool:
+    """确认该单号已不在盘口 —— 普通挂单与条件单查各自的接口。
+
+    只查一边会把「普通挂单还在」误判成「已撤干净」。
+    """
     try:
-        orders = await fetch_open_algo_orders(client, symbol)
+        if str(algo_id).startswith(REGULAR_ORDER_PREFIX):
+            orders = await fetch_open_regular_take_profits(client, symbol)
+        else:
+            orders = await fetch_open_algo_orders(client, symbol)
     except Exception:  # noqa: BLE001
         return False
     return not any(algo_ident(o) == algo_id for o in orders)
@@ -558,10 +724,12 @@ async def tighten_protective_stop(
 async def cancel_protective_orders(
     client: Any, symbol: str, *, include_take_profit: bool = False,
 ) -> tuple:
-    """撤销该标的的 Algo 条件单。返回 (撤销数, 剩余数)。
+    """撤销该标的的保护单（Algo 条件单 + 普通挂单止盈）。返回 (撤销数, 剩余数)。
 
-    必须走 Algo 接口：普通 openOrders 查不到条件单，用它清理会「以为撤干净了」
-    而实际把上一笔的保护单留在交易所，影响下一笔仓位。
+    **两套接口都要查、都要撤**：止损在 openAlgoOrders（走 Algo 接口撤），
+    限价止盈在 openOrders（走 /fapi/v1/order 撤）。只查一边的后果是「以为撤
+    干净了」而实际把单子留在交易所，影响下一笔仓位 —— 撤销时用错端点更危险，
+    因为接口会返回成功。
 
     include_take_profit: **默认 False，只撤止损单。**
         这里曾经是无差别撤销全部 Algo 单，把止盈单一起撤了。后果不只是丢了
@@ -571,7 +739,7 @@ async def cancel_protective_orders(
         止盈单也一并清掉，否则下一笔仓位会挂着一张旧止盈单。
     """
     try:
-        orders = await fetch_open_algo_orders(client, symbol)
+        orders = await fetch_open_protective_orders(client, symbol)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"撤销保护单前查询失败: {exc}") from exc
     n = 0
@@ -585,7 +753,16 @@ async def cancel_protective_orders(
         if not aid and not cid:
             continue
         try:
-            if aid:
+            # 分发到正确的端点：普通挂单走 /fapi/v1/order，条件单走 Algo 接口。
+            # 用错端点的表现是「撤销返回成功但单子还在」—— 比报错更危险。
+            if is_regular_order(o):
+                oid = regular_order_id(o)
+                if oid:
+                    await client.cancel_order(order_id=oid, symbol=symbol)
+                else:
+                    await client.cancel_order(
+                        client_order_id=cid, symbol=symbol)
+            elif aid:
                 await client.cancel_algo_order(algo_id=aid, symbol=symbol)
             else:
                 await client.cancel_algo_order(client_algo_id=cid, symbol=symbol)
@@ -593,7 +770,7 @@ async def cancel_protective_orders(
         except Exception as exc:  # noqa: BLE001 单张失败不阻断其余
             logger.warning("撤销保护单失败 %s %s: %s", symbol, aid or cid, exc)
     try:
-        left = await fetch_open_algo_orders(client, symbol)
+        left = await fetch_open_protective_orders(client, symbol)
     except Exception:  # noqa: BLE001
         left = []
     remaining = sum(1 for o in left if algo_alive(o))
@@ -650,7 +827,7 @@ async def reconcile_protective(
     """
     res = ReconcileResult(symbol=symbol, side=side, quantity=quantity)
     try:
-        orders = await fetch_open_algo_orders(client, symbol)
+        orders = await fetch_open_protective_orders(client, symbol)
     except Exception as exc:  # noqa: BLE001
         res.state = ProtectionState.UNKNOWN
         res.note = f"openAlgoOrders 查询失败，按未保护处理: {exc}"

@@ -24,6 +24,7 @@ from shadow.deploy import (  # noqa: E402
     reconcile_tp_fills,
 )
 from shadow.strategy_books import specs_for_symbol  # noqa: E402
+from trading.binance_client import OrderResult  # noqa: E402
 from trading.models import ManagedOrder, OrderState  # noqa: E402
 from trading.protective_orders import (  # noqa: E402
     find_protective_stop,
@@ -45,7 +46,8 @@ class FakeExchange:
     def __init__(self, *, tick=0.10, step=0.0001):
         self.tick = tick
         self.step = step
-        self.algo: dict = {}
+        self.algo: dict = {}          # 条件单（止损）
+        self.regular: dict = {}       # 普通挂单（限价止盈）
         self._next = 1
         self.place_calls = 0
         self.hide_placed = False
@@ -79,6 +81,53 @@ class FakeExchange:
                             state=OrderState.ACKNOWLEDGED, symbol=symbol,
                             is_stop=True, is_algo=True, algo_id=aid, raw=dict(o))
 
+    async def place_resting_limit_order(self, side, quantity, price,
+                                        symbol=None, *, reduce_only=False,
+                                        client_order_id=None,
+                                        time_in_force="GTC"):
+        """限价止盈：挂上即返回，不轮询成交。"""
+        self.place_calls += 1
+        oid = str(self._next)
+        self._next += 1
+        o = {
+            "orderId": oid, "clientOrderId": client_order_id or "",
+            "symbol": symbol,
+            "side": "SELL" if side == "LONG" else "BUY",
+            "type": "LIMIT", "price": f"{price:.2f}",
+            "origQty": f"{quantity:.6f}", "status": "NEW",
+            "reduceOnly": "true" if reduce_only else "false",
+        }
+        if not self.hide_placed:
+            self.regular[oid] = o
+        return OrderResult(
+            ok=True, order_id=oid, symbol=symbol, side=o["side"],
+            quantity=float(quantity), requested_qty=float(quantity),
+            submitted_qty=float(quantity), cum_filled_qty=0.0, avg_price=0.0,
+            status="NEW", client_order_id=client_order_id or "",
+            order_state="ACKNOWLEDGED", raw=dict(o),
+        )
+
+    async def get_open_orders(self, symbol=None):
+        # 真实接口返回币安原始形状（orderId / price / type / origQty）
+        return [o for o in self.regular.values() if o.get("symbol") == symbol]
+
+    def tps(self, symbol="BTCUSDT"):
+        """**归一化后**的止盈单视图 —— 与生产代码看到的一致。
+
+        断言用这个而不是 self.regular，是为了让测试验证的是代码实际消费的
+        形状（algoId / triggerPrice / orderType），而不是币安原始字段。
+        归一化一旦出错，这里就会跟着失败。
+        """
+        from trading.protective_orders import normalize_regular_order
+        return [normalize_regular_order(o) for o in self.regular.values()
+                if o.get("symbol") == symbol]
+
+    async def cancel_order(self, *, client_order_id=None, order_id=None,
+                           symbol=None):
+        self.regular.pop(order_id, None)
+        return ManagedOrder(client_order_id=client_order_id or "",
+                            state=OrderState.CANCELED)
+
     async def get_open_algo_orders(self, symbol=None):
         return [o for o in self.algo.values() if o.get("symbol") == symbol]
 
@@ -91,6 +140,14 @@ class FakeExchange:
     def seed(self, *, symbol="BTCUSDT", side="SELL", trig, otype, qty="0.0"):
         aid = str(self._next)
         self._next += 1
+        if otype == "LIMIT":
+            # 限价止盈现在落在普通挂单账本里
+            o = {"orderId": aid, "clientOrderId": f"seed{aid}", "symbol": symbol,
+                 "side": side, "type": "LIMIT", "price": f"{trig:.2f}",
+                 "status": "NEW", "reduceOnly": "true", "origQty": qty}
+            self.regular[aid] = o
+            from trading.protective_orders import normalize_regular_order
+            return normalize_regular_order(o)
         o = {"algoId": aid, "clientAlgoId": f"seed{aid}", "symbol": symbol,
              "side": side, "orderType": otype, "triggerPrice": f"{trig:.2f}",
              "algoStatus": "NEW", "closePosition": "false", "quantity": qty}
@@ -166,8 +223,8 @@ class TestManageTakeProfit(unittest.TestCase):
         _run(manage_take_profit(ex, st, symbol="BTCUSDT", ex_side=0.296,
                                 entry_px=AVG, atr_1h=ATR, execute=True))
         self.assertEqual(ex.place_calls, 1)
-        o = list(ex.algo.values())[0]
-        self.assertEqual(o["orderType"], "TAKE_PROFIT_MARKET")
+        o = ex.tps()[0]
+        self.assertEqual(o["orderType"], "LIMIT")
         self.assertAlmostEqual(float(o["triggerPrice"]), AVG + 2 * ATR, delta=0.11)
         self.assertAlmostEqual(float(o["quantity"]), 0.148, delta=1e-4)
         self.assertEqual(o["closePosition"], "false", "止盈是部分单，不能覆盖全仓")
@@ -187,7 +244,7 @@ class TestManageTakeProfit(unittest.TestCase):
         rec["tp_filled"] = 1
         _run(manage_take_profit(ex, st, symbol="BTCUSDT", ex_side=0.148,
                                 entry_px=AVG, atr_1h=ATR, execute=True))
-        o = list(ex.algo.values())[0]
+        o = ex.tps()[0]
         self.assertAlmostEqual(float(o["triggerPrice"]), AVG + 3 * ATR, delta=0.11)
 
     def test_no_more_stages_after_all_filled(self):
@@ -255,7 +312,7 @@ class TestReconcileTpFills(unittest.TestCase):
     def test_no_action_when_tp_still_alive(self):
         ex = FakeExchange()
         st = make_state()
-        o = ex.seed(trig=85295.31, otype="TAKE_PROFIT_MARKET", qty="0.148")
+        o = ex.seed(trig=85295.31, otype="LIMIT", qty="0.148")
         rec = st.setdefault("protection", {}).setdefault("BTCUSDT", {})
         rec["tp_orders"] = [{"algo_id": o["algoId"], "trigger": 85295.31,
                              "qty": 0.148, "stage": 0, "filled": False}]
@@ -341,14 +398,14 @@ class TestTakeProfitNoDuplicateOnAtrDrift(unittest.TestCase):
                                 entry_px=AVG, atr_1h=ATR * 0.93, execute=True))
         self.assertEqual(ex.place_calls, 1,
                          f"目标价漂移不得重复下单，实际下了 {ex.place_calls} 张")
-        self.assertEqual(len(ex.algo), 1)
+        self.assertEqual(len(ex.tps()), 1)
 
     def test_duplicates_are_canceled_keeping_one(self):
         """已经堆出的重复止盈单必须被清掉，只留一张。"""
         ex = FakeExchange()
         st = make_state()
-        a = ex.seed(trig=AVG + 2 * ATR, otype="TAKE_PROFIT_MARKET", qty="0.1479")
-        b = ex.seed(trig=AVG + 2 * ATR - 6.90, otype="TAKE_PROFIT_MARKET",
+        a = ex.seed(trig=AVG + 2 * ATR, otype="LIMIT", qty="0.1479")
+        b = ex.seed(trig=AVG + 2 * ATR - 6.90, otype="LIMIT",
                     qty="0.1479")
         rec = st.setdefault("protection", {}).setdefault("BTCUSDT", {})
         rec["tp_orders"] = [
@@ -360,7 +417,7 @@ class TestTakeProfitNoDuplicateOnAtrDrift(unittest.TestCase):
         _run(manage_take_profit(ex, st, symbol="BTCUSDT", ex_side=0.296,
                                 entry_px=AVG, atr_1h=ATR, execute=True))
         self.assertEqual(ex.place_calls, 0, "去重不该新下单")
-        self.assertEqual(len(ex.algo), 1, "重复止盈单必须被清到只剩一张")
+        self.assertEqual(len(ex.tps()), 1, "重复止盈单必须被清到只剩一张")
         self.assertEqual(len(rec["tp_orders"]), 1)
 
     def test_total_tp_quantity_never_exceeds_intended_fraction(self):
@@ -370,8 +427,8 @@ class TestTakeProfitNoDuplicateOnAtrDrift(unittest.TestCase):
         for _ in range(4):
             _run(manage_take_profit(ex, st, symbol="BTCUSDT", ex_side=0.296,
                                     entry_px=AVG, atr_1h=ATR, execute=True))
-        total = sum(float(o["quantity"]) for o in ex.algo.values()
-                    if o["orderType"] == "TAKE_PROFIT_MARKET")
+        total = sum(float(o["quantity"]) for o in ex.tps()
+                    if o["orderType"] in ("LIMIT", "TAKE_PROFIT_MARKET"))
         frac = TP_STAGES[0][1]
         self.assertLessEqual(total, 0.296 * frac + 1e-4,
                              f"止盈合计 {total} 超过设定比例 {frac}，会把整仓平掉")
@@ -380,11 +437,11 @@ class TestTakeProfitNoDuplicateOnAtrDrift(unittest.TestCase):
         """状态文件丢了记录时，认养现存止盈单，而不是再下一张。"""
         ex = FakeExchange()
         st = make_state()
-        ex.seed(trig=AVG + 2 * ATR, otype="TAKE_PROFIT_MARKET", qty="0.148")
+        ex.seed(trig=AVG + 2 * ATR, otype="LIMIT", qty="0.148")
         _run(manage_take_profit(ex, st, symbol="BTCUSDT", ex_side=0.296,
                                 entry_px=AVG, atr_1h=ATR, execute=True))
         self.assertEqual(ex.place_calls, 0, "应认养现存单")
-        self.assertEqual(len(ex.algo), 1)
+        self.assertEqual(len(ex.tps()), 1)
 
     def test_places_when_truly_missing(self):
         """确实没有止盈单时才下单。"""

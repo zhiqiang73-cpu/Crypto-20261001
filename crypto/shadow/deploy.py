@@ -56,6 +56,7 @@ from trading.protective_orders import (ProtectionState,
                                        is_take_profit_type,
                                        place_take_profit,
                                        fetch_open_algo_orders,
+                                       fetch_open_protective_orders,
                                        find_protective_stop,
                                        place_protective_stop,
                                        reconcile_protective,
@@ -1372,7 +1373,7 @@ async def clear_ledger_if_stop_fired(client: BinanceTestnetClient, st: dict, *,
     if not ours:
         return False        # 没有任何属于我们的单 → 无从判断
     try:
-        orders = await fetch_open_algo_orders(client, symbol)
+        orders = await fetch_open_protective_orders(client, symbol)
     except Exception as exc:  # noqa: BLE001
         print(f"[{symbol} 保护单成交判定] 查询失败，本轮不清账本: {exc}")
         return False
@@ -1464,7 +1465,7 @@ async def manage_take_profit(client: BinanceTestnetClient, st: dict, *,
         return None
 
     try:
-        orders = await fetch_open_algo_orders(client, symbol)
+        orders = await fetch_open_protective_orders(client, symbol)
     except Exception as exc:  # noqa: BLE001
         print(f"[{symbol} 止盈] 查询失败，本轮不动作: {exc}")
         return None
@@ -1561,7 +1562,7 @@ async def reconcile_tp_fills(client: BinanceTestnetClient, st: dict, *,
     if not pending:
         return False
     try:
-        orders = await fetch_open_algo_orders(client, symbol)
+        orders = await fetch_open_protective_orders(client, symbol)
     except Exception as exc:  # noqa: BLE001
         print(f"[{symbol} 止盈成交判定] 查询失败，本轮不动账本: {exc}")
         return False

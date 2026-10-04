@@ -1133,6 +1133,128 @@ class BinanceTestnetClient:
             raw=last.raw if isinstance(last.raw, dict) else {},
         )
 
+    async def place_resting_limit_order(
+        self,
+        side: str,
+        quantity: float,
+        price: float,
+        symbol: Optional[str] = None,
+        *,
+        reduce_only: bool = False,
+        client_order_id: Optional[str] = None,
+        time_in_force: str = "GTC",
+    ) -> OrderResult:
+        """挂一张**留在盘口**的限价单，提交成功即返回。
+
+        与 place_limit_order 的本质差别：后者是「追价成交」语义 —— 超时未成交
+        会返回 ok=False（unfilled_after_timeout），因为它假设调用方要的是成交。
+        而挂单止盈要的恰恰是**挂着不成交**，用它会得到假失败，进而重复下单。
+
+        2026-10-04：止盈腿从 TAKE_PROFIT_MARKET 改为 LIMIT + reduceOnly，目的
+        是吃 maker 费率（2bp）而不是 taker（4bp），同时避免市价成交的滑点。
+        多头的止盈价在市场上方，所以一张挂在那里的 SELL LIMIT 天然是 maker，
+        **不需要触发机制**。
+
+        与 place_limit_order 相同的安全规则：
+          * 刚提交返回 NEW/PENDING_NEW 是正常的，必须查一次确认
+          * 提交异常时先按 clientOrderId 回查，确认没下出去才报失败
+          * 只有明确拒单才标记 REJECTED
+        **绝不撤单** —— 留在盘口就是目的。
+        """
+        symbol = symbol or self.symbol
+        step = await self._lot_step(symbol)
+        qty = self._qty_precision(quantity, step)
+        if qty <= 0:
+            return OrderResult(
+                ok=False, error=f"quantity too small: {quantity}", symbol=symbol
+            )
+        tick = await self.price_tick(symbol)
+        limit_price = self._price_precision(price, tick)
+        if limit_price <= 0:
+            return OrderResult(
+                ok=False, error=f"price invalid: {price}", symbol=symbol
+            )
+        side_u = side.upper()
+        # side 是持仓方向，不是买卖方向：止盈必须平仓。
+        # 多仓 SELL、空仓 BUY；写反会变成给多仓加仓，触发 -2022。
+        order_side = "SELL" if side_u == "LONG" else "BUY"
+        cid = client_order_id or _new_client_order_id("tp")
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": order_side,
+            "type": "LIMIT",
+            "quantity": qty,
+            "price": limit_price,
+            "timeInForce": (time_in_force or "GTC").upper(),
+            "newClientOrderId": cid,
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        hedge = False
+        try:
+            hedge = await self.get_position_mode()
+        except Exception:
+            hedge = bool(self._hedge_mode)
+        if hedge:
+            # 双向持仓模式下 reduceOnly 不被接受，用 positionSide 表达「只减仓」
+            params["positionSide"] = (
+                "LONG" if order_side == "SELL" else "SHORT"
+            )
+            params.pop("reduceOnly", None)
+        submit_raw = None
+        submit_error = ""
+        try:
+            submit_raw = await self._request(
+                "POST", "/fapi/v1/order", params, signed=True
+            )
+        except BinanceClientError as exc:
+            submit_error = str(exc)
+            if "-1116" in submit_error or "-1102" in submit_error \
+                    or "-4014" in submit_error:
+                return OrderResult(
+                    ok=False, error=submit_error, symbol=symbol,
+                    side=order_side, client_order_id=cid,
+                    order_state=OrderState.REJECTED.value,
+                    requested_qty=quantity, submitted_qty=qty,
+                    cum_filled_qty=0.0, quantity=0.0,
+                )
+            # 其余网络类错误：走回查，不判定失败
+        entry = (
+            self._raw_to_managed(submit_raw, client_order_id=cid)
+            if submit_raw
+            else ManagedOrder(
+                client_order_id=cid, state=OrderState.UNKNOWN,
+                symbol=symbol, side=order_side, raw={},
+            )
+        )
+        # 查一次确认挂单真的在盘口。挂单成功时状态是 NEW / PARTIALLY_FILLED。
+        if entry.state == OrderState.UNKNOWN:
+            try:
+                entry = await self.query_order(client_order_id=cid, symbol=symbol)
+            except Exception:  # noqa: BLE001 回查失败不得冒充失败
+                pass
+        # 注意：OrderState 没有 NEW —— 币安的 NEW 映射为 ACKNOWLEDGED。
+        # 「挂单成功」= ACKNOWLEDGED（在盘口待成交）/ PARTIALLY_FILLED / FILLED
+        if entry.state in (OrderState.ACKNOWLEDGED, OrderState.PARTIALLY_FILLED,
+                           OrderState.FILLED):
+            res = entry.to_order_result()
+            res.ok = True
+            return res
+        if entry.state == OrderState.REJECTED:
+            return entry.to_order_result()
+        return OrderResult(
+            ok=False,
+            order_id=entry.exchange_order_id or "",
+            symbol=symbol, side=order_side, position_side=side_u,
+            quantity=0.0, requested_qty=quantity, submitted_qty=qty,
+            cum_filled_qty=0.0, avg_price=0.0,
+            status=entry.state.value, client_order_id=cid,
+            order_state=entry.state.value,
+            error=(f"submitted_unknown: {submit_error}" if submit_error
+                   else "resting_order_unconfirmed"),
+            raw=entry.raw if isinstance(entry.raw, dict) else {},
+        )
+
     async def place_limit_chase(
         self,
         side: str,
