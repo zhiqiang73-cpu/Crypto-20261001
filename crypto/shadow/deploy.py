@@ -46,6 +46,9 @@ from trading.cost_model import (net_break_even_price, stop_price_from_avg,
                                stop_is_tighter)
 from trading.protective_orders import (ProtectionState,
                                        algo_ident, algo_trigger,
+                                       cancel_algo_by_id,
+                                       find_take_profit,
+                                       place_take_profit,
                                        fetch_open_algo_orders,
                                        find_protective_stop,
                                        place_protective_stop,
@@ -116,6 +119,24 @@ EXCHANGE_STOPS_ENABLED = True
 # 限流持续失败，没有退避就会**每轮都下一张新单**，在交易所堆出一串重复的
 # 保护单 —— 触发时重复平仓。只在真正需要下单时才受这个间隔约束；
 # 「查到已有合格保护单」的正常路径不受影响。
+# ---------------------------------------------------------------------------
+# 分批止盈 + 剩余仓位移动止损（2026-10-04 加入）
+# ---------------------------------------------------------------------------
+# 用户文档第 6 行原本排除止盈；2026-10-04 19:45 用户明确要求「本次也给我
+# 加入分批止盈」，故按方案 D 实施：到 +2×ATR 平掉一半，剩余转移动止损。
+#
+# 分批表：(ATR_1H 倍数, 平掉「当前仓位」的比例)。按顺序、由近及远。
+# 比例是相对**当前**仓位，所以 ((2,0.5),(3,0.5)) 最终留下 25% 跟随。
+TP_ENABLED = True
+TP_STAGES: tuple = ((2.0, 0.5), (3.0, 0.5))
+
+# 移动止损：止损与「入场以来最有利标记价」的间距（ATR_1H 倍数）。
+# 只向保护利润的方向移动，永不放宽。1.0 比初始止损的 1.5 更紧 ——
+# 这是刻意的：追踪的目的就是用一部分回撤空间换利润锁定。
+TRAIL_ENABLED = True
+TRAIL_ATR = 1.0
+
+# 止盈/止损单的下单退避（共用）
 PROTECTIVE_RETRY_INTERVAL_MS = 30_000
 _PROTECTIVE_ATTEMPT: dict = {}
 
@@ -154,10 +175,13 @@ def protection_blocked(st: dict, symbol: str) -> Optional[str]:
 
 def set_protection_state(st: dict, symbol: str, *, state: str, note: str,
                          algo_id: str = '', trigger: float = 0.0) -> None:
-    st.setdefault("protection", {})[symbol] = {
+    """写入保护状态。**合并而非替换** —— best_price / tp_filled / tp_orders
+    等字段由止盈与追踪逻辑维护，替换会把它们抹掉。"""
+    rec = st.setdefault("protection", {}).setdefault(symbol, {})
+    rec.update({
         "state": state, "note": note, "algo_id": algo_id,
         "trigger": float(trigger or 0.0), "ts": int(time.time() * 1000),
-    }
+    })
 
 # 补记窗口: 运行器停机后最多回看多少根 15m K 线 (96 根 = 24 小时)。
 # 2026-10-02 用户在图表上看到 09:45 金叉, 而日志里那一根只有「观察」——
@@ -1001,8 +1025,21 @@ async def _protective_target(client: BinanceTestnetClient, st: dict, *,
             entry_fee_paid=0.0, funding_paid=0.0, tick=tick,
             entry_fee_missing=True,
         )
-        if be > 0:
-            return be, True, tick
+        target = be
+        # 移动止损：止损与「入场以来最有利标记价」保持 TRAIL_ATR×ATR_1H。
+        # 只朝保护利润的方向取更紧的一侧，永不放宽。
+        if TRAIL_ENABLED:
+            best = float(protection_state(st, symbol).get("best_price") or 0.0)
+            if best > 0:
+                trail = (best - TRAIL_ATR * float(atr_1h) if side > 0
+                         else best + TRAIL_ATR * float(atr_1h))
+                if trail > 0:
+                    if side > 0:
+                        target = max(target, trail) if target > 0 else trail
+                    else:
+                        target = min(target, trail) if target > 0 else trail
+        if target > 0:
+            return target, True, tick
     px = stop_price_from_avg(
         avg_price=float(entry_px), side=side, atr_1h=float(atr_1h),
         multiple=NORMAL_STOP_ATR, tick=tick,
@@ -1039,6 +1076,19 @@ async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
         set_protection_state(st, symbol, state="UNKNOWN",
                              note="触发价算不出来（均价或 ATR 非法）")
         return None
+
+    # 记录入场以来最有利的标记价，供移动止损使用。必须在下单判断之前更新，
+    # 否则止损会滞后一个 tick 才跟上新高。
+    mark = float(latest_mark_price(symbol) or 0.0)
+    if mark > 0:
+        rec0 = protection_state(st, symbol)
+        best0 = float(rec0.get("best_price") or 0.0)
+        if best0 <= 0:
+            rec0["best_price"] = mark
+        elif side > 0:
+            rec0["best_price"] = max(best0, mark)
+        else:
+            rec0["best_price"] = min(best0, mark)
 
     book = book_for_symbol(st, symbol)
     prev = dict((book or {}).get("exchange_stop") or {})
@@ -1132,17 +1182,22 @@ async def clear_ledger_if_stop_fired(client: BinanceTestnetClient, st: dict, *,
     book = book_for_symbol(st, symbol)
     if not book or not book.get("entry"):
         return False
-    rec = dict(book.get("exchange_stop") or {})
-    algo_id = str(rec.get("algo_id") or "")
-    if not algo_id:
+    # 止损单与所有止盈单都算「我们自己的单」。仓位归零时，只要还有任何一张
+    # 在挂，就说明不是被它们打掉的（可能是人工平仓），不擅自清账本。
+    ours = {str((book.get("exchange_stop") or {}).get("algo_id") or "")}
+    for t in (protection_state(st, symbol).get("tp_orders") or []):
+        ours.add(str(t.get("algo_id") or ""))
+    ours.discard("")
+    if not ours:
         return False
     try:
         orders = await fetch_open_algo_orders(client, symbol)
     except Exception as exc:  # noqa: BLE001
         print(f"[{symbol} 保护单成交判定] 查询失败，本轮不清账本: {exc}")
         return False
-    if any(algo_ident(o) == algo_id for o in orders):
-        return False        # 保护单还在，仓位是别的原因变空的 → 不擅自清
+    if any(algo_ident(o) in ours for o in orders):
+        return False        # 我们的单还在，仓位是别的原因变空的 → 不擅自清
+    rec = dict(book.get("exchange_stop") or {})
     trig = float(rec.get("trigger") or 0.0)
     clear_symbol_books(st, symbol)
     if symbol == "BTCUSDT":
@@ -1153,6 +1208,121 @@ async def clear_ledger_if_stop_fired(client: BinanceTestnetClient, st: dict, *,
     log_row([_fmt(0), f"{symbol_short(symbol)} 保护单成交",
              "", "", f"{trig:.2f}", "", "", "", "", "", "",
              f"{symbol} 交易所保护单触发平仓，账本清零"])
+    return True
+
+
+async def manage_take_profit(client: BinanceTestnetClient, st: dict, *,
+                             symbol: str, ex_side: float, entry_px: float,
+                             atr_1h: float, execute: bool) -> Optional[dict]:
+    """按 TP_STAGES 逐批挂出止盈单（部分数量 + reduceOnly）。
+
+    每批只挂「当前还没触发的那一批」，触发过的批次记在 tp_filled 里不再重挂。
+    成交由 reconcile_tp_fills 认定，不在本函数里猜。
+    """
+    if not TP_ENABLED or not execute:
+        return None
+    if abs(ex_side) < MIN_QTY or entry_px <= 0 or not (atr_1h > 0):
+        return None
+    if not np.isfinite(float(atr_1h)):
+        return None
+    side = 1 if ex_side > 0 else -1
+    rec = protection_state(st, symbol)
+    idx = int(rec.get("tp_filled") or 0)
+    if idx >= len(TP_STAGES):
+        return None
+    mult, frac = TP_STAGES[idx]
+
+    tick = await client.price_tick(symbol)
+    level = float(entry_px) + side * float(mult) * float(atr_1h)
+    level = client._price_precision(level, tick)
+    if level <= 0:
+        return None
+    qty = abs(ex_side) * float(frac)
+    if qty < MIN_QTY:
+        return None
+
+    try:
+        orders = await fetch_open_algo_orders(client, symbol)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{symbol} 止盈] 查询失败，本轮不动作: {exc}")
+        return None
+
+    existing = find_take_profit(orders, side=side, trigger=level,
+                                tolerance=max(tick, 0.0))
+    if existing is not None:
+        tp = rec.setdefault("tp_orders", [])
+        aid = algo_ident(existing)
+        if not any(str(t.get("algo_id")) == aid for t in tp):
+            tp.append({"algo_id": aid, "trigger": algo_trigger(existing),
+                       "qty": qty, "stage": idx, "filled": False})
+        return None
+
+    if not _protective_attempt_ok(f"{symbol}:tp"):
+        return None
+    _PROTECTIVE_ATTEMPT[f"{symbol}:tp"] = time.time() * 1000
+
+    res = await place_take_profit(
+        client, symbol=symbol, side=side, trigger_price=level, quantity=qty)
+    if not res.protects:
+        print(f"[{symbol} ⚠️ 止盈挂单未确认] 第{idx + 1}批 {level:.2f} × {qty}: "
+              f"{res.error}")
+        return {"action": "止盈挂单未确认", "note": res.error}
+
+    rec.setdefault("tp_orders", []).append({
+        "algo_id": res.algo_id, "trigger": res.trigger_price,
+        "qty": qty, "stage": idx, "filled": False,
+    })
+    detail = (f"{symbol} 第{idx + 1}批止盈挂出：{('多' if side > 0 else '空')} "
+              f"触发价 {res.trigger_price:.2f}（{mult}×ATR）"
+              f" 数量 {qty:.4f}/{abs(ex_side):.4f}")
+    print(f"[{symbol} 止盈] {detail}")
+    log_row([_fmt(0), f"{symbol_short(symbol)} 止盈第{idx + 1}批",
+             "多" if side > 0 else "空", f"{qty:.4f}",
+             f"{res.trigger_price:.2f}", "", "", "", "", "", "", detail])
+    return {"action": f"止盈第{idx + 1}批", "note": detail}
+
+
+async def reconcile_tp_fills(client: BinanceTestnetClient, st: dict, *,
+                             symbol: str, ex_side: float) -> bool:
+    """认定止盈成交，并把账本对齐到交易所实际净仓。
+
+    必要性：止盈单由**交易所**触发成交，运行器不是下单方。若不处理，账本仍
+    记着原仓位，净仓同步会认为「目标有仓、实际少了一半」，把刚止盈掉的部分
+    **买回来** —— 止盈就白做了。
+
+    判定保持保守：只有「账本里记的那张止盈单已不在 openAlgoOrders 里」才认。
+    无论是成交还是被撤，**交易所净仓才是事实**，所以一律按实际净仓对齐；
+    对齐是幂等的，净仓没变就不会有任何改动。
+    """
+    rec = protection_state(st, symbol)
+    tps = rec.get("tp_orders") or []
+    pending = [t for t in tps if not t.get("filled")]
+    if not pending:
+        return False
+    try:
+        orders = await fetch_open_algo_orders(client, symbol)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{symbol} 止盈成交判定] 查询失败，本轮不动账本: {exc}")
+        return False
+    alive = {algo_ident(o) for o in orders}
+    gone = [t for t in pending if str(t.get("algo_id")) not in alive]
+    if not gone:
+        return False
+
+    for t in gone:
+        t["filled"] = True
+        rec["tp_filled"] = max(int(rec.get("tp_filled") or 0),
+                               int(t.get("stage") or 0) + 1)
+    note = reconcile_symbol_books(st, symbol, float(ex_side))
+    detail = (f"{symbol} 止盈第{gone[0].get('stage', 0) + 1}批已成交"
+              f"（触发价 {float(gone[0].get('trigger') or 0):.2f}）；"
+              f"账本对齐到交易所净仓 {float(ex_side):+.4f}"
+              + (f"：{note}" if note else ""))
+    print(f"[{symbol} 止盈成交] {detail}")
+    log_row([_fmt(0), f"{symbol_short(symbol)} 止盈成交",
+             "", f"{abs(float(ex_side)):.4f}",
+             f"{float(gone[0].get('trigger') or 0):.2f}", "", "", "", "", "",
+             "", detail])
     return True
 
 
@@ -1570,6 +1740,14 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
             return True
         return False
 
+    # 止盈成交对账必须排在保护单管理之前：先把账本对齐到交易所实际净仓，
+    # 后面的「缺保护单」判断和净仓同步才不会被虚高的账本带偏。
+    if ex_side != 0.0 and TP_ENABLED and execute:
+        try:
+            await reconcile_tp_fills(client, st, symbol=symbol, ex_side=ex_side)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{symbol} 止盈成交判定] 异常: {type(exc).__name__}: {exc}")
+
     # 交易所预挂保护单：先确保交易所有一张覆盖全仓的条件单。
     # 顺序必须在软件止损之前 —— 后面要按它是否确认来决定要不要软件兜底下单。
     ex_stop_state = ""
@@ -1590,6 +1768,15 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
             return
     except Exception as exc:  # noqa: BLE001
         print(f"[{symbol} 保护单成交判定] 异常: {exc}")
+
+    # 分批止盈：按 TP_STAGES 逐批挂单
+    if ex_side != 0.0 and TP_ENABLED and execute:
+        try:
+            await manage_take_profit(
+                client, st, symbol=symbol, ex_side=ex_side,
+                entry_px=entry_px, atr_1h=atr_1h, execute=execute)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{symbol} 止盈] 管理异常: {type(exc).__name__}: {exc}")
 
     # 正常止损（1.5×ATR）/ 保本止损：比灾难止损近，必须先判。
     try:

@@ -180,6 +180,11 @@ def find_protective_stop(
     best: Optional[Dict[str, Any]] = None
     best_trig = 0.0
     for o in orders:
+        # ⚠ 多仓的止损单与止盈单**都是 SELL**。不按 orderType 过滤的话，
+        # 触发价更高的止盈单会被当成「更紧的止损」选中 —— 结果是止损永远
+        # 建不起来，而系统显示「已保护」，仓位实际裸奔。
+        if not is_stop_type(o):
+            continue
         if algo_side(o) != want:
             continue
         if not algo_alive(o):
@@ -216,6 +221,130 @@ def covers_full_position(order: Dict[str, Any], *, quantity: float,
 # ---------------------------------------------------------------------------
 # 下单 / 确认
 # ---------------------------------------------------------------------------
+def algo_order_type(o: Dict[str, Any]) -> str:
+    """条件单类型：STOP_MARKET / TAKE_PROFIT_MARKET / ..."""
+    return str(o.get("orderType") or o.get("type") or "").upper()
+
+
+def is_stop_type(o: Dict[str, Any]) -> bool:
+    """是不是止损类条件单。
+
+    字段缺失时**按止损处理**：老响应与既有测试不带 orderType，收紧默认值会
+    让它们全部失效。只有明确标了 TAKE_PROFIT 的才排除。
+    """
+    t = algo_order_type(o)
+    return not t or "STOP" in t
+
+
+def is_take_profit_type(o: Dict[str, Any]) -> bool:
+    """是不是止盈类条件单。字段缺失时**不**当止盈 —— 宁可漏认也不能误认。"""
+    return "TAKE_PROFIT" in algo_order_type(o)
+
+
+def find_take_profit(
+    orders: List[Dict[str, Any]], *, side: int, trigger: float,
+    tolerance: float = 0.0,
+) -> Optional[Dict[str, Any]]:
+    """找一张触发价等于 trigger 的止盈单（容差 tolerance 内）。
+
+    只认 orderType 里带 TAKE_PROFIT 的单 —— 多仓的止损单与止盈单都是 SELL，
+    不按类型过滤会把止损单当成止盈单（或反过来），后果是保护完全失效。
+    """
+    # ⚠ 这里要的是**交易所买卖方向**，不是持仓方向。
+    # exit_side_of() 返回 "LONG"/"SHORT"（那是给 place_stop_market 的持仓方向
+    # 参数），而 openAlgoOrders 回给我们的 side 字段是 "SELL"/"BUY"。用错就永远
+    # 匹配不上，表现是「明明挂着止盈单却反复重挂」。
+    want = "SELL" if side > 0 else "BUY"
+    for o in orders:
+        if not is_take_profit_type(o) or not algo_alive(o):
+            continue
+        if algo_side(o) != want:
+            continue
+        t = algo_trigger(o)
+        if t <= 0:
+            continue
+        if abs(t - trigger) <= max(tolerance, 0.0):
+            return o
+    return None
+
+
+async def place_take_profit(
+    client: Any, *, symbol: str, side: int, trigger_price: float,
+    quantity: float, tag: str = "tp",
+) -> ProtectiveOrder:
+    """挂一张部分仓位的止盈单（TAKE_PROFIT_MARKET + reduceOnly + quantity）。
+
+    与止损单的关键差别：止损用 closePosition=true 覆盖全仓；止盈必须指定
+    数量，且**不能**同时传 closePosition（两者互斥）。
+    """
+    cid = new_client_algo_id(symbol, tag)
+    try:
+        res = await client.place_stop_market(
+            exit_side_of(side), quantity, trigger_price, symbol,
+            client_order_id=cid, close_position=False,
+            order_type="TAKE_PROFIT_MARKET",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return ProtectiveOrder(
+            symbol=symbol, side=side, trigger_price=float(trigger_price),
+            client_algo_id=cid, state=ProtectionState.UNKNOWN,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    state = getattr(res, "state", None)
+    ok = bool(getattr(res, "ok", False)) or str(state) in (
+        "OrderState.ACKNOWLEDGED", "OrderState.FILLED", "ACKNOWLEDGED", "FILLED")
+    algo_id = str(getattr(res, "algo_id", "") or "")
+    if not ok or not algo_id:
+        # 下单超时/无回执时按 clientAlgoId 回查，不能盲目重复下单
+        found = await _verify_by_client_id(client, symbol, cid)
+        if found is not None:
+            return ProtectiveOrder(
+                symbol=symbol, side=side,
+                trigger_price=algo_trigger(found),
+                algo_id=algo_ident(found), client_algo_id=cid,
+                verified=True, state=ProtectionState.PROTECTED,
+            )
+        return ProtectiveOrder(
+            symbol=symbol, side=side, trigger_price=float(trigger_price),
+            client_algo_id=cid, state=ProtectionState.UNKNOWN,
+            error=str(getattr(res, "error", "") or "下单未确认"),
+        )
+    return ProtectiveOrder(
+        symbol=symbol, side=side, trigger_price=float(trigger_price),
+        algo_id=algo_id, client_algo_id=cid, verified=True,
+        state=ProtectionState.PROTECTED,
+    )
+
+
+async def _verify_by_client_id(client: Any, symbol: str,
+                               client_algo_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        orders = await fetch_open_algo_orders(client, symbol)
+    except Exception:  # noqa: BLE001
+        return None
+    for o in orders:
+        if algo_client_ident(o) == client_algo_id:
+            return o
+    return None
+
+
+async def cancel_algo_by_id(client: Any, symbol: str, algo_id: str) -> bool:
+    """按 algoId 撤一张条件单。返回是否确认已不在挂单里。"""
+    try:
+        await client.cancel_algo_order(algo_id=algo_id, symbol=symbol)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{symbol}] 撤条件单 {algo_id} 失败: {exc}")
+        return False
+    return await _verify_absent(client, symbol, algo_id)
+
+
+async def _verify_absent(client: Any, symbol: str, algo_id: str) -> bool:
+    try:
+        orders = await fetch_open_algo_orders(client, symbol)
+    except Exception:  # noqa: BLE001
+        return False
+    return not any(algo_ident(o) == algo_id for o in orders)
+
 async def fetch_open_algo_orders(client: Any, symbol: str) -> List[Dict[str, Any]]:
     """查询交易所当前有效的 Algo 条件单。异常时抛给调用方，不吞。"""
     raw = await client.get_open_algo_orders(symbol)

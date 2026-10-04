@@ -596,8 +596,14 @@ class BinanceTestnetClient:
         *,
         client_order_id: Optional[str] = None,
         close_position: bool = False,
+        order_type: str = "STOP_MARKET",
     ) -> ManagedOrder:
-        """Algo 条件单 STOP_MARKET — POST /fapi/v1/algoOrder (官方已迁出 /order)."""
+        """Algo 条件单 — POST /fapi/v1/algoOrder (官方已迁出 /order).
+
+        order_type: STOP_MARKET（止损）或 TAKE_PROFIT_MARKET（止盈）。
+            两者的方向相同（多仓都是 SELL），**只有 orderType 能区分** ——
+            这也是查询侧必须按 orderType 过滤的原因。
+        """
         symbol = symbol or self.symbol
         side_u = side.upper()
         order_side = "SELL" if side_u == "LONG" else "BUY"
@@ -620,7 +626,7 @@ class BinanceTestnetClient:
             "algoType": "CONDITIONAL",
             "symbol": symbol,
             "side": order_side,
-            "type": "STOP_MARKET",
+            "type": order_type,
             "triggerPrice": trigger,
             "workingType": "MARK_PRICE",
             "clientAlgoId": cid,
