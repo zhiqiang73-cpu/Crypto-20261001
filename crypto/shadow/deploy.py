@@ -112,6 +112,19 @@ ORDER_TAG = "kdj"
 #   * 保护单未确认时禁止开新仓 —— 宁可错过信号，不能裸奔。
 EXCHANGE_STOPS_ENABLED = True
 
+# 下单尝试的最小间隔（毫秒）。主循环 15 秒一轮，若验证环节因为字段解析或
+# 限流持续失败，没有退避就会**每轮都下一张新单**，在交易所堆出一串重复的
+# 保护单 —— 触发时重复平仓。只在真正需要下单时才受这个间隔约束；
+# 「查到已有合格保护单」的正常路径不受影响。
+PROTECTIVE_RETRY_INTERVAL_MS = 30_000
+_PROTECTIVE_ATTEMPT: dict = {}
+
+
+def _protective_attempt_ok(symbol: str) -> bool:
+    """距上次下单尝试是否已过退避间隔。"""
+    last = float(_PROTECTIVE_ATTEMPT.get(symbol) or 0.0)
+    return (time.time() * 1000 - last) >= PROTECTIVE_RETRY_INTERVAL_MS
+
 # 人工干预观察状态。不能放进 st：save_state 会 json.dump 整个 st，
 # ExternalWatch 不是 JSON 可序列化的。进程重启后重建（首次扫描只记基线）。
 _EXTERNAL_WATCHES: dict = {}
@@ -1872,15 +1885,3 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
-# 下单尝试的最小间隔（毫秒）。主循环 15 秒一轮，若验证环节因为字段解析或
-# 限流持续失败，没有退避就会**每轮都下一张新单**，在交易所堆出一串重复的
-# 保护单 —— 触发时重复平仓。只在真正需要下单时才受这个间隔约束；
-# 「查到已有合格保护单」的正常路径不受影响。
-PROTECTIVE_RETRY_INTERVAL_MS = 30_000
-_PROTECTIVE_ATTEMPT: dict = {}
-
-
-def _protective_attempt_ok(symbol: str) -> bool:
-    """距上次下单尝试是否已过退避间隔。"""
-    last = float(_PROTECTIVE_ATTEMPT.get(symbol) or 0.0)
-    return (time.time() * 1000 - last) >= PROTECTIVE_RETRY_INTERVAL_MS
