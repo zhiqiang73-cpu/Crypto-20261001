@@ -7,7 +7,7 @@ BTCUSDT 与 ETHUSDT 各跑两条策略，按标的各记虚拟仓、只下该标
     5m 仓位：与同标的 15m 同向满仓，对着干则减半
     仓位 = 权益 × r ÷ (2 × ATR_1H), r=RISK_R, 向下取整 0.001
     开仓/平仓一律限价: post-only 贴盘口挂单争取 maker, 窗口耗尽才穿盘口兜底
-    布林带仅记录 / 日亏 3% / 回撤 10% / 10x 逐仓
+    布林带仅记录 / 日亏与回撤门控可配置 / 10x 逐仓
 
 只允许 Testnet; live 被 runtime_mode 闸门硬阻断。
 """
@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import csv
 import json
 import os
 import time
+import traceback
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -34,13 +36,15 @@ from shadow.live import ENDPOINTS, MARKET, fetch
 from shadow.strategy_books import (SPEC_15M, SPEC_5M, SPECS, TRADE_SYMBOLS,
                                    apply_virtual_signal, clear_symbol_books,
                                    contra_5m_qty, desired_net, migrate_state,
-                                   reduce_only_for_delta, signal_reason,
-                                   specs_for_symbol, symbol_short, trend_side)
+                                   reconcile_symbol_books, reduce_only_for_delta,
+                                   signal_reason, specs_for_symbol,
+                                   symbol_short, trend_side)
 from shadow.external_watch import (apply_external, classify_external,
                                    clear_hold_on_new_signal,
                                    consume_resume_requests, external_fills,
                                    watch_for)
 from trading.binance_client import BinanceTestnetClient
+from trading.models import OrderResult
 from trading.runtime_mode import current_mode, validate_exchange_target
 from config.market_endpoints import (MARKET_MAINNET, MarketMismatchError,
                                      assert_market_consistency,
@@ -66,6 +70,10 @@ ORDER_LEDGER = os.path.join(OUT, "deployed_orders.jsonl")
 # 运行器心跳 —— 页面据此区分「最新读数」和「运行器确实仍在运行」。
 HEARTBEAT = os.path.join(OUT, "runner_heartbeat.json")
 
+# 默认保留资金保护；测试网 launchd 显式关闭，以便连续采集故障样本。
+BLOCK_ON_DAILY_LOSS = os.environ.get("BLOCK_ON_DAILY_LOSS", "1") != "0"
+HALT_ON_MAX_DRAWDOWN = os.environ.get("HALT_ON_MAX_DRAWDOWN", "1") != "0"
+
 COLS = ["时间", "动作", "方向", "数量", "价格", "净盈亏", "K", "D", "ATR_1H",
         "倍数", "权益", "说明"]
 
@@ -78,6 +86,101 @@ ORDER_TAG = "kdj"
 # 信号判定本身没错 (当时规则仍要求 K<30, 该根 K=50.73 不满足),
 # 但「运行器停了多久、跳过了哪几根」当时完全无从查起。
 MISSED_LOOKBACK_BARS = 96
+
+# 净仓同步的死区。步长取整会让账本与交易所偶尔差一个最小步长（如 ETH 9.567 vs
+# 9.566）；若拿它当"需要下单"，就会为一笔几 USDT 的微单发起 180 秒追价，而交易所
+# 又会以最小名义额(20U)拒掉 —— 纯空转。留 2 个步长的死区。
+SYNC_MIN_DELTA = MIN_QTY * 2.0
+
+# 单笔保证金预算（占权益比例）。风险定量 qty = 权益×RISK_R/(2×ATR_1H) 只回答
+# "想下多少"，不回答"下不下得起" —— 10× 逐仓下它常要求单仓占用 60~90% 权益的
+# 保证金（2026-10-04 实测 BTC 需 86%、ETH 需 59%，合计 145%），两个标的在数学上
+# 不可能同时持仓。这里按"该标的整仓"封顶，使两标的合计 ≤ 2×该值。
+# 0.35 → 两标的合计 70%，留 30% 缓冲给浮亏/手续费/资金费。设 0 表示不封顶。
+MARGIN_BUDGET_PER_TRADE = float(os.environ.get("MARGIN_BUDGET_PER_TRADE", "0.35"))
+
+# 本运行器日志的轮转上限。launchd 用 StandardOutPath 把 stdout 重定向到文件且是
+# O_APPEND, 所以重命名/替换都不起作用(我们的 fd 仍指向旧 inode, 之后的输出会写进
+# 已被换走的文件而丢失)。只能"读末尾 → 就地截断重写": O_APPEND 保证 fd 的后续写入
+# 仍落在文件末尾。
+# 2026-10-04 之前从不轮转, trader.out 里混着 1268 条仓库搬家前的旧路径错误,
+# 排查真实故障时噪音极大。
+LOG_ROTATE_MAX_BYTES = 8 * 1024 * 1024
+LOG_ROTATE_KEEP_LINES = 3000
+LOG_FILES = ("com.crypto.btcusdt.testnet.trader.out.log",
+             "com.crypto.btcusdt.testnet.trader.err.log")
+
+
+def rotate_own_logs() -> None:
+    """超限时就地轮转本运行器的 launchd 日志(保留末尾若干行)。失败不影响交易。"""
+    for name in LOG_FILES:
+        path = os.path.join(ROOT, "runtime", "logs", name)
+        try:
+            if not os.path.exists(path):
+                continue
+            if os.path.getsize(path) <= LOG_ROTATE_MAX_BYTES:
+                continue
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                tail = fh.readlines()[-LOG_ROTATE_KEEP_LINES:]
+            if not tail:
+                continue
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(f"[日志轮转 {datetime.now():%Y-%m-%d %H:%M:%S}] "
+                         f"超过 {LOG_ROTATE_MAX_BYTES // (1024 * 1024)}MB, "
+                         f"仅保留最后 {LOG_ROTATE_KEEP_LINES} 行\n")
+                fh.writelines(tail)
+            print(f"[日志轮转] {name} 已裁剪, 保留最后 {len(tail)} 行")
+        except Exception as exc:  # noqa: BLE001  轮转是维护动作, 绝不中断交易
+            print(f"[日志轮转] {name} 失败(已忽略): {exc}")
+
+
+_SKIP_NOTE: dict = {}
+
+
+def should_report_skip(symbol: str, key: str, now_ms: int, *,
+                       interval_ms: int = 30 * 60 * 1000) -> bool:
+    """同一个「开不出来」的情形不要每 tick 都刷日志。
+
+    2026-10-04: 保证金不足会持续存在（直到减仓或换信号），若每 15 秒打印一次，
+    一天就能刷出上万行把真正的事件淹掉。只在情形变化时、或每 30 分钟重报一次。
+    """
+    prev = _SKIP_NOTE.get(symbol)
+    if prev and prev[0] == key and now_ms - prev[1] < interval_ms:
+        return False
+    _SKIP_NOTE[symbol] = (key, now_ms)
+    return True
+
+
+def apply_margin_budget(book: dict, qty: float, *, side: int, equity: float,
+                        px: float) -> tuple:
+    """按「该标的整仓」的保证金预算给数量封顶。返回 (数量, 说明)。
+
+    同向加层时"整仓"= 已持有 + 本层，所以先扣掉已有量；反向或空仓时按整仓算
+    （反手会先清掉旧层，不该被旧仓占掉额度）。
+    """
+    if qty <= 0 or px <= 0 or equity <= 0 or MARGIN_BUDGET_PER_TRADE <= 0:
+        return qty, ""
+    cap_total = equity * MARGIN_BUDGET_PER_TRADE * float(LEVERAGE) / px
+    entry = book.get("entry") or {}
+    try:
+        existing = abs(float(entry.get("qty") or 0))
+        existing_side = int(entry.get("side") or 0)
+    except (TypeError, ValueError):
+        existing, existing_side = 0.0, 0
+    room = (cap_total - existing) if (existing_side and side == existing_side) \
+        else cap_total
+    room = floor_step(max(0.0, room))
+    if qty <= room:
+        return qty, ""
+    return room, f"保证金预算封顶(整仓≤{cap_total:.4f})"
+
+
+def symbol_book_has_position(st: dict, symbol: str) -> bool:
+    """该标的的虚拟账本里是否还记着仓位（用于识别「幽灵仓位」）。"""
+    return any(
+        float(((st["strategies"][spec.id].get("entry") or {}).get("qty")) or 0) > 0
+        for spec in specs_for_symbol(symbol)
+    )
 
 
 def plan_pending(ts, last_ts: int, *, lookback: int = MISSED_LOOKBACK_BARS):
@@ -422,7 +525,9 @@ def _virtual_side_label(book: dict) -> str:
 
 
 async def sync_net(client: BinanceTestnetClient, st: dict, execute: bool, *,
-                   symbol: str, tag: str, force_cross: bool = False):
+                   symbol: str, tag: str, force_cross: bool = False,
+                   available_balance: Optional[float] = None,
+                   on_step=None):
     """把同一标的两条策略的虚拟仓合成净仓，只下差额。"""
     pos = await client.get_position(symbol)
     pos_side = (getattr(pos, "side", "FLAT") or "FLAT").upper()
@@ -430,16 +535,62 @@ async def sync_net(client: BinanceTestnetClient, st: dict, execute: bool, *,
         1.0 if pos_side == "LONG" else (-1.0 if pos_side == "SHORT" else 0.0))
     desired = desired_net(st, symbol)
     delta = desired - ex
-    if abs(delta) < MIN_QTY:
+    if abs(delta) < SYNC_MIN_DELTA:
         return None
     if not execute:
         print(f"[{symbol} 净仓观察] 应有 {desired:.4f} 实际 {ex:.4f} 差额 {delta:.4f}")
         return None
     side = "LONG" if delta > 0 else "SHORT"
     reduce_only = reduce_only_for_delta(ex, desired, MIN_QTY)
+
+    # ---- 保证金可行性（2026-10-04）------------------------------------------
+    # 背景：定量 = 权益 × RISK_R / (2 × ATR_1H)。BTC 的 price/ATR ≈ 426，于是
+    # 名义 ≈ 6.4 × 权益；10× 逐仓下**单仓就要 ~64% 保证金**，两个标的在数学上
+    # 不可能同时持仓。此前从不看可用保证金，于是每 tick 都发一笔注定被
+    # -2019 拒掉的单（单 tick 被动挂 25+ 次），既空转又把整个 tick 拖垮。
+    # 现在：加仓方向先算所需保证金，不足就直接不发单（账本随即回滚）。
+    if not reduce_only and not force_cross:
+        if available_balance is None:
+            try:
+                bal = await client.get_balance()
+                available_balance = float(
+                    getattr(bal, "available_balance", 0.0) or 0.0)
+            except Exception as exc:  # noqa: BLE001  读不到就不拦，交给交易所兜底
+                print(f"[{symbol} 净仓] 可用保证金读取失败，跳过校验: {exc}")
+                available_balance = None
+        if available_balance is not None:
+            try:
+                mark = float(await client.mark_price(symbol))
+            except Exception:  # noqa: BLE001
+                mark = 0.0
+            if mark > 0:
+                need = abs(delta) * mark / float(LEVERAGE)
+                if need > float(available_balance):
+                    msg = (f"保证金不足，跳过开仓：需 {need:.2f} > 可用 "
+                           f"{float(available_balance):.2f}"
+                           f"（目标 {desired:+.4f}，差额 {delta:+.4f}，"
+                           f"{LEVERAGE}x 逐仓）")
+                    now_ms = int(time.time() * 1000)
+                    if should_report_skip(symbol, f"{desired:+.4f}|{side}", now_ms):
+                        print(f"[{symbol} 净仓跳过] {msg}")
+                        log_row([_fmt(now_ms),
+                                 f"{symbol_short(symbol)} 保证金不足跳过",
+                                 "多" if ex > 0 else ("空" if ex < 0 else "空仓"),
+                                 f"{abs(ex):.4f}", f"{mark:.2f}", "", "", "",
+                                 "", "", msg])
+                    return OrderResult(
+                        ok=False, symbol=symbol,
+                        side="BUY" if delta > 0 else "SELL",
+                        position_side=side.upper(),
+                        quantity=0.0, requested_qty=abs(delta),
+                        cum_filled_qty=0.0, avg_price=0.0,
+                        order_state="skipped_margin",
+                        error=f"skipped_margin_insufficient: {msg}",
+                    )
+
     result = await client.place_limit_chase(
         side=side, quantity=abs(delta), reduce_only=reduce_only,
-        tag=tag, force_cross=force_cross, symbol=symbol,
+        tag=tag, force_cross=force_cross, symbol=symbol, on_step=on_step,
     )
     record_order(result, action=f"{symbol_short(symbol)}净仓{side}")
     after = await client.get_position(symbol)
@@ -448,6 +599,10 @@ async def sync_net(client: BinanceTestnetClient, st: dict, execute: bool, *,
         1.0 if after_side == "LONG" else (-1.0 if after_side == "SHORT" else 0.0))
     print(f"[{symbol} 净仓] 目标 {desired:.4f} 原 {ex:.4f} → {after_qty:.4f} "
           f"{_chase_note(result) or result.error}")
+    # 把「实际达成的净仓」带回给调用方 —— 部分成交时账本要据此对齐。
+    _raw = result.raw if isinstance(result.raw, dict) else {}
+    result.raw = {**_raw, "net_after": after_qty,
+                  "entry_after": float(getattr(after, "entry_price", 0.0) or 0.0)}
     return result
 
 
@@ -525,6 +680,16 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
         print(f"[{mark} 补记] 停机期间收盘 {len(missed)} 根, "
               f"其中 {sigs} 根有交叉"
               + (f"; 另有 {dropped} 根超出回看窗口未补记" if dropped else ""))
+        if sigs:
+            # 2026-10-04: 补记只留痕不下单；漏掉的若是「有效反向」，实盘仓位会与
+            # 规则长期相反（当晚 ETH 漏掉两次反手，空单一直持到值班结束）。
+            # 显式告警，避免只能靠事后人工翻日志才发现。
+            book["missed_signal_last_ms"] = max(
+                int(book.get("missed_signal_last_ms", 0) or 0),
+                int(ts[missed[-1]]),
+            )
+            print(f"[{mark} ⚠️ 漏信号] 停机期间有 {sigs} 根交叉未执行 —— "
+                  f"实盘仓位可能与规则相反，请人工核对账本与交易所")
 
     if i <= 0 or np.isnan(atr_al[i]) or (spec.confirm_next and i < 2):
         book["last_ts"] = int(ts[i])
@@ -567,6 +732,9 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
     qty, size_note = contra_5m_qty(
         qty, interval=spec.interval, want=want, trend=trend,
     )
+    qty, cap_note = apply_margin_budget(book, qty, side=want, equity=equity, px=px)
+    if cap_note:
+        size_note = f"{size_note}; {cap_note}" if size_note else cap_note
     reason_gold = bool(sig_long) if spec.confirm_next else gold
     reason_dead = bool(sig_short) if spec.confirm_next else dead
     action, note, changed = apply_virtual_signal(
@@ -749,6 +917,174 @@ async def detect_external(
     }
 
 
+async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
+                         execute: bool, block: bool, equity: float,
+                         now: int) -> None:
+    """处理单个标的的完整一轮（对照 / 人工干预 / 灾难止损 / 信号 / 净仓同步）。
+
+    与 step 的分工：step 负责权益与闸门，本函数负责单标的。**异常一律向 step
+    抛出**，由 step 隔离——一个标的失败不得影响另一个标的。
+
+    2026-10-04 两处关键语义变更：
+      1. 账本快照 + 回滚：虚拟账本只在「委托真的成交」后才保留改动，失败零成交
+         则还原。此前 `apply_virtual_signal` 在委托**之前**就改账本，导致账本
+         与交易所长期脱节（BTC 记着 0.675 多单，交易所始终空仓）。
+      2. 灾难止损只有真的打平才清账本；部分成交/失败时账本保留。
+    """
+    pos = await client.get_position(symbol)
+    ex_side = _signed_qty(pos)
+    entry_px = float(getattr(pos, "entry_price", 0.0) or 0.0)
+    # 人工干预检测：必须排在信号处理与净仓同步之前。
+    # 2026-10-02 19:47 用户在网页手动平仓, 11/35 秒后被运行器原样补回 ——
+    # 就是因为这里没有区分「谁动的仓」。
+    watch = watch_for(st, symbol)
+    hit = await detect_external(
+        client, symbol, ex_now=ex_side, now=now, watch=watch
+    )
+    if hit and execute:
+        watch = apply_external(
+            st, symbol, hit["kind"],
+            ex_before=hit["ex_before"], ex_after=hit["ex_after"],
+            now=now, detail=hit["detail"],
+        )
+        label = "人工减仓跟随" if hit["kind"] == "reduce" else "人工加仓暂停"
+        print(f"[{symbol} {label}] {hit['detail']}")
+        log_row([_fmt(now), f"{symbol_short(symbol)} {label}",
+                 "多" if hit["ex_after"] > 0 else "空",
+                 f"{abs(hit['ex_after']):.4f}", "", "", "", "", "", "",
+                 f"{equity:.2f}", hit["detail"]])
+    pack = _fetch_symbol_bars(symbol, now)
+    if not pack:
+        return
+
+    # 快照排在人工干预之后（apply_external 记的是已发生的事实，不该被回滚）。
+    snap = {spec.id: copy.deepcopy(st["strategies"][spec.id].get("entry"))
+            for spec in specs_for_symbol(symbol)}
+
+    def rollback(reason: str) -> None:
+        restored = False
+        for sid, prev in snap.items():
+            cur = st["strategies"][sid].get("entry")
+            if json.dumps(cur, sort_keys=True) != json.dumps(prev, sort_keys=True):
+                st["strategies"][sid]["entry"] = prev
+                restored = True
+        if restored:
+            print(f"[{symbol} 账本回滚] {reason}；账本已还原为本轮处理前的状态")
+
+    b15, atr15 = pack["15m"]
+    latest15 = len(b15["ts"]) - 1
+    atr_1h = float(atr15[latest15]) if latest15 >= 0 else float("nan")
+    tag15 = next((spec.tag for spec in specs_for_symbol(symbol)
+                  if spec.interval == "15m"), ORDER_TAG)
+
+    async def safety_checkpoint(bid: float, ask: float) -> bool:
+        """追价期间的安全检查点：刷新心跳 + 评估灾难止损，需要时中止追价。
+
+        追价最长 180 秒且会占住主循环，这期间既不处理另一标的、也不评估止损。
+        检查点复用追价**自己已经拿到的盘口价**，不额外发任何请求。
+
+        只在「已持仓、本次是加仓/反手」时才有意义：空仓开首层时 ex_side==0，
+        没有仓位需要保护。
+        """
+        save_heartbeat(status="running", execute=execute,
+                       detail=f"{symbol} 追价中")
+        if ex_side == 0.0 or entry_px <= 0 or not (atr_1h > 0) \
+                or not np.isfinite(atr_1h):
+            return False
+        mid = (bid + ask) / 2.0
+        loss = (entry_px - mid) if ex_side > 0 else (mid - entry_px)
+        if loss >= DISASTER_ATR * atr_1h:
+            print(f"[{symbol} ⚠️ 追价中止] 浮亏 {loss:.2f} ≥ "
+                  f"{DISASTER_ATR:.0f}×ATR {DISASTER_ATR * atr_1h:.2f}；"
+                  f"停止追价，立即交给灾难止损")
+            return True
+        return False
+
+    try:
+        emergency = await disaster_limit_stop(
+            client, st, ex_side=ex_side, entry_px=entry_px,
+            atr_1h=atr_1h, execute=execute, symbol=symbol, tag=tag15,
+        )
+    except Exception:
+        rollback("灾难止损调用失败")
+        raise
+    if emergency:
+        if emergency.get("flat"):
+            clear_symbol_books(st, symbol)
+            if symbol == "BTCUSDT":
+                st["entry"] = None
+        else:
+            print(f"[{symbol} 灾难止损未打平] 剩余 {emergency.get('remaining')}；"
+                  f"账本保持不变，下一轮继续尝试")
+        if latest15 >= 0:
+            log_row([_fmt(int(b15["ts"][latest15])),
+                     f"{symbol_short(symbol)} {emergency['action']}",
+                     "多" if ex_side > 0 else "空", f"{abs(ex_side):.4f}",
+                     f"{emergency['mark']:.2f}", "", "", "",
+                     f"{atr15[latest15]:.2f}", "", f"{equity:.2f}",
+                     emergency["note"]])
+        return
+
+    changed = False
+    tag = tag15
+    try:
+        for spec in specs_for_symbol(symbol):
+            book = st["strategies"][spec.id]
+            bars, atr_al = pack[spec.interval]
+            if len(bars["ts"]) == 0:
+                continue
+            before = json.dumps(book.get("entry"), sort_keys=True)
+            did = process_strategy(
+                spec, book, bars, atr_al,
+                equity=equity, block=block or bool(watch.get("paused")),
+                now=now, execute=execute,
+                trend=trend_side(st, symbol),
+            )
+            after = json.dumps(book.get("entry"), sort_keys=True)
+            if did or before != after:
+                changed = True
+                tag = spec.tag
+    except Exception:
+        rollback("信号处理失败")
+        raise
+
+    if changed:
+        # 人工平仓后「等下一根信号」：账本被新信号改动即解除持有。
+        clear_hold_on_new_signal(st, symbol)
+    allow_sync = not watch.get("paused") and not watch.get("hold")
+    if allow_sync and (changed or
+                       abs(desired_net(st, symbol) - ex_side) >= SYNC_MIN_DELTA):
+        try:
+            result = await sync_net(client, st, execute, symbol=symbol, tag=tag,
+                                    on_step=safety_checkpoint)
+        except Exception:
+            rollback("净仓同步调用失败")
+            raise
+        if (result is not None and not getattr(result, "ok", False)
+                and float(getattr(result, "cum_filled_qty", 0.0) or 0.0) <= 0):
+            rollback(f"下单未成交: {result.error}")
+            # 交易所侧该标的本来就空仓、委托又没成交 ⇒ 账本也必须归零。
+            # 否则会长期留下一个「策略以为持有、交易所没有」的幽灵仓位：既污染面板
+            # 与 desired_net，又让每 tick 都白跑一次净仓同步（2026-10-04 的 BTC
+            # 空单 0.382 就是旧代码留下的幽灵仓）。口径与 apply_external 处理人工
+            # 平仓一致：清零、不补回、等下一根信号。
+            if abs(ex_side) < MIN_QTY and symbol_book_has_position(st, symbol):
+                clear_symbol_books(st, symbol)
+                if symbol == "BTCUSDT":
+                    st["entry"] = None
+                print(f"[{symbol} 幽灵仓位清零] 交易所空仓但账本有仓，"
+                      f"已清零该标的账本，等下一根信号")
+        elif result is not None:
+            # 部分成交对齐：委托可能只成交了一部分，账本不能继续记着没成交的部分。
+            # 2026-10-04 ETH 目标 -15.854 实际只到 -7.430，账本却一直虚高。
+            raw = getattr(result, "raw", None)
+            net_after = raw.get("net_after") if isinstance(raw, dict) else None
+            if net_after is not None:
+                note = reconcile_symbol_books(st, symbol, float(net_after))
+                if note:
+                    print(f"[{symbol} 账本对齐] {note}")
+
+
 async def step(client: BinanceTestnetClient, st: dict, execute: bool) -> None:
     migrate_state(st)
     # 面板的「确认恢复」请求：一次性消费，只接受暂停之后发出的。
@@ -766,85 +1102,33 @@ async def step(client: BinanceTestnetClient, st: dict, execute: bool) -> None:
         st["day"], st["day_start_eq"] = day, mtm
     dl = ((st.get("day_start_eq") or mtm) - mtm) / st["day_start_eq"] if st.get("day_start_eq") else 0.0
     dd = ((st.get("peak") or mtm) - mtm) / st["peak"] if st.get("peak") else 0.0
-    if dd >= 0.10 and not st.get("halted"):
+    if not HALT_ON_MAX_DRAWDOWN:
+        st["halted"] = False
+    elif dd >= 0.10 and not st.get("halted"):
         st["halted"] = True
         print(f"[熔断] 累计回撤 {dd:.1%} ≥ 10% —— 停止开新仓, 等待人工指令")
-    block = bool(st.get("halted")) or dl >= 0.03
+    block = (
+        (HALT_ON_MAX_DRAWDOWN and bool(st.get("halted")))
+        or (BLOCK_ON_DAILY_LOSS and dl >= 0.03)
+    )
 
     for symbol in TRADE_SYMBOLS:
-        pos = await client.get_position(symbol)
-        ex_side = _signed_qty(pos)
-        entry_px = float(getattr(pos, "entry_price", 0.0) or 0.0)
-        # 人工干预检测：必须排在信号处理与净仓同步之前。
-        # 2026-10-02 19:47 用户在网页手动平仓, 11/35 秒后被运行器原样补回 ——
-        # 就是因为这里没有区分「谁动的仓」。
-        watch = watch_for(st, symbol)
-        hit = await detect_external(
-            client, symbol, ex_now=ex_side, now=now, watch=watch
-        )
-        if hit and execute:
-            watch = apply_external(
-                st, symbol, hit["kind"],
-                ex_before=hit["ex_before"], ex_after=hit["ex_after"],
-                now=now, detail=hit["detail"],
+        try:
+            await process_symbol(
+                client, st, symbol, execute=execute, block=block,
+                equity=equity, now=now,
             )
-            label = "人工减仓跟随" if hit["kind"] == "reduce" else "人工加仓暂停"
-            print(f"[{symbol} {label}] {hit['detail']}")
-            log_row([_fmt(now), f"{symbol_short(symbol)} {label}",
-                     "多" if hit["ex_after"] > 0 else "空",
-                     f"{abs(hit['ex_after']):.4f}", "", "", "", "", "", "",
-                     f"{equity:.2f}", hit["detail"]])
-        pack = _fetch_symbol_bars(symbol, now)
-        if not pack:
-            continue
-        b15, atr15 = pack["15m"]
-        latest15 = len(b15["ts"]) - 1
-        tag15 = next((spec.tag for spec in specs_for_symbol(symbol)
-                      if spec.interval == "15m"), ORDER_TAG)
-        emergency = await disaster_limit_stop(
-            client, st, ex_side=ex_side, entry_px=entry_px,
-            atr_1h=float(atr15[latest15]) if latest15 >= 0 else float("nan"),
-            execute=execute, symbol=symbol, tag=tag15,
-        )
-        if emergency:
-            clear_symbol_books(st, symbol)
-            if symbol == "BTCUSDT":
-                st["entry"] = None
-            if latest15 >= 0:
-                log_row([_fmt(int(b15["ts"][latest15])),
-                         f"{symbol_short(symbol)} {emergency['action']}",
-                         "多" if ex_side > 0 else "空", f"{abs(ex_side):.4f}",
-                         f"{emergency['mark']:.2f}", "", "", "",
-                         f"{atr15[latest15]:.2f}", "", f"{equity:.2f}",
-                         emergency["note"]])
-            continue
-
-        changed = False
-        tag = tag15
-        for spec in specs_for_symbol(symbol):
-            book = st["strategies"][spec.id]
-            bars, atr_al = pack[spec.interval]
-            if len(bars["ts"]) == 0:
-                continue
-            before = json.dumps(book.get("entry"), sort_keys=True)
-            did = process_strategy(
-                spec, book, bars, atr_al,
-                equity=equity, block=block or bool(watch.get("paused")),
-                now=now, execute=execute,
-                trend=trend_side(st, symbol),
-            )
-            after = json.dumps(book.get("entry"), sort_keys=True)
-            if did or before != after:
-                changed = True
-                tag = spec.tag
-
-        if changed:
-            # 人工平仓后「等下一根信号」：账本被新信号改动即解除持有。
-            clear_hold_on_new_signal(st, symbol)
-        allow_sync = not watch.get("paused") and not watch.get("hold")
-        if allow_sync and (changed or
-                           abs(desired_net(st, symbol) - ex_side) >= MIN_QTY):
-            await sync_net(client, st, execute, symbol=symbol, tag=tag)
+        except Exception as exc:  # noqa: BLE001  单标的失败必须隔离
+            # 2026-10-04: 此前任一标的下单失败都会抛穿整个 tick —— 另一标的被跳过、
+            # 状态不落盘，实测造成连续数小时的服务降级。现在失败只限于本标的。
+            print(f"[{symbol}] 本轮处理失败（已隔离，不影响其它标的）："
+                  f"{type(exc).__name__}: {exc}")
+            print(traceback.format_exc())
+            save_heartbeat(status="degraded", execute=execute,
+                           detail=f"{symbol} {type(exc).__name__}: {exc}")
+        finally:
+            # 每标的落盘：此前只在整轮结束后 save_state，任何一步失败整轮状态全丢。
+            save_state(st)
 
     # 旧面板仍读顶层 last_ts / entry，与 BTC 15m 账本对齐。
     s15 = st["strategies"]["kdj15"]
@@ -919,10 +1203,15 @@ async def main() -> int:
     try:
         while True:
             try:
+                rotate_own_logs()
                 await step(client, st, args.execute)
                 save_heartbeat(status="running", execute=args.execute)
             except Exception as exc:  # noqa: BLE001
-                print(f"[{datetime.now():%H:%M:%S}] 异常: {exc}")
+                # 2026-10-04: 此前只打 str(exc)，而 TimeoutError 的消息是空串 ——
+                # 日志里只剩 196 条 "异常: "，没有类型也没有堆栈，完全无法排障。
+                print(f"[{datetime.now():%H:%M:%S}] 异常: "
+                      f"{type(exc).__name__}: {exc}")
+                print(traceback.format_exc())
                 save_heartbeat(status="error", execute=args.execute,
                                detail=f"{type(exc).__name__}: {exc}")
             if args.once:

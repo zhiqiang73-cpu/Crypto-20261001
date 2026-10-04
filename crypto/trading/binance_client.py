@@ -195,8 +195,13 @@ class BinanceTestnetClient:
                 if not text:
                     return {}
                 return __import__("json").loads(text)
-        except aiohttp.ClientError as exc:
-            raise BinanceClientError(f"连接 Binance 失败: {exc}") from exc
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            # 2026-10-04: aiohttp 的 ClientTimeout 抛的是 asyncio.TimeoutError，
+            # 它**不是** ClientError，此前直接逃逸出 _request。追价一个 tick 要发
+            # 上百次请求，任一次超时就会冒泡到 step()，把整个 tick（含另一标的）打断。
+            raise BinanceClientError(
+                f"连接 Binance 失败: {type(exc).__name__}: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------ public
     async def ping(self) -> bool:
@@ -296,6 +301,26 @@ class BinanceTestnetClient:
                     item.get("crossUnPnl") or 0
                 )
                 break
+        # 2026-10-04: 本系统跑 10× **逐仓**，而 /fapi/v2/balance 的 crossUnPnl 只统计
+        # 全仓未实现盈亏 —— 逐仓账户上恒为 0。于是「未实现盈亏」在面板与权益口径里
+        # 一直是 0，持仓浮亏完全不可见（当晚 ETH 浮亏 -33 时读数仍是 0；权益也因此
+        # 少算了浮盈浮亏，直接影响回撤闸门与按权益的仓位定量）。
+        #
+        # ⚠ 字段名是币安的 **unRealizedProfit**（大写 R，历史拼法）——不是
+        #   unrealizedProfit。写错只会静默拿到 0，与整个 bug 的表现一模一样。
+        #   两种拼法都接受，避免再踩。
+        if not bal.total_unrealized_pnl:
+            try:
+                risk = await self._request(
+                    "GET", "/fapi/v2/positionRisk", signed=True
+                )
+                bal.total_unrealized_pnl = sum(
+                    float(r.get("unRealizedProfit")
+                          or r.get("unrealizedProfit") or 0)
+                    for r in (risk or [])
+                )
+            except Exception as exc:  # noqa: BLE001  取不到就保留原值
+                logger.warning("读取逐仓未实现盈亏失败: %s", exc)
         return bal
 
     async def get_position(self, symbol: Optional[str] = None) -> PositionInfo:
@@ -1024,6 +1049,53 @@ class BinanceTestnetClient:
         window_sec: Optional[float] = None,
         tag: str = "ps",
         force_cross: bool = False,
+        on_step: Optional[Any] = None,
+    ) -> OrderResult:
+        """下单入口 —— **契约: 永不抛异常**, 失败一律返回 ok=False 的 OrderResult.
+
+        2026-10-04: 追价内部要发上百次 HTTP, 任何一次超时/网络抖动此前都以异常
+        形式逃逸, 冒泡到运行器 step() 把整个 tick 打断(另一标的也不再处理、状态
+        不落盘)。现在统一兜底, 由调用方按"下单未成功"处理。
+
+        on_step: 可选的 async 回调 ``on_step(bid, ask) -> bool``, 在**每次挂单
+        之前**调用。返回真值即中止追价(返回 ok=False), 供调用方插入安全检查点
+        —— 追价最长 180 秒, 期间主循环被占住, 此前没有任何机会评估止损。
+        回调抛异常只记警告, 不影响下单。
+        """
+        symbol = symbol or self.symbol
+        try:
+            return await self._place_limit_chase_impl(
+                side, quantity, symbol,
+                reduce_only=reduce_only, mark_price=mark_price,
+                max_steps=max_steps, window_sec=window_sec,
+                tag=tag, force_cross=force_cross, on_step=on_step,
+            )
+        except Exception as exc:  # noqa: BLE001  契约要求兜住一切非取消异常
+            logger.error("place_limit_chase 失败(已降级为失败结果): %s: %s",
+                         type(exc).__name__, exc)
+            return OrderResult(
+                ok=False, symbol=symbol,
+                side="BUY" if side.upper() == "LONG" else "SELL",
+                position_side=side.upper(),
+                quantity=0.0, requested_qty=float(quantity or 0),
+                cum_filled_qty=0.0, avg_price=0.0,
+                order_state=OrderState.UNKNOWN.value,
+                error=f"chase_error: {type(exc).__name__}: {exc}",
+            )
+
+    async def _place_limit_chase_impl(
+        self,
+        side: str,
+        quantity: float,
+        symbol: str,
+        *,
+        reduce_only: bool = False,
+        mark_price: Optional[float] = None,
+        max_steps: Optional[int] = None,
+        window_sec: Optional[float] = None,
+        tag: str = "ps",
+        force_cross: bool = False,
+        on_step: Optional[Any] = None,
     ) -> OrderResult:
         """被动限价挂单 (post-only) + 跟盘口重挂, 超时兜底.
 
@@ -1079,6 +1151,26 @@ class BinanceTestnetClient:
                 return OrderResult(
                     ok=False, error="book ticker unavailable", symbol=symbol
                 )
+            if on_step is not None:
+                # 安全检查点: 追价最长 180 秒, 这期间主循环被占住, 此前完全
+                # 没有机会评估灾难止损。回调返回真值即中止本次追价(此时尚未
+                # 挂出任何单, 不会有遗留挂单), 让主循环去处理止损。
+                try:
+                    if await on_step(bid, ask):
+                        return OrderResult(
+                            ok=False, symbol=symbol,
+                            side="BUY" if is_long else "SELL",
+                            position_side=side.upper(),
+                            quantity=0.0, requested_qty=quantity,
+                            submitted_qty=qty, cum_filled_qty=0.0,
+                            avg_price=0.0, client_order_id="",
+                            order_state=OrderState.CANCELED.value,
+                            error="chase_aborted: 安全检查点要求中止追价",
+                            raw={"chase": {"attempts": attempts,
+                                           "likely_maker": False}},
+                        )
+                except Exception as exc:  # noqa: BLE001 检查点故障不得影响下单
+                    logger.warning("chase on_step 回调失败(已忽略): %s", exc)
             if is_long:
                 px = min(bid - pad * tick, ask - tick)
             else:

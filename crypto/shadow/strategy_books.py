@@ -250,6 +250,66 @@ def clear_symbol_books(st: Dict[str, Any], symbol: str) -> None:
         book["entry"] = None
 
 
+def reconcile_symbol_books(st: Dict[str, Any], symbol: str,
+                           actual_signed: float, *,
+                           min_qty: float = 0.001) -> Optional[str]:
+    """把该标的的虚拟账本对齐到交易所**实际**净仓。返回说明；未改动返回 None。
+
+    为什么需要：账本在委托**之前**就写入意图，而委托可能只成交一部分。此前只有
+    「零成交」会回滚，部分成交会留下虚高账本 —— 2026-10-04 ETH 目标 -15.854、
+    实际只成交到 -7.430，账本却一直记着 -15.854。
+
+    差额只可能来自**最近一次下单**，所以从最新那一层往回削，语义正确：老层的
+    成交价与层号都保持不变，或被整层移除。
+
+    只处理「同向、实际比账本少」这一个方向。反手/交易所比账本多都属异常状态，
+    不做猜测，返回说明请人工复核。
+    """
+    books = [st.setdefault("strategies", {}).setdefault(spec.id, empty_book())
+             for spec in specs_for_symbol(symbol)]
+    book_total = sum(book_signed_qty(b) for b in books)
+    target = float(actual_signed)
+    if abs(target - book_total) < min_qty:
+        return None
+
+    if abs(target) < min_qty:                      # 交易所说空仓
+        if abs(book_total) < min_qty:
+            return None
+        clear_symbol_books(st, symbol)
+        return (f"交易所已空仓，账本由 {book_total:+.4f} 归零")
+
+    if book_total == 0 or (book_total > 0) != (target > 0):
+        return (f"账本 {book_total:+.4f} 与实际 {target:+.4f} 方向不符，"
+                f"不做猜测，请人工复核")
+    if abs(target) > abs(book_total):
+        return (f"实际 {target:+.4f} 多于账本 {book_total:+.4f}，"
+                f"非本轮成交所致，请人工复核")
+
+    shortfall = abs(book_total) - abs(target)
+    for book in reversed(books):                   # 从最新加的那本开始削
+        if shortfall < min_qty:
+            break
+        entry = book.get("entry")
+        if not entry:
+            continue
+        layers = entry_layers(entry)
+        want = 1 if book_signed_qty(book) > 0 else -1
+        while layers and shortfall >= min_qty:
+            top = layers[-1]
+            qty = max(0.0, float(top.get("qty") or 0.0))
+            take = min(qty, shortfall)
+            left = qty - take
+            if left < min_qty:
+                layers.pop()
+                shortfall -= qty
+            else:
+                top["qty"] = round(left, 8)
+                shortfall -= take
+        book["entry"] = _aggregate_layers(want, layers) if layers else None
+    return (f"部分成交对齐：账本 {book_total:+.4f} → {target:+.4f}"
+            f"（差额 {shortfall:.4f} 已从最新层扣除）")
+
+
 def signal_reason(spec: StrategySpec, *, gold: bool, dead: bool,
                   k: Optional[float] = None) -> str:
     """人话原因：哪条规则在这一根上成立。"""
