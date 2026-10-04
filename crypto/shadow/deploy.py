@@ -28,8 +28,9 @@ from typing import Optional
 
 import numpy as np
 
-from shadow.engine import (ATR_MULT_K, DISASTER_ATR, GATE_FEE_RATE,
-                           LEVERAGE, MIN_QTY, RISK_R, floor_step)
+from shadow.engine import (ATR_MULT_K, BREAK_EVEN_TRIGGER_ATR, DISASTER_ATR,
+                           GATE_FEE_RATE, LEVERAGE, MIN_QTY, NORMAL_STOP_ATR,
+                           RISK_R, floor_step)
 from shadow.indicators import atr_wilder, boll, kdj, macd
 from shadow.signals import (confirmed_signal, entry_signal, macd_gate,
                             macd_side, price_breaks)
@@ -849,6 +850,90 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
     return changed
 
 
+def book_for_symbol(st: dict, symbol: str) -> Optional[dict]:
+    """该标的的策略账本（当前每个标的只有一条 15m 策略）。"""
+    for spec in specs_for_symbol(symbol):
+        return st.setdefault("strategies", {}).get(spec.id)
+    return None
+
+
+async def protective_stop(client: BinanceTestnetClient, st: dict, *,
+                          symbol: str, ex_side: float, entry_px: float,
+                          atr_1h: float, mark: float, execute: bool,
+                          tag: str = ORDER_TAG) -> Optional[dict]:
+    """正常止损（1.5×ATR_1H）与保本止损（浮盈 +1.5×ATR 后移到入场价）。
+
+    与 disaster_limit_stop 的分工：本函数管更近的两档，它在更远处（3×ATR），
+    所以先判本函数即可。三档都走同一种平仓方式：带滑点上限的穿盘口 **限价** 单
+    （reduce_only，绝不发 MARKET）。
+
+    保本状态用 `entry["ms"]`（开仓那根 K 线）绑定：存的是 `break_even_armed_ms`，
+    只有它等于当前持仓的开仓 ms 才算已激活。这样反手/换仓后旧标记自动失效，
+    不会把上一笔的保本状态带到新仓上。
+
+    返回 None 表示未触发或不该动；返回字典表示已尝试平仓。
+    """
+    if not execute or ex_side == 0.0 or not np.isfinite(float(atr_1h)):
+        return None
+    if entry_px <= 0 or atr_1h <= 0 or mark <= 0:
+        return None
+    book = book_for_symbol(st, symbol)
+    if not book:
+        return None
+    entry = book.get("entry") or {}
+    entry_ms = int(entry.get("ms") or 0)
+    if entry_ms <= 0:
+        return None
+
+    # 1) 保本止损激活：浮盈达到阈值 → 止损上移到入场价
+    armed = int(book.get("break_even_armed_ms") or 0) == entry_ms
+    if not armed:
+        trigger = BREAK_EVEN_TRIGGER_ATR * float(atr_1h)
+        reached = ((mark >= entry_px + trigger) if ex_side > 0
+                   else (mark <= entry_px - trigger))
+        if reached:
+            book["break_even_armed_ms"] = entry_ms
+            armed = True
+            print(f"[{symbol} 保本止损已激活] 浮盈达 "
+                  f"{BREAK_EVEN_TRIGGER_ATR}×ATR（{trigger:.2f}）；"
+                  f"止损上移到入场价 {entry_px:.2f}")
+
+    # 2) 判定触发：已激活 → 保本（距离 0）；否则 → 正常止损 1.5×ATR
+    if armed:
+        stop_px, why = entry_px, "保本止损"
+    else:
+        stop_px = (entry_px - NORMAL_STOP_ATR * float(atr_1h) if ex_side > 0
+                   else entry_px + NORMAL_STOP_ATR * float(atr_1h))
+        why = "正常止损"
+    hit = (mark <= stop_px) if ex_side > 0 else (mark >= stop_px)
+    if not hit:
+        return None
+
+    close_side = "SHORT" if ex_side > 0 else "LONG"
+    result = await client.place_limit_chase(
+        side=close_side, quantity=abs(ex_side), reduce_only=True,
+        tag=tag, force_cross=True, symbol=symbol,
+    )
+    record_order(result, action=f"{symbol_short(symbol)}{why}平仓")
+    after = await client.get_position(symbol)
+    remaining = abs(float(getattr(after, "quantity", 0.0) or 0.0))
+    flat = remaining < MIN_QTY
+    if flat:
+        clear_symbol_books(st, symbol)
+        book.pop("break_even_armed_ms", None)
+        if symbol == "BTCUSDT":
+            st["entry"] = None
+    detail = (f"{symbol} {why}触发：{('多头' if ex_side > 0 else '空头')} "
+              f"入场 {entry_px:.2f} 止损 {stop_px:.2f}（{why}）"
+              f"{'；已打平' if flat else f'；剩余 {remaining:.4f}'}")
+    print(f"[{symbol} {why}] {detail}")
+    return {
+        "action": f"{why}平仓" if flat else f"{why}部分平仓",
+        "note": detail, "mark": mark, "flat": flat,
+        "remaining": remaining, "result": result, "symbol": symbol,
+    }
+
+
 async def disaster_limit_stop(client: BinanceTestnetClient, st: dict, *,
                               ex_side: float, entry_px: float,
                               atr_1h: float, execute: bool,
@@ -1057,6 +1142,26 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
                   f"停止追价，立即交给灾难止损")
             return True
         return False
+
+    # 正常止损（1.5×ATR）/ 保本止损：比灾难止损近，必须先判。
+    try:
+        mark_now = float(await client.mark_price(symbol))
+        stopped = await protective_stop(
+            client, st, symbol=symbol, ex_side=ex_side, entry_px=entry_px,
+            atr_1h=atr_1h, mark=mark_now, execute=execute, tag=tag15,
+        )
+    except Exception:
+        rollback("正常/保本止损调用失败")
+        raise
+    if stopped:
+        if latest15 >= 0:
+            log_row([_fmt(int(b15["ts"][latest15])),
+                     f"{symbol_short(symbol)} {stopped['action']}",
+                     "多" if ex_side > 0 else "空", f"{abs(ex_side):.4f}",
+                     f"{stopped['mark']:.2f}", "", "", "",
+                     f"{atr15[latest15]:.2f}", "", f"{equity:.2f}",
+                     stopped["note"]])
+        return
 
     try:
         emergency = await disaster_limit_stop(
