@@ -1103,7 +1103,14 @@ async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
                              note=f"openAlgoOrders 查询失败: {exc}")
         return {"action": "保护单查询失败", "note": str(exc)}
 
-    existing = find_protective_stop(orders, side=side, required_trigger=target)
+    # 目标价是 avg ± N×ATR 算出来的，而 1H ATR 每根 K 线都在变。若拿精确
+    # 目标价要求「不比它松」，ATR 稍微一缩就会判定需要收紧 —— 实测 ETH 每轮
+    # 都去重挂、每轮都失败，刷屏且无意义。加一个死区：现有止损只要不比目标
+    # 差 0.25×ATR 以上，就认为已经够紧。真正的保本/追踪收紧幅度远大于此，
+    # 不会被挡。
+    dead = 0.25 * float(atr_1h)
+    existing = find_protective_stop(
+        orders, side=side, required_trigger=max(target - side * dead, 0.0))
     if existing is not None:
         aid = algo_ident(existing)
         trig = algo_trigger(existing)
@@ -1286,8 +1293,16 @@ async def manage_take_profit(client: BinanceTestnetClient, st: dict, *,
             "algo_id": keep_id, "trigger": algo_trigger(keep),
             "qty": float(keep.get("quantity") or qty),
             "stage": idx, "filled": False,
+            "pos_at_place": abs(float(ex_side)),
         })
         return None
+
+    # 走到这里说明账本里没有任何一张属于本批次的活单，现存止盈单都是残留
+    # （例如批次被误推进留下的）。先撤掉再下新的，否则会越堆越多。
+    for o in live:
+        print(f"[{symbol} 止盈清理] 撤销不属于第{idx + 1}批的残留止盈单 "
+              f"{algo_ident(o)} 触发价 {algo_trigger(o):.2f}")
+        await cancel_algo_by_id(client, symbol, algo_ident(o))
 
     if not _protective_attempt_ok(f"{symbol}:tp"):
         return None
@@ -1303,6 +1318,7 @@ async def manage_take_profit(client: BinanceTestnetClient, st: dict, *,
     rec.setdefault("tp_orders", []).append({
         "algo_id": res.algo_id, "trigger": res.trigger_price,
         "qty": qty, "stage": idx, "filled": False,
+        "pos_at_place": abs(float(ex_side)),
     })
     detail = (f"{symbol} 第{idx + 1}批止盈挂出：{('多' if side > 0 else '空')} "
               f"触发价 {res.trigger_price:.2f}（{mult}×ATR）"
@@ -1340,6 +1356,28 @@ async def reconcile_tp_fills(client: BinanceTestnetClient, st: dict, *,
     gone = [t for t in pending if str(t.get("algo_id")) not in alive]
     if not gone:
         return False
+
+    # ⚠ 「单子没了」不等于「成交了」—— 被撤销也会没。
+    # 实测事故：启动对账清理重复单时把止盈单一起撤了，这里就把「消失」当成
+    # 「成交」，直接跳过了 2×ATR 那个批次（BTC 的止盈被挪到 3×ATR）。
+    # 唯一可信的证据是**交易所净仓确实变小了**，且减小幅度与批次数量相符。
+    shrunk = []
+    for t in gone:
+        before = float(t.get("pos_at_place") or 0.0)
+        q = float(t.get("qty") or 0.0)
+        if before > 0 and abs(float(ex_side)) <= before - q * 0.5:
+            shrunk.append(t)
+        else:
+            # 净仓没变小 → 只是被撤了，不是成交。清掉这条记录让它重挂，
+            # 但**绝不**推进批次。
+            print(f"[{symbol} 止盈记录清理] {t.get('algo_id')} 已不在挂单里，"
+                  f"但净仓 {float(ex_side):+.4f} 未小于下单时的 "
+                  f"{before:.4f} —— 判为已撤销而非成交，退回重挂")
+    if not shrunk:
+        rec["tp_orders"] = [t for t in (rec.get("tp_orders") or [])
+                            if t not in gone]
+        return False
+    gone = shrunk
 
     for t in gone:
         t["filled"] = True

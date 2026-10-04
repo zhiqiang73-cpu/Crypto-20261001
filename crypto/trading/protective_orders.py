@@ -555,11 +555,20 @@ async def tighten_protective_stop(
     return out
 
 
-async def cancel_protective_orders(client: Any, symbol: str) -> tuple:
-    """撤销该标的**全部** Algo 保护单。返回 (撤销数, 剩余数)。
+async def cancel_protective_orders(
+    client: Any, symbol: str, *, include_take_profit: bool = False,
+) -> tuple:
+    """撤销该标的的 Algo 条件单。返回 (撤销数, 剩余数)。
 
     必须走 Algo 接口：普通 openOrders 查不到条件单，用它清理会「以为撤干净了」
     而实际把上一笔的保护单留在交易所，影响下一笔仓位。
+
+    include_take_profit: **默认 False，只撤止损单。**
+        这里曾经是无差别撤销全部 Algo 单，把止盈单一起撤了。后果不只是丢了
+        止盈：止盈单消失后，reconcile_tp_fills 会把「单子没了」当成「已成交」，
+        于是批次被跳过（实测 BTC 直接跳过了 2×ATR 的批次）。清理重复止损单
+        绝不该碰止盈单。**只有仓位归零时才传 True** —— 那时才需要把残留的
+        止盈单也一并清掉，否则下一笔仓位会挂着一张旧止盈单。
     """
     try:
         orders = await fetch_open_algo_orders(client, symbol)
@@ -568,6 +577,8 @@ async def cancel_protective_orders(client: Any, symbol: str) -> tuple:
     n = 0
     for o in orders:
         if not algo_alive(o):
+            continue
+        if not include_take_profit and not is_stop_type(o):
             continue
         aid = algo_ident(o)
         cid = algo_client_ident(o)
@@ -647,7 +658,8 @@ async def reconcile_protective(
 
     if abs(quantity) <= 0:
         if orders:
-            n, left = await cancel_protective_orders(client, symbol)
+            n, left = await cancel_protective_orders(
+                client, symbol, include_take_profit=True)
             res.action = f"空仓，清理残留保护单 {n} 张"
             res.duplicates_canceled = n
             res.note = f"剩余未撤 {left} 张" if left else "已清理干净"

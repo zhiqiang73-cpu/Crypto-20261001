@@ -214,12 +214,43 @@ class TestReconcileTpFills(unittest.TestCase):
         st = make_state()
         rec = st.setdefault("protection", {}).setdefault("BTCUSDT", {})
         rec["tp_orders"] = [{"algo_id": "999", "trigger": 85295.31,
-                             "qty": 0.148, "stage": 0, "filled": False}]
-        # 交易所里已经没有 999 了，且净仓只剩一半
+                             "qty": 0.148, "stage": 0, "filled": False,
+                             "pos_at_place": 0.296}]
+        # 交易所里已经没有 999 了，且净仓只剩一半（0.296 → 0.148）
         fired = _run(reconcile_tp_fills(ex, st, symbol="BTCUSDT", ex_side=0.148))
         self.assertTrue(fired)
         self.assertTrue(rec["tp_orders"][0]["filled"])
         self.assertEqual(rec["tp_filled"], 1)
+
+    def test_canceled_order_is_not_a_fill(self):
+        """⚠ 回归：单子没了但净仓没变小 → 是**被撤销**，绝不能算成交。
+
+        实测事故（2026-10-04 20:03）：启动对账清理重复单时把止盈单一起撤了，
+        这里把「消失」当成「成交」，直接把 2×ATR 那一批跳过，BTC 的止盈被
+        挪到 3×ATR。批次推进必须要有「净仓真的变小」为证。
+        """
+        ex = FakeExchange()
+        st = make_state()
+        rec = st.setdefault("protection", {}).setdefault("BTCUSDT", {})
+        rec["tp_orders"] = [{"algo_id": "999", "trigger": 85295.31,
+                             "qty": 0.148, "stage": 0, "filled": False,
+                             "pos_at_place": 0.296}]
+        # 999 已不在挂单里，但净仓仍是完整的 0.296 —— 只是被撤了
+        fired = _run(reconcile_tp_fills(ex, st, symbol="BTCUSDT", ex_side=0.296))
+        self.assertFalse(fired, "净仓未变小不得认定为成交")
+        self.assertEqual(int(rec.get("tp_filled") or 0), 0, "批次不得推进")
+        self.assertEqual(rec["tp_orders"], [], "残留记录应被清掉以便重挂")
+
+    def test_missing_pos_at_place_is_conservative(self):
+        """记录缺 pos_at_place 时按未成交处理（宁可重挂，不可跳过批次）。"""
+        ex = FakeExchange()
+        st = make_state()
+        rec = st.setdefault("protection", {}).setdefault("BTCUSDT", {})
+        rec["tp_orders"] = [{"algo_id": "999", "trigger": 1.0, "qty": 0.148,
+                             "stage": 0, "filled": False}]
+        fired = _run(reconcile_tp_fills(ex, st, symbol="BTCUSDT", ex_side=0.148))
+        self.assertFalse(fired)
+        self.assertEqual(int(rec.get("tp_filled") or 0), 0)
 
     def test_no_action_when_tp_still_alive(self):
         ex = FakeExchange()
