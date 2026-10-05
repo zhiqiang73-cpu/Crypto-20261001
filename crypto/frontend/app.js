@@ -1159,42 +1159,48 @@
     const rp = (r && r.params) || {};
     const mk = marketCache || {};
 
-    // 连接状态
-    const ok = st.connected !== false;
-    const nets = exchangeNets();
-    const liveNets = ["BTCUSDT", "ETHUSDT"].filter((sym) => nets[sym] && Number(nets[sym].quantity || 0));
-    kvRows($("setConnKv"), [
-      { k: "接口连接", v: ok ? `<span class="up">已连接</span>` : `<span class="down">未配置/不可达</span>`, x: mk.market_label || "" },
-      { k: "账户余额", v: num(st.balance && st.balance.total_wallet_balance, 2), x: "USDT" },
-      { k: "可用余额", v: num(st.balance && st.balance.available_balance, 2), x: "USDT" },
-      { k: "交易所仓位", v: liveNets.length ? liveNets.map((sym) => `${coin(sym)} ${sideZh(nets[sym].side)} ${num(nets[sym].quantity, 4)}`).join(" · ") : "空仓" },
-      { k: "对账状态", v: reconState().ok ? `<span class="up">一致</span>` : `<span class="down">不一致</span>`, x: "策略账本 vs 交易所" },
-      { k: "交易所设置", v: st.exchange_settings ? `${st.exchange_settings.symbol || ""} · ${st.exchange_settings.leverage || "—"}x · ${st.exchange_settings.margin_type || ""}` : "—", x: "单向持仓 / 逐仓" },
-      { k: "账户通道", v: esc(String(mk.account_base_url || "—").replace("https://", "")) },
-      { k: "记录起点", v: esc(s.record_start || "—") },
-    ]);
+    // 连接状态（设置页已精简该节；元素不存在时整块跳过，避免脚本中断）
+    const connKv = $("setConnKv");
+    if (connKv) {
+      const ok = st.connected !== false;
+      const nets = exchangeNets();
+      const liveNets = ["BTCUSDT", "ETHUSDT"].filter((sym) => nets[sym] && Number(nets[sym].quantity || 0));
+      kvRows(connKv, [
+        { k: "接口连接", v: ok ? `<span class="up">已连接</span>` : `<span class="down">未配置/不可达</span>`, x: mk.market_label || "" },
+        { k: "账户余额", v: num(st.balance && st.balance.total_wallet_balance, 2), x: "USDT" },
+        { k: "可用余额", v: num(st.balance && st.balance.available_balance, 2), x: "USDT" },
+        { k: "交易所仓位", v: liveNets.length ? liveNets.map((sym) => `${coin(sym)} ${sideZh(nets[sym].side)} ${num(nets[sym].quantity, 4)}`).join(" · ") : "空仓" },
+        { k: "对账状态", v: reconState().ok ? `<span class="up">一致</span>` : `<span class="down">不一致</span>`, x: "策略账本 vs 交易所" },
+        { k: "交易所设置", v: st.exchange_settings ? `${st.exchange_settings.symbol || ""} · ${st.exchange_settings.leverage || "—"}x · ${st.exchange_settings.margin_type || ""}` : "—", x: "单向持仓 / 逐仓" },
+        { k: "账户通道", v: esc(String(mk.account_base_url || "—").replace("https://", "")) },
+        { k: "记录起点", v: esc(s.record_start || "—") },
+      ]);
+    }
 
-    // 运行参数
-    setText("setParamsMeta", r && r.params_fingerprint ? `指纹 ${r.params_fingerprint}` : "—", "ph-meta mono");
-    const layerR = rp.layer_risk_r || {};
-    const fmtR = (arr) => (arr || []).map((x) => `${parseFloat((Number(x) * 100).toFixed(3))}%`).join(" / ");
-    const lrKeys = Object.keys(layerR);
-    const lrSame = lrKeys.length === 2 && JSON.stringify(layerR[lrKeys[0]]) === JSON.stringify(layerR[lrKeys[1]]);
-    const layerText = !lrKeys.length ? "—"
-      : lrSame ? `两策略均 ${fmtR(layerR[lrKeys[0]])}`
-      : lrKeys.map((k2) => `${k2} ${fmtR(layerR[k2])}`).join(" · ");
-    kvRows($("setParamsKv"), [
-      { k: "首层风险 r", v: String(rp.risk_r ?? "—"), x: "权益 × r ÷ (k × ATR)" },
-      { k: "分层风险", v: esc(layerText), x: "首层 → 第 2/3 层" },
-      { k: "杠杆", v: rp.leverage ? `${rp.leverage}x` : "—", x: "逐仓" },
-      { k: "ATR 系数 k", v: String(rp.atr_mult_k ?? "—"), x: "仓位分母" },
-      { k: "灾难止损", v: rp.disaster_atr ? `${rp.disaster_atr} × ATR_1H` : "—", x: "穿盘口限价平仓" },
-      { k: "单标的保证金预算", v: rp.margin_budget_per_trade != null ? pct(rp.margin_budget_per_trade, 0) : "—" },
-      { k: "组合保证金预算", v: rp.portfolio_margin_budget != null ? pct(rp.portfolio_margin_budget, 0) : "—", x: "BTC+ETH 合计" },
-      { k: "最大层数", v: Object.entries(rp.max_layers || {}).map(([k2, v2]) => `${k2} ${v2}`).join(" · ") || "—", x: "同向回调加仓" },
-      { k: "日亏闸门", v: rp.block_on_daily_loss === false ? `<span class="warn">关闭</span>` : `<span class="up">启用</span>`, x: "block_on_daily_loss" },
-      { k: "回撤熔断", v: rp.halt_on_max_drawdown === false ? `<span class="warn">关闭</span>` : `<span class="up">启用</span>`, x: "halt_on_max_drawdown" },
-    ]);
+    // 运行参数（设置页已精简该节；元素不存在时整块跳过）
+    const paramsKv = $("setParamsKv");
+    if (paramsKv) {
+      setText("setParamsMeta", r && r.params_fingerprint ? `指纹 ${r.params_fingerprint}` : "—", "ph-meta mono");
+      const layerR = rp.layer_risk_r || {};
+      const fmtR = (arr) => (arr || []).map((x) => `${parseFloat((Number(x) * 100).toFixed(3))}%`).join(" / ");
+      const lrKeys = Object.keys(layerR);
+      const lrSame = lrKeys.length === 2 && JSON.stringify(layerR[lrKeys[0]]) === JSON.stringify(layerR[lrKeys[1]]);
+      const layerText = !lrKeys.length ? "—"
+        : lrSame ? `两策略均 ${fmtR(layerR[lrKeys[0]])}`
+        : lrKeys.map((k2) => `${k2} ${fmtR(layerR[k2])}`).join(" · ");
+      kvRows(paramsKv, [
+        { k: "首层风险 r", v: String(rp.risk_r ?? "—"), x: "权益 × r ÷ (k × ATR)" },
+        { k: "分层风险", v: esc(layerText), x: "首层 → 第 2/3 层" },
+        { k: "杠杆", v: rp.leverage ? `${rp.leverage}x` : "—", x: "逐仓" },
+        { k: "ATR 系数 k", v: String(rp.atr_mult_k ?? "—"), x: "仓位分母" },
+        { k: "灾难止损", v: rp.disaster_atr ? `${rp.disaster_atr} × ATR_1H` : "—", x: "穿盘口限价平仓" },
+        { k: "单标的保证金预算", v: rp.margin_budget_per_trade != null ? pct(rp.margin_budget_per_trade, 0) : "—" },
+        { k: "组合保证金预算", v: rp.portfolio_margin_budget != null ? pct(rp.portfolio_margin_budget, 0) : "—", x: "BTC+ETH 合计" },
+        { k: "最大层数", v: Object.entries(rp.max_layers || {}).map(([k2, v2]) => `${k2} ${v2}`).join(" · ") || "—", x: "同向回调加仓" },
+        { k: "日亏闸门", v: rp.block_on_daily_loss === false ? `<span class="warn">关闭</span>` : `<span class="up">启用</span>`, x: "block_on_daily_loss" },
+        { k: "回撤熔断", v: rp.halt_on_max_drawdown === false ? `<span class="warn">关闭</span>` : `<span class="up">启用</span>`, x: "halt_on_max_drawdown" },
+      ]);
+    }
 
     // 恢复按钮状态
     const ext = st.external_interventions || {};
