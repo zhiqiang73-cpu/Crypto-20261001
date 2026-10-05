@@ -1,0 +1,124 @@
+{
+  "ts": "2026-10-05 13:33:12",
+  "symbol": "BTCUSDT",
+  "steps": [
+    {
+      "step": "gate",
+      "mode": "live",
+      "mainnet_confirmed": true,
+      "startup": {
+        "mode": "live",
+        "live_allowed": true,
+        "mainnet_confirmed": true,
+        "entries_default": false,
+        "reason": "主网真实资金模式已启用"
+      }
+    },
+    {
+      "step": "gate_check",
+      "ok": true
+    },
+    {
+      "step": "credentials",
+      "ok": true,
+      "key_masked": "uWLdzV***apXE"
+    },
+    {
+      "step": "preflight",
+      "ping": true,
+      "mark": 85491.4004058,
+      "min_notional": 50.0,
+      "available": 130.33202766,
+      "position_qty": 0.0,
+      "position_side": "FLAT"
+    },
+    {
+      "step": "account_prep",
+      "one_way": "ok",
+      "isolated": "ok",
+      "leverage_10x": "ok"
+    },
+    {
+      "step": "entry",
+      "ok": true,
+      "filled": 0.002,
+      "order_id": "1154667161547",
+      "entry_px": 85491.2
+    },
+    {
+      "step": "state",
+      "strategies": [
+        "kdj15"
+      ],
+      "atr_1h": 340.4253,
+      "entry_px": 85491.2
+    },
+    {
+      "step": "auto_stop_loss",
+      "info": {
+        "action": "保护单建立",
+        "note": "BTCUSDT 建立交易所保护单：多 触发价 84980.60（0.0020），已由交易所接管止损",
+        "trigger": 84980.6,
+        "state": "PROTECTED"
+      },
+      "protection_state": "PROTECTED"
+    },
+    {
+      "step": "auto_take_profit",
+      "info": {
+        "action": "止盈第1批",
+        "note": "BTCUSDT 第1批止盈挂出：多 触发价 86172.10（2.0×ATR） 数量 0.0010/0.0020"
+      },
+      "tp_orders": 1
+    },
+    {
+      "step": "exchange_orders",
+      "count": 2,
+      "orders": [
+        {
+          "algoId": "2000001488926895",
+          "type": "STOP_MARKET",
+          "side": "SELL",
+          "trigger": "84980.6",
+          "qty": "0.002",
+          "reduceOnly": true,
+          "is_tp": false,
+          "alive": true
+        },
+        {
+          "algoId": "ord-1154667225669",
+          "type": "LIMIT",
+          "side": "SELL",
+          "trigger": 86172.1,
+          "qty": 0.001,
+          "reduceOnly": true,
+          "is_tp": true,
+          "alive": true
+        }
+      ]
+    },
+    {
+      "step": "verdict",
+      "auto_stop_loss": true,
+      "auto_take_profit": true,
+      "exchange_has_stop": true,
+      "exchange_has_tp": true
+    },
+    {
+      "step": "cleanup_cancel",
+      "cancelled": 2,
+      "remaining": 0
+    },
+    {
+      "step": "close",
+      "ok": true,
+      "filled": 0.002
+    },
+    {
+      "step": "final",
+      "position_qty": 0.0,
+      "open_orders": 0
+    }
+  ],
+  "ok": true
+}

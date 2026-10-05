@@ -1,0 +1,81 @@
+{
+  "ts": "2026-10-05 13:26:06",
+  "symbol": "BTCUSDT",
+  "steps": [
+    {
+      "step": "gate",
+      "mode": "live",
+      "mainnet_confirmed": true,
+      "startup": {
+        "mode": "live",
+        "live_allowed": true,
+        "mainnet_confirmed": true,
+        "entries_default": false,
+        "reason": "主网真实资金模式已启用"
+      }
+    },
+    {
+      "step": "gate_check",
+      "ok": true
+    },
+    {
+      "step": "credentials",
+      "ok": true,
+      "key_masked": "uWLdzV***apXE"
+    },
+    {
+      "step": "preflight",
+      "ping": true,
+      "mark": 85461.36244378,
+      "min_notional": 50.0,
+      "available": 130.37162654,
+      "position_qty": 0.0,
+      "position_side": "FLAT"
+    },
+    {
+      "step": "plan",
+      "qty": 0.001,
+      "est_notional": 85.46
+    },
+    {
+      "step": "entry",
+      "ok": true,
+      "filled": 0.001,
+      "order_id": "1154663474815"
+    },
+    {
+      "step": "stop_loss",
+      "protects": true,
+      "algo_id": "2000001488915150",
+      "trigger": 85034.1,
+      "error": ""
+    },
+    {
+      "step": "take_profit",
+      "protects": true,
+      "algo_id": "ord-1154663540206",
+      "trigger": 85888.7,
+      "error": ""
+    },
+    {
+      "step": "cancel_stop_loss",
+      "ok": true
+    },
+    {
+      "step": "cancel_take_profit",
+      "ok": true
+    },
+    {
+      "step": "close",
+      "ok": true,
+      "filled": 0.001
+    },
+    {
+      "step": "final",
+      "position_qty": 0.0,
+      "open_orders": 0
+    }
+  ],
+  "ok": true,
+  "dry_run": false
+}
