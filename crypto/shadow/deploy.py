@@ -18,9 +18,12 @@ import argparse
 import asyncio
 import copy
 import csv
+import fcntl
 import hashlib
 import json
 import os
+import shutil
+import sys
 import time
 import traceback
 from datetime import datetime, timezone
@@ -28,19 +31,39 @@ from typing import Optional
 
 import numpy as np
 
+from shadow.alerts import notify
 from shadow.engine import (ATR_MULT_K, BREAK_EVEN_TRIGGER_ATR, DISASTER_ATR,
                            GATE_FEE_RATE, LEVERAGE, MIN_QTY, NORMAL_STOP_ATR,
                            RISK_R, floor_step)
 from shadow.indicators import atr_wilder, boll, kdj, macd
 from shadow.signals import (confirmed_signal, entry_signal, macd_gate,
                             macd_side, price_breaks)
-from shadow.live import ENDPOINTS, MARKET, fetch
+from shadow.live import ENDPOINTS, MARKET, fetch, latest_mark_price, start_market_stream
 from shadow.strategy_books import (SPEC_15M, SPEC_5M, SPECS, TRADE_SYMBOLS,
                                    apply_virtual_signal, clear_symbol_books,
                                    contra_5m_qty, desired_net, migrate_state,
                                    reconcile_symbol_books, reduce_only_for_delta,
-                                   signal_reason, specs_for_symbol,
-                                   symbol_short, trend_side)
+                                   signal_reason, specs_for_symbol, layer_count,
+                                   other_symbol_margin, symbol_short,
+                                   trend_side)
+from trading.cost_model import (net_break_even_price, stop_price_from_avg,
+                               stop_is_tighter)
+from trading.protective_orders import (ProtectionState,
+                                       algo_alive, algo_ident, algo_side,
+                                       algo_trigger,
+                                       cancel_algo_by_id,
+                                       covers_full_position,
+                                       find_take_profit,
+                                       is_take_profit_type,
+                                       place_take_profit,
+                                       fetch_open_algo_orders,
+                                       fetch_open_protective_orders,
+                                       find_protective_stop,
+                                       place_protective_stop,
+                                       reconcile_protective,
+                                       tighten_protective_stop)
+from shadow.external_guard import (ExternalWatch, fill_blocked, note_net,
+                                   scan_external)
 from shadow.external_watch import (apply_external, classify_external,
                                    clear_hold_on_new_signal,
                                    consume_resume_requests, external_fills,
@@ -56,6 +79,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 OUT = os.path.join(ROOT, "runtime", "shadow")
 TRADE_LOG = os.path.join(OUT, "deployed_trades.csv")
 STATE = os.path.join(OUT, "deployed_state.json")
+# 状态备份：save_state 每次把**上一个可解析的版本**轮转到这里。
+# 主文件损坏时 load_state 回退到它，避免启动崩溃循环（2026-10-04 验收 B2）。
+STATE_BAK = STATE + ".bak"
 # 进程启动时刻（≈ 本模块导入时刻）。心跳据此区分「同一个进程跑了多久」
 # 与「进程被重启过」——旧进程会一直报同一个 started_ms。
 PROCESS_STARTED_MS = int(time.time() * 1000)
@@ -86,6 +112,91 @@ COLS = ["时间", "动作", "方向", "数量", "价格", "净盈亏", "K", "D",
 # 2026-10-02 用户看到 10:22 的 5 笔成交以为策略发了 5 次信号, 就是缺这个标签。
 ORDER_TAG = "kdj"
 
+# ---------------------------------------------------------------------------
+# 交易所预挂保护单（2026-10-04 接入）
+# ---------------------------------------------------------------------------
+# 背景：此前保护完全在进程内 —— 进程一死、断网、关机，交易所上没有任何
+# 保护单，仓位裸奔。实测确认 openAlgoOrders 返回空数组，与持仓同时存在。
+#
+# 接入后的分工：
+#   * 交易所保护单是**主**保护：STOP_MARKET，closePosition=true，
+#     workingType=MARK_PRICE。加层后自动跟随全部仓位，不需要重挂。
+#   * 进程内的软件止损退化为**兜底**：只有在交易所保护单未被确认
+#     （UNPROTECTED / UNKNOWN）时才真正下单，避免两边同时平仓。
+#   * 保护单未确认时禁止开新仓 —— 宁可错过信号，不能裸奔。
+EXCHANGE_STOPS_ENABLED = True
+
+# 下单尝试的最小间隔（毫秒）。主循环 15 秒一轮，若验证环节因为字段解析或
+# 限流持续失败，没有退避就会**每轮都下一张新单**，在交易所堆出一串重复的
+# 保护单 —— 触发时重复平仓。只在真正需要下单时才受这个间隔约束；
+# 「查到已有合格保护单」的正常路径不受影响。
+# ---------------------------------------------------------------------------
+# 分批止盈 + 剩余仓位移动止损（2026-10-04 加入）
+# ---------------------------------------------------------------------------
+# 用户文档第 6 行原本排除止盈；2026-10-04 19:45 用户明确要求「本次也给我
+# 加入分批止盈」，故按方案 D 实施：到 +2×ATR 平掉一半，剩余转移动止损。
+#
+# 分批表：(ATR_1H 倍数, 平掉「当前仓位」的比例)。按顺序、由近及远。
+# 比例是相对**当前**仓位，所以 ((2,0.5),(3,0.5)) 最终留下 25% 跟随。
+TP_ENABLED = True
+TP_STAGES: tuple = ((2.0, 0.5), (3.0, 0.5))
+
+# 移动止损：止损与「入场以来最有利标记价」的间距（ATR_1H 倍数）。
+# 只向保护利润的方向移动，永不放宽。1.0 比初始止损的 1.5 更紧 ——
+# 这是刻意的：追踪的目的就是用一部分回撤空间换利润锁定。
+TRAIL_ENABLED = True
+TRAIL_ATR = 1.0
+
+# 止盈/止损单的下单退避（共用）
+PROTECTIVE_RETRY_INTERVAL_MS = 30_000
+_PROTECTIVE_ATTEMPT: dict = {}
+# 连续拉 K 线失败计数。用于识别「进程活着但业务已经死了」——
+# 网络/DNS 长期故障时，循环照转、心跳照更新，但信号根本没在处理。
+_FETCH_FAIL_STREAK: dict = {}
+
+
+def _protective_attempt_ok(symbol: str) -> bool:
+    """距上次下单尝试是否已过退避间隔。"""
+    last = float(_PROTECTIVE_ATTEMPT.get(symbol) or 0.0)
+    return (time.time() * 1000 - last) >= PROTECTIVE_RETRY_INTERVAL_MS
+
+# 人工干预观察状态。不能放进 st：save_state 会 json.dump 整个 st，
+# ExternalWatch 不是 JSON 可序列化的。进程重启后重建（首次扫描只记基线）。
+_EXTERNAL_WATCHES: dict = {}
+
+
+def _ext_watch(symbol: str) -> ExternalWatch:
+    ew = _EXTERNAL_WATCHES.get(symbol)
+    if ew is None:
+        ew = ExternalWatch()
+        _EXTERNAL_WATCHES[symbol] = ew
+    return ew
+
+
+def protection_state(st: dict, symbol: str) -> dict:
+    return (st.get("protection") or {}).get(symbol) or {}
+
+
+def protection_blocked(st: dict, symbol: str) -> Optional[str]:
+    """保护单未确认时返回拦截原因，用于禁止开新仓。"""
+    ps = protection_state(st, symbol)
+    if ps.get("state") in ("PROTECTED",):
+        return None
+    if ps.get("state") in ("UNPROTECTED", "UNKNOWN"):
+        return f"保护单未确认（{ps.get('state')}）：{ps.get('note', '')}"
+    return None
+
+
+def set_protection_state(st: dict, symbol: str, *, state: str, note: str,
+                         algo_id: str = '', trigger: float = 0.0) -> None:
+    """写入保护状态。**合并而非替换** —— best_price / tp_filled / tp_orders
+    等字段由止盈与追踪逻辑维护，替换会把它们抹掉。"""
+    rec = st.setdefault("protection", {}).setdefault(symbol, {})
+    rec.update({
+        "state": state, "note": note, "algo_id": algo_id,
+        "trigger": float(trigger or 0.0), "ts": int(time.time() * 1000),
+    })
+
 # 补记窗口: 运行器停机后最多回看多少根 15m K 线 (96 根 = 24 小时)。
 # 2026-10-02 用户在图表上看到 09:45 金叉, 而日志里那一根只有「观察」——
 # 信号判定本身没错 (当时规则仍要求 K<30, 该根 K=50.73 不满足),
@@ -101,8 +212,17 @@ SYNC_MIN_DELTA = MIN_QTY * 2.0
 # "想下多少"，不回答"下不下得起" —— 10× 逐仓下它常要求单仓占用 60~90% 权益的
 # 保证金（2026-10-04 实测 BTC 需 86%、ETH 需 59%，合计 145%），两个标的在数学上
 # 不可能同时持仓。这里按"该标的整仓"封顶，使两标的合计 ≤ 2×该值。
-# 0.35 → 两标的合计 70%，留 30% 缓冲给浮亏/手续费/资金费。设 0 表示不封顶。
-MARGIN_BUDGET_PER_TRADE = float(os.environ.get("MARGIN_BUDGET_PER_TRADE", "0.35"))
+# 单标的保证金预算（占权益比例）。设 0 表示不封顶。
+MARGIN_BUDGET_PER_TRADE = float(os.environ.get("MARGIN_BUDGET_PER_TRADE", "0.70"))
+
+# 组合级保证金预算（BTC+ETH 合计，占权益比例）。设 0 表示不封顶。
+#
+# 2026-10-04：单标的 70% × 两个标的 = 140% > 可用余额，两标的都会互相挤爆
+# （实测同时满 3 层需 5,570 USDT / 5,000 权益 = 111%）。改为组合级 80% 后：
+#   只做一个标的 → 该标的可用到 min(70%, 80%) = 70%，BTC 满 3 层需 68% ⇒ 放得下
+#   两个标的都做 → 先建仓的先占额度，后一个只能用剩下的，不会超出可用余额
+# 先到先得，不做事后重分配：运行器每 tick 顺序处理标的，先处理的先占。
+PORTFOLIO_MARGIN_BUDGET = float(os.environ.get("PORTFOLIO_MARGIN_BUDGET", "0.80"))
 
 # 本运行器日志的轮转上限。launchd 用 StandardOutPath 把 stdout 重定向到文件且是
 # O_APPEND, 所以重命名/替换都不起作用(我们的 fd 仍指向旧 inode, 之后的输出会写进
@@ -157,15 +277,39 @@ def should_report_skip(symbol: str, key: str, now_ms: int, *,
 
 
 def apply_margin_budget(book: dict, qty: float, *, side: int, equity: float,
-                        px: float) -> tuple:
-    """按「该标的整仓」的保证金预算给数量封顶。返回 (数量, 说明)。
+                        px: float, budget: Optional[float] = None,
+                        others_margin: float = 0.0,
+                        portfolio_budget: Optional[float] = None) -> tuple:
+    """按保证金预算给数量封顶。返回 (数量, 说明)。
+
+    两层预算，取更紧的一层作为「该标的整仓」上限：
+
+      1. 单标的预算：equity × budget
+      2. 组合预算：equity × portfolio_budget − 其它标的已占用（先到先得）
 
     同向加层时"整仓"= 已持有 + 本层，所以先扣掉已有量；反向或空仓时按整仓算
     （反手会先清掉旧层，不该被旧仓占掉额度）。
     """
-    if qty <= 0 or px <= 0 or equity <= 0 or MARGIN_BUDGET_PER_TRADE <= 0:
+    budget = MARGIN_BUDGET_PER_TRADE if budget is None else float(budget)
+    if qty <= 0 or px <= 0 or equity <= 0:
         return qty, ""
-    cap_total = equity * MARGIN_BUDGET_PER_TRADE * float(LEVERAGE) / px
+    cap_total = (equity * budget * float(LEVERAGE) / px
+                 if budget > 0 else float("inf"))
+    port_note = ""
+    pb = (PORTFOLIO_MARGIN_BUDGET if portfolio_budget is None
+          else float(portfolio_budget))
+    if pb > 0:
+        room_usdt = equity * pb - float(others_margin or 0.0)
+        if room_usdt <= 0:
+            return 0.0, (f"组合保证金已满(合计≤{equity * pb:.2f}USDT; "
+                         f"其它标的已占 {float(others_margin or 0.0):.2f})")
+        room_qty = floor_step(room_usdt * float(LEVERAGE) / px)
+        if room_qty < cap_total:
+            cap_total = room_qty
+            port_note = (f"组合预算封顶(合计≤{equity * pb:.2f}USDT; "
+                         f"其它标的已占 {float(others_margin or 0.0):.2f})")
+    if cap_total == float("inf"):
+        return qty, ""
     entry = book.get("entry") or {}
     try:
         existing = abs(float(entry.get("qty") or 0))
@@ -177,7 +321,8 @@ def apply_margin_budget(book: dict, qty: float, *, side: int, equity: float,
     room = floor_step(max(0.0, room))
     if qty <= room:
         return qty, ""
-    return room, f"保证金预算封顶(整仓≤{cap_total:.4f})"
+    note = f"保证金预算封顶(整仓≤{cap_total:.4f})"
+    return room, f"{port_note}; {note}" if port_note else note
 
 
 def symbol_book_has_position(st: dict, symbol: str) -> bool:
@@ -301,21 +446,147 @@ def record_order(r, *, action: str) -> None:
         pass
 
 
+def _default_state() -> dict:
+    return {"last_ts": 0, "peak": 0.0, "day": None, "day_start_eq": 0.0,
+            "halted": False, "entry": None}
+
+
+def _state_file_ok(path: str) -> bool:
+    """文件存在、非空、且能解析成 dict。用于判断「这份状态值得备份」。"""
+    try:
+        if os.path.getsize(path) <= 0:
+            return False
+        with open(path, encoding="utf-8") as fh:
+            return isinstance(json.load(fh), dict)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _recover_state() -> dict:
+    """主状态文件不可用：留证 → 回退备份 → 都没有才用默认值。"""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    quarantined = f"{STATE}.corrupt-{stamp}"
+    try:
+        os.replace(STATE, quarantined)
+        detail = f"损坏文件保留为 {os.path.basename(quarantined)}"
+    except OSError as exc:
+        detail = f"损坏文件改名失败: {exc}"
+    if _state_file_ok(STATE_BAK):
+        try:
+            with open(STATE_BAK, encoding="utf-8") as fh:
+                st = json.load(fh)
+            notify("CRITICAL", "state_recovered_from_backup",
+                   "状态文件损坏，已从备份恢复",
+                   f"{detail}；已回退 {os.path.basename(STATE_BAK)}")
+            return migrate_state(st)
+        except Exception as exc:  # noqa: BLE001
+            detail += f"；备份也读不了: {exc}"
+    notify("CRITICAL", "state_reset_to_default",
+           "状态文件损坏且无可用备份，已重置为默认状态",
+           f"{detail}；账本已丢失，请人工核对交易所实仓与保护单")
+    return migrate_state(_default_state())
+
+
 def load_state() -> dict:
-    if os.path.exists(STATE):
-        with open(STATE, encoding="utf-8") as fh:
-            st = json.load(fh)
-    else:
-        st = {"last_ts": 0, "peak": 0.0, "day": None, "day_start_eq": 0.0,
-              "halted": False, "entry": None}
-    return migrate_state(st)
+    """读状态。**损坏时必须自愈，绝不能把进程带崩。**
+
+    2026-10-04 验收（B2）：旧实现只兜底「文件不存在」，文件**损坏**直接抛
+    JSONDecodeError → 进程退出 → launchd KeepAlive 立刻拉起 → 再崩，形成
+    永不放弃的崩溃循环，而且没有任何人会知道。
+    """
+    if not os.path.exists(STATE):
+        return migrate_state(_default_state())
+    if _state_file_ok(STATE):
+        try:
+            with open(STATE, encoding="utf-8") as fh:
+                return migrate_state(json.load(fh))
+        except Exception as exc:  # noqa: BLE001 校验通过后被改写（竞态）
+            print(f"[状态] 读取失败（校验后竞态）: {type(exc).__name__}: {exc}")
+    print("[状态] ⚠️ 主状态文件不可解析，进入恢复流程")
+    return _recover_state()
 
 
 def save_state(st: dict) -> None:
+    """写状态。**原子替换 + fsync 落盘 + 轮转备份。**
+
+    2026-10-04 验收（B2 上游成因）：旧实现用 os.replace 保证目录项替换原子，
+    但**没有 fsync**，断电时数据可能仍在页缓存，状态文件会变成空文件或截断的
+    JSON。同一仓库的 position_manager.py / journal.py 都做了 fsync，只有最
+    关键的状态链漏了。
+    """
     os.makedirs(OUT, exist_ok=True)
-    with open(STATE + ".tmp", "w", encoding="utf-8") as fh:
+    tmp = STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(st, fh, ensure_ascii=False, indent=2)
-    os.replace(STATE + ".tmp", STATE)
+        fh.flush()
+        os.fsync(fh.fileno())
+    # 只在现有文件**可解析**时轮转备份，避免把损坏内容覆盖掉好备份。
+    if _state_file_ok(STATE):
+        try:
+            shutil.copy2(STATE, STATE_BAK)
+        except OSError as exc:
+            print(f"[状态] 备份失败（不阻断）: {exc}")
+    os.replace(tmp, STATE)
+    # rename 本身也要 fsync 目录，否则掉电后可能「数据落了但名字没落」。
+    try:
+        dfd = os.open(OUT, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+# 单实例锁。用 flock 而不是 pidfile：内核在进程死亡时自动释放，
+# kill -9 不会留下死锁 —— 这正是无人值守场景需要的语义。
+LOCK = os.path.join(OUT, "trader.lock")
+_LOCK_FH = None
+
+
+def acquire_single_instance_lock() -> bool:
+    """独占单实例锁。拿不到返回 False（调用方应以非零码退出）。
+
+    2026-10-04 验收（B1）：全仓没有任何互斥机制。两个 trader 会各自判断
+    信号、各自下单；clientAlgoId 含 pid，所以交易所不会替你去重；两个进程
+    还会同时写 deployed_state.json，后写者静默覆盖先写者。
+    """
+    global _LOCK_FH
+    os.makedirs(OUT, exist_ok=True)
+    try:
+        fh = open(LOCK, "a+", encoding="utf-8")
+    except OSError as exc:
+        print(f"[拒绝启动] 无法打开锁文件 {LOCK}: {exc}")
+        return False
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        holder = ""
+        try:
+            fh.seek(0)
+            holder = (fh.read() or "").strip()[:200]
+        except OSError:
+            pass
+        fh.close()
+        msg = (f"已有运行器实例持有单实例锁；持有者={holder or '未知'}；"
+               f"本进程 pid={os.getpid()} 退出，避免重复下单")
+        print(f"[拒绝启动] {msg}")
+        notify("CRITICAL", "duplicate_instance_blocked",
+               "检测到重复启动，已拒绝第二个实例", msg)
+        return False
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(json.dumps(
+            {"pid": os.getpid(),
+             "started": datetime.now().isoformat(timespec="seconds"),
+             "argv": sys.argv}, ensure_ascii=False))
+        fh.flush()
+        os.fsync(fh.fileno())
+    except OSError:
+        pass
+    _LOCK_FH = fh          # 必须持有引用：句柄一关，锁就释放
+    return True
 
 
 def save_reading(rec: dict, path: Optional[str] = None) -> None:
@@ -344,6 +615,8 @@ def runtime_params() -> dict:
     return {
         "risk_r": RISK_R,
         "margin_budget_per_trade": MARGIN_BUDGET_PER_TRADE,
+        "portfolio_margin_budget": PORTFOLIO_MARGIN_BUDGET,
+        "layer_risk_r": {spec.id: list(spec.layer_risk_r or ()) for spec in SPECS},
         "leverage": LEVERAGE,
         "atr_mult_k": ATR_MULT_K,
         "disaster_atr": DISASTER_ATR,
@@ -491,16 +764,35 @@ async def prepare_testnet_execution(client: BinanceTestnetClient) -> dict:
 
     检查顺序刻意保守：
 
-    1. 任一标的有外部挂单时拒绝启动，绝不擅自取消；
+    1. 放行与当前持仓匹配的、系统生成的 reduce-only 止盈挂单；
+       其他普通挂单仍拒绝启动，绝不混单或擅自取消；
     2. 需要改持仓模式 / 逐仓 / 杠杆但该标的有仓时拒绝启动，绝不混改；
     3. 空仓且没有挂单时才把该标的设成策略规格的「单向、10x、逐仓」；
     4. 每个写入操作之后重新读取并验证，不是只相信接口没有报错。
 
     本函数只有 `--execute` 才调用。观察模式严格只读。
     """
+    positions = {}
+    for symbol in TRADE_SYMBOLS:
+        positions[symbol] = await client.get_position(symbol)
+
     leftover = []
     for symbol in TRADE_SYMBOLS:
-        leftover.extend(await client.get_open_orders(symbol))
+        pos = positions[symbol]
+        qty = float(getattr(pos, "quantity", 0.0) or 0.0)
+        pos_side = str(getattr(pos, "side", "") or "").upper()
+        expected_close_side = "SELL" if pos_side == "LONG" else (
+            "BUY" if pos_side == "SHORT" else "")
+        for order in await client.get_open_orders(symbol):
+            client_id = str(order.get("clientOrderId", ""))
+            is_managed_tp = (
+                abs(qty) > 1e-12
+                and bool(order.get("reduceOnly"))
+                and str(order.get("side", "")).upper() == expected_close_side
+                and client_id.startswith("tp")
+            )
+            if not is_managed_tp:
+                leftover.append(order)
     if leftover:
         raise RuntimeError(
             f"检测到 {len(leftover)} 笔未完成委托；拒绝启动策略以免混单。"
@@ -511,7 +803,7 @@ async def prepare_testnet_execution(client: BinanceTestnetClient) -> dict:
     settings_by_symbol = {}
     occupied = []
     for symbol in TRADE_SYMBOLS:
-        pos = await client.get_position(symbol)
+        pos = positions[symbol]
         settings = await client.get_position_settings(symbol)
         settings_by_symbol[symbol] = settings
         has_position = abs(float(getattr(pos, "quantity", 0.0) or 0.0)) > 1e-12
@@ -627,6 +919,15 @@ async def sync_net(client: BinanceTestnetClient, st: dict, execute: bool, *,
                 mark = 0.0
             if mark > 0:
                 need = abs(delta) * mark / float(LEVERAGE)
+                # 反手时 delta = 平旧仓 + 开新仓，但**旧仓的保证金在平仓成交后
+                # 就会释放**。2026-10-05 实测：BTC 反手（平 0.1710 空、开
+                # 0.1700 多，净增只有 0.1700）被算成「需 2908.71」，而可用只有
+                # 2482.26 —— 系统用自己的旧仓把自己挡住了，反手永远做不成。
+                # 正确口径是**净增名义**：减掉即将释放的那部分。
+                cur_side = "LONG" if ex > 0 else ("SHORT" if ex < 0 else "")
+                if cur_side and side.upper() != cur_side:
+                    released = abs(ex) * mark / float(LEVERAGE)
+                    need = max(0.0, need - released)
                 if need > float(available_balance):
                     msg = (f"保证金不足，跳过开仓：需 {need:.2f} > 可用 "
                            f"{float(available_balance):.2f}"
@@ -667,7 +968,7 @@ async def sync_net(client: BinanceTestnetClient, st: dict, execute: bool, *,
 
 def process_strategy(spec, book: dict, bars: dict, atr_al, *,
                      equity: float, block: bool, now: int, execute: bool,
-                     trend: int = 0) -> bool:
+                     trend: int = 0, others_margin: float = 0.0) -> bool:
     """处理一条策略的已收盘 K 线，只改虚拟账本。返回是否需要同步净仓。"""
     ts = bars["ts"]
     o, h, l, c = (bars[x] for x in ("open", "high", "low", "close"))
@@ -784,14 +1085,24 @@ def process_strategy(spec, book: dict, bars: dict, atr_al, *,
             sig_long, sig_short,
             float(hist[i]) if i < len(hist) else float("nan"),
         )
+    want = 1 if sig_long else (-1 if sig_short else 0)
     qty = 0.0
     if not np.isnan(atr_al[i]) and atr_al[i] > 0:
-        qty = floor_step(equity * RISK_R / (ATR_MULT_K * float(atr_al[i])))
-    want = 1 if sig_long else (-1 if sig_short else 0)
+        # 首层 1%，第2/3层各 0.5%；5m 等未配置分层风险的策略继续沿用 RISK_R。
+        current_layers = layer_count(book.get("entry"))
+        current_side = int((book.get("entry") or {}).get("side") or 0)
+        layer_no = current_layers + 1 if want and current_side == want else 1
+        risk_schedule = spec.layer_risk_r or ()
+        layer_r = (float(risk_schedule[layer_no - 1])
+                   if 0 < layer_no <= len(risk_schedule) else RISK_R)
+        qty = floor_step(equity * layer_r / (ATR_MULT_K * float(atr_al[i])))
     qty, size_note = contra_5m_qty(
         qty, interval=spec.interval, want=want, trend=trend,
     )
-    qty, cap_note = apply_margin_budget(book, qty, side=want, equity=equity, px=px)
+    qty, cap_note = apply_margin_budget(
+        book, qty, side=want, equity=equity, px=px,
+        budget=MARGIN_BUDGET_PER_TRADE, others_margin=others_margin,
+    )
     if cap_note:
         size_note = f"{size_note}; {cap_note}" if size_note else cap_note
     reason_gold = bool(sig_long) if spec.confirm_next else gold
@@ -857,10 +1168,657 @@ def book_for_symbol(st: dict, symbol: str) -> Optional[dict]:
     return None
 
 
+def _clamp_trigger_side(target: float, *, side: int, symbol: str,
+                        atr_1h: float, tick: float) -> float:
+    """把触发价钳制到市价的**正确一侧**。
+
+    为什么必须有这一层
+    ------------------
+    交易所对「一挂出就可立即成交」的条件单直接返回 **-2021**
+    （"Order would immediately trigger"）。
+
+    2026-10-05 实测：追踪止损按 `best_price − 1.5×ATR` 算出 86505.5，
+    而现价已回落到 86420.40 —— 目标价跑到市价**上方**，SELL 止损变成
+    「可立即成交」，下单被拒。后果是收紧永远失败、标的被永久禁止开仓。
+
+    这不是偶发：只要价格从最高点回撤超过 TRAIL_ATR×ATR，追踪止损就会
+    算出越界价。**回撤越大越必然发生**，恰恰是追踪止损最该起作用的时刻。
+
+    钳制方向：多仓止损必须低于市价、空仓止损必须高于市价，各留一个
+    缓冲（0.25×ATR，且不小于 2 个 tick），避免贴着市价被噪声瞬间打掉。
+
+    注意：钳制只会让触发价**更靠近市价**（更紧），不会放宽既有保护；
+    上层 find_protective_stop 的死区判断仍会拦住「无改进空间」的重挂。
+    """
+    mark = float(latest_mark_price(symbol) or 0.0)
+    if mark <= 0 or target <= 0:
+        return target
+    buf = max(2.0 * float(tick), 0.25 * float(atr_1h))
+    if side > 0:
+        return min(target, mark - buf)
+    return max(target, mark + buf)
+
+
+async def _protective_target(client: BinanceTestnetClient, st: dict, *,
+                            symbol: str, ex_side: float, entry_px: float,
+                            atr_1h: float):
+    """算出该标的此刻应该挂在哪里的保护触发价。
+
+    未到保本档 → 入场均价 ∓ 1.5×ATR_1H（需求 B 的「按实际持仓均价」）。
+    已到保本档 → 净保本价（扣掉全部成本后预计不亏的位置，需求 C）。
+
+    返回 (触发价, 是否保本档, tick)。触发价 <= 0 表示算不出来。
+    """
+    side = 1 if ex_side > 0 else -1
+    tick = await client.price_tick(symbol)
+    book = book_for_symbol(st, symbol) or {}
+    entry = book.get("entry") or {}
+    entry_ms = int(entry.get("ms") or 0)
+    armed = (entry_ms > 0
+             and int(book.get("break_even_armed_ms") or 0) == entry_ms)
+    if armed:
+        # 入场手续费与已发生资金费在账本里没有分项字段，按 taker 费率保守
+        # 估算入场费（宁可把保本价算高一点，也不要把止损放到成本线以下）。
+        be, _why = net_break_even_price(
+            avg_price=float(entry_px), side=side, quantity=abs(ex_side),
+            entry_fee_paid=0.0, funding_paid=0.0, tick=tick,
+            entry_fee_missing=True,
+        )
+        target = be
+        # 移动止损：止损与「入场以来最有利标记价」保持 TRAIL_ATR×ATR_1H。
+        # 只朝保护利润的方向取更紧的一侧，永不放宽。
+        if TRAIL_ENABLED:
+            best = float(protection_state(st, symbol).get("best_price") or 0.0)
+            if best > 0:
+                trail = (best - TRAIL_ATR * float(atr_1h) if side > 0
+                         else best + TRAIL_ATR * float(atr_1h))
+                if trail > 0:
+                    if side > 0:
+                        target = max(target, trail) if target > 0 else trail
+                    else:
+                        target = min(target, trail) if target > 0 else trail
+        if target > 0:
+            return _clamp_trigger_side(
+                target, side=side, symbol=symbol, atr_1h=atr_1h,
+                tick=tick), True, tick
+    px = stop_price_from_avg(
+        avg_price=float(entry_px), side=side, atr_1h=float(atr_1h),
+        multiple=NORMAL_STOP_ATR, tick=tick,
+    )
+    return _clamp_trigger_side(
+        px, side=side, symbol=symbol, atr_1h=atr_1h, tick=tick), False, tick
+
+
+async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
+                               symbol: str, ex_side: float, entry_px: float,
+                               atr_1h: float, execute: bool) -> Optional[dict]:
+    """确保交易所有一张覆盖全仓的保护单；保本激活后收紧到净保本价。
+
+    只在 execute 模式动作。返回 None 表示无需动作或已受保护；
+    返回字典表示本轮做了什么（用于日志）。
+    """
+    if not EXCHANGE_STOPS_ENABLED or not execute:
+        return None
+    if abs(ex_side) < MIN_QTY or entry_px <= 0:
+        return None
+    if not (atr_1h > 0) or not np.isfinite(float(atr_1h)):
+        return None
+    side = 1 if ex_side > 0 else -1
+
+    try:
+        target, armed, _tick = await _protective_target(
+            client, st, symbol=symbol, ex_side=ex_side, entry_px=entry_px,
+            atr_1h=atr_1h)
+    except Exception as exc:  # noqa: BLE001
+        set_protection_state(st, symbol, state="UNKNOWN",
+                             note=f"触发价计算失败: {exc}")
+        return {"action": "保护单计算失败", "note": str(exc)}
+
+    if target <= 0:
+        set_protection_state(st, symbol, state="UNKNOWN",
+                             note="触发价算不出来（均价或 ATR 非法）")
+        return None
+
+    # 记录入场以来最有利的标记价，供移动止损使用。必须在下单判断之前更新，
+    # 否则止损会滞后一个 tick 才跟上新高。
+    mark = float(latest_mark_price(symbol) or 0.0)
+    if mark > 0:
+        rec0 = protection_state(st, symbol)
+        best0 = float(rec0.get("best_price") or 0.0)
+        if best0 <= 0:
+            rec0["best_price"] = mark
+        elif side > 0:
+            rec0["best_price"] = max(best0, mark)
+        else:
+            rec0["best_price"] = min(best0, mark)
+
+    book = book_for_symbol(st, symbol)
+    prev = dict((book or {}).get("exchange_stop") or {})
+    prev_id = str(prev.get("algo_id") or "")
+    ps = protection_state(st, symbol)
+    pending_cid = str(ps.get("pending_client_algo_id") or "")
+    pending_trigger = float(ps.get("pending_trigger") or 0.0)
+    # 下单可能已落地但确认查询遇到 429。后续重试复用同一 clientAlgoId，
+    # 避免每个退避周期都产生一张新的保护单。
+    if (pending_cid and pending_trigger > 0 and
+            abs(pending_trigger - target) > max(float(_tick), 0.01)):
+        pending_cid = ""
+
+    try:
+        orders = await fetch_open_algo_orders(client, symbol)
+    except Exception as exc:  # noqa: BLE001 查不到 ≠ 没有，按未确认处理
+        set_protection_state(st, symbol, state="UNKNOWN",
+                             note=f"openAlgoOrders 查询失败: {exc}")
+        notify("WARNING", f"protection_query_fail_{symbol}",
+               f"{symbol} 保护单查询失败，保护状态未知",
+               f"{type(exc).__name__}: {exc}")
+        return {"action": "保护单查询失败", "note": str(exc)}
+
+    # 目标价是 avg ± N×ATR 算出来的，而 1H ATR 每根 K 线都在变。若拿精确
+    # 目标价要求「不比它松」，ATR 稍微一缩就会判定需要收紧 —— 实测 ETH 每轮
+    # 都去重挂、每轮都失败，刷屏且无意义。加一个死区：现有止损只要不比目标
+    # 差 0.25×ATR 以上，就认为已经够紧。真正的保本/追踪收紧幅度远大于此，
+    # 不会被挡。
+    dead = 0.25 * float(atr_1h)
+    existing = find_protective_stop(
+        orders, side=side, required_trigger=max(target - side * dead, 0.0))
+    # 显式数量的止损**不会自动跟随仓位**（closePosition 才会）。加仓后数量
+    # 不足 = 仓位没被完全保护，必须重挂；分批止盈后数量偏大是安全的
+    # （reduceOnly 触发时按实际仓位平），不触发重挂。
+    if (existing is not None
+            and not covers_full_position(existing, quantity=abs(ex_side))):
+        print(f"[{symbol} 保护单补量] 现有止损数量 "
+              f"{float(existing.get('quantity') or 0):.4f} < 仓位 "
+              f"{abs(ex_side):.4f}，重挂以覆盖全仓")
+        prev_id = algo_ident(existing)
+        existing = None
+    if existing is not None:
+        aid = algo_ident(existing)
+        trig = algo_trigger(existing)
+        if book is not None:
+            book["exchange_stop"] = {"algo_id": aid, "trigger": trig,
+                                     "armed": armed}
+        set_protection_state(st, symbol, state="PROTECTED",
+                             note=("交易所保护单有效（保本档）" if armed
+                                   else "交易所保护单有效（初始档）"),
+                             algo_id=aid, trigger=trig)
+        return None
+
+    # 需要下单。已有旧单则先立后破；没有则首次建立。
+    if not _protective_attempt_ok(symbol):
+        # 退避期内不再下单。返回当前已知状态，让上层按未确认处理（禁止开新仓），
+        # 但不在交易所堆重复保护单。
+        ps = protection_state(st, symbol)
+        set_protection_state(st, symbol, state=ps.get("state") or "UNKNOWN",
+                             note=f"{ps.get('note', '')}（{PROTECTIVE_RETRY_INTERVAL_MS // 1000} 秒内不重试）",
+                             algo_id=ps.get("algo_id", ""),
+                             trigger=float(ps.get("trigger") or 0.0))
+        return None
+    _PROTECTIVE_ATTEMPT[symbol] = time.time() * 1000
+    if prev_id:
+        res = await tighten_protective_stop(
+            client, symbol=symbol, side=side, new_trigger=target,
+            old_algo_id=prev_id, quantity=abs(ex_side),
+            # ⚠ 必须 False：closePosition=true 的条件单每标的每方向只允许
+            # 一张，旧单还在时新单会被交易所 -4130 明确拒绝，「先立后破」
+            # 在 closePosition 上根本不可行（2026-10-05 实测证实）。
+            # 显式数量 + reduceOnly 可与旧单并存，先立后破才成立。
+            close_position=False,
+            client_algo_id=pending_cid or None)
+        verb = "收紧"
+    else:
+        res = await place_protective_stop(
+            client, symbol=symbol, side=side, trigger_price=target,
+            quantity=abs(ex_side), close_position=False,
+            client_algo_id=pending_cid or None)
+        verb = "建立"
+
+    if res.protects:
+        if book is not None:
+            book["exchange_stop"] = {"algo_id": res.algo_id,
+                                     "trigger": res.trigger_price,
+                                     "armed": armed}
+        set_protection_state(
+            st, symbol, state="PROTECTED",
+            note=(f"{verb}保护单成功，触发价 {res.trigger_price:.2f}"
+                  + (f"；旧单撤销未确认 {res.error}" if res.error else "")),
+            algo_id=res.algo_id, trigger=res.trigger_price)
+        rec = st.setdefault("protection", {}).setdefault(symbol, {})
+        rec.pop("pending_client_algo_id", None)
+        rec.pop("pending_trigger", None)
+        rec.pop("unconfirmed_streak", None)
+        detail = (f"{symbol} {verb}交易所保护单：{('多' if side > 0 else '空')} "
+                  f"触发价 {res.trigger_price:.2f}（{abs(ex_side):.4f}）"
+                  f"{'，已由交易所接管止损' if not res.error else ''}")
+        print(f"[{symbol} 保护单] {detail}")
+        log_row([_fmt(0), f"{symbol_short(symbol)} 保护单{verb}",
+                 "多" if side > 0 else "空", f"{abs(ex_side):.4f}",
+                 f"{res.trigger_price:.2f}", "", "", "", "", "",
+                 "", detail])
+        return {"action": f"保护单{verb}", "note": detail,
+                "trigger": res.trigger_price, "state": "PROTECTED"}
+
+    # 未确认：按未保护处理，并禁止开新仓
+    set_protection_state(st, symbol, state=res.state.value,
+                         note=f"{verb}未确认: {res.error}")
+    # 连续失败计数：状态本身保持 UNKNOWN（fail-safe 不变），但**日志与告警
+    # 必须退避**。2026-10-05 实测：同一个失败每 tick 重打一次，刷了 1224 条、
+    # 占满最后 200 行日志的 100%，把真实业务事件全淹没了。
+    rec0 = st.setdefault("protection", {}).setdefault(symbol, {})
+    streak = int(rec0.get("unconfirmed_streak") or 0) + 1
+    rec0["unconfirmed_streak"] = streak
+    # 第 1 次必报（状态变化点），之后每 20 次（约 10 分钟）报一次
+    should_report = (streak == 1 or streak % 20 == 0)
+    if should_report:
+        notify("CRITICAL", f"protection_unconfirmed_{symbol}",
+               f"{symbol} 保护单{verb}未确认，该标的已禁止开新仓",
+               f"仓位仍由软件止损兜底；原因: {res.error}"
+               + (f"（连续第 {streak} 次）" if streak > 1 else ""))
+    # UNKNOWN 不是失败：请求可能已落地但确认查询遇到 429/网络问题。
+    # 持久化同一 clientAlgoId，下一轮按 ID 回查/重试，禁止重复下单。
+    rec = st.setdefault("protection", {}).setdefault(symbol, {})
+    if res.client_algo_id:
+        rec["pending_client_algo_id"] = res.client_algo_id
+        rec["pending_trigger"] = float(target)
+    if should_report:
+        print(f"[{symbol} ⚠️ 保护单{verb}未确认] {res.error}；"
+              f"该标的暂停开新仓，软件止损继续兜底"
+              + (f"（连续第 {streak} 次）" if streak > 1 else ""))
+    return {"action": f"保护单{verb}未确认", "note": res.error,
+            "state": res.state.value}
+
+
+async def clear_ledger_if_stop_fired(client: BinanceTestnetClient, st: dict, *,
+                                     symbol: str, ex_side: float) -> bool:
+    """交易所已空仓时，判定「是不是我们自己的保护单打掉的」，并收拾状态。
+
+    必要性：保护单由交易所触发成交，运行器不是下单方。若不处理，账本仍记着
+    多头，净仓同步会认为「目标有仓、实际空仓」，把仓位**补回来** —— 正是要
+    杜绝的行为。
+
+    判定必须具体：只有「账本/状态里记的那些单已不在 openAlgoOrders 里」才
+    认定是自己的单成交。查不到就**不清**，宁可下一轮再判，也不误清账本。
+
+    两种进入形态（都会收拾，区别只在要不要报「成交」）：
+      A. 账本还记着仓 + 我们的单没了  → 保护单成交：清账本 + 告警 + 记 FLAT
+      B. 账本已空 + 状态残留          → 清理残留：记 FLAT（不重复告警）
+
+    形态 B 是 2026-10-04 实测事故的余波：成交判定当时排在 apply_external
+    之后，账本已被当作「人工减仓」清空，于是形态 A 的守卫永远返回 False，
+    而形态 B 当时压根不存在 —— 残留的 PROTECTED 会一直留着。残留有害：
+    过期的 best_price 会让**下一笔多头仓**在首轮就 max(旧高价, 现价) 判为
+    已盈利，立刻武装保本止损。
+    """
+    if abs(ex_side) >= MIN_QTY:
+        return False
+    book = book_for_symbol(st, symbol)
+    has_entry = bool(book and book.get("entry"))
+    ps = protection_state(st, symbol)
+    # 止损单、止盈单、以及状态里记着的单号，都算「我们自己的单」。
+    ours = {str((book.get("exchange_stop") or {}).get("algo_id") or "")} \
+        if book else set()
+    for t in (ps.get("tp_orders") or []):
+        ours.add(str(t.get("algo_id") or ""))
+    ours.add(str(ps.get("algo_id") or ""))
+    ours.discard("")
+    if not ours:
+        return False        # 没有任何属于我们的单 → 无从判断
+    try:
+        orders = await fetch_open_protective_orders(client, symbol)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{symbol} 保护单成交判定] 查询失败，本轮不清账本: {exc}")
+        return False
+    if any(algo_ident(o) in ours for o in orders):
+        return False        # 我们的单还在，仓位是别的原因变空的 → 不擅自清
+
+    if not has_entry:
+        # 形态 B：账本早空了，只是状态没收拾。静默清理，避免重复告警。
+        _mark_flat(st, symbol,
+                   float(ps.get("trigger") or ps.get("fired_trigger") or 0.0),
+                   announce=False)
+        print(f"[{symbol} 保护状态] 已空仓但状态残留，清理为 FLAT")
+        return False
+
+    # 形态 A：保护单成交。
+    rec = dict(book.get("exchange_stop") or {})
+    trig = float(rec.get("trigger") or 0.0)
+    clear_symbol_books(st, symbol)
+    if symbol == "BTCUSDT":
+        st["entry"] = None
+    _mark_flat(st, symbol, trig, announce=True)
+    log_row([_fmt(0), f"{symbol_short(symbol)} 保护单成交",
+             "", "", f"{trig:.2f}", "", "", "", "", "", "",
+             f"{symbol} 交易所保护单触发平仓，账本清零"])
+    return True
+
+
+def _mark_flat(st: dict, symbol: str, trigger: float, *,
+               announce: bool) -> None:
+    """把保护状态记为 FLAT 并清掉属于**上一笔仓位**的残留字段。
+
+    状态记 FLAT 而不是 PROTECTED：仓位已经没了，再声称「受保护」是假的。
+    protection_blocked 只拦截 PROTECTED/UNKNOWN/UNPROTECTED，FLAT 不会误挡新仓。
+
+    必须清掉 algo_id / tp_orders / best_price —— 否则下一笔仓位会拿着上一笔的
+    死亡单号去「收紧」，或误判止盈批次，或因过期 best_price 立刻武装保本。
+    """
+    rec = protection_state(st, symbol)
+    rec.update({
+        "state": "FLAT",
+        "note": (f"保护单已触发成交（触发价 {trigger:.2f}），账本已清零"
+                 if announce else "已空仓，清理上一笔的残留保护状态"),
+        "algo_id": "",
+        "trigger": 0.0,
+        "tp_orders": [],
+        "tp_filled": 0,
+        "best_price": 0.0,
+        "fired_at": int(time.time() * 1000),
+        "fired_trigger": float(trigger or 0.0),
+        "fired_kind": "exchange_stop",
+    })
+    # 一并清掉策略账本里属于**上一笔仓位**的止损记录。
+    #
+    # 为什么必须在这里清（2026-10-04 实测）：
+    #   「形态 B」——账本早已为空、只剩保护状态残留——**不会**调用
+    #   clear_symbol_books，只走 _mark_flat。若这里不清 exchange_stop，
+    #   clear_ledger_if_stop_fired 里 ours 集合就永远非空，于是每个 tick 都
+    #   重新判定一次「状态残留」并打印，永不停止（实测最后 200 行里 186 行
+    #   是这一句）。
+    #   更实质的危害是：下一笔新仓的 manage_exchange_stop 会拿这个死单号走
+    #   「收紧」分支，而不是「建立」分支。
+    for _spec in specs_for_symbol(symbol):
+        _bk = (st.get("strategies") or {}).get(_spec.id)
+        if isinstance(_bk, dict):
+            _bk.pop("exchange_stop", None)
+            _bk.pop("stop_defer_logged", None)
+    if announce:
+        print(f"[{symbol} 保护单已成交] 触发价 {trigger:.2f}；"
+              f"账本清零，不补回，等下一根信号")
+        # 止损成交是无人值守时必须知道的事件 —— 此前它只打一行 stdout。
+        notify("CRITICAL", f"stop_fired_{symbol}",
+               f"{symbol} 保护单已触发平仓（触发价 {trigger:.2f}）",
+               f"交易所净额已归零，账本已清零且不补回；等待下一根信号")
+
+
+async def manage_take_profit(client: BinanceTestnetClient, st: dict, *,
+                             symbol: str, ex_side: float, entry_px: float,
+                             atr_1h: float, execute: bool) -> Optional[dict]:
+    """按 TP_STAGES 逐批挂出止盈单（部分数量 + reduceOnly）。
+
+    每批只挂「当前还没触发的那一批」，触发过的批次记在 tp_filled 里不再重挂。
+    成交由 reconcile_tp_fills 认定，不在本函数里猜。
+    """
+    if not TP_ENABLED or not execute:
+        return None
+    if abs(ex_side) < MIN_QTY or entry_px <= 0 or not (atr_1h > 0):
+        return None
+    if not np.isfinite(float(atr_1h)):
+        return None
+    side = 1 if ex_side > 0 else -1
+    rec = protection_state(st, symbol)
+    idx = int(rec.get("tp_filled") or 0)
+    if idx >= len(TP_STAGES):
+        return None
+    mult, frac = TP_STAGES[idx]
+
+    tick = await client.price_tick(symbol)
+    level = float(entry_px) + side * float(mult) * float(atr_1h)
+    level = client._price_precision(level, tick)
+    if level <= 0:
+        return None
+    qty = abs(ex_side) * float(frac)
+    if qty < MIN_QTY:
+        return None
+
+    try:
+        orders = await fetch_open_protective_orders(client, symbol)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{symbol} 止盈] 查询失败，本轮不动作: {exc}")
+        return None
+
+    # ⚠ 匹配必须按 algoId，不能按触发价。
+    # 触发价是用「当前 ATR」重算的，而 1H ATR 每根 K 线都在变（实测一次
+    # 漂移 6.90）。用 tick 级容差按价格匹配就永远匹配不上，于是每轮都当成
+    # 「没有止盈单」再下一张 —— 实测每标的一轮就多一张，两张各占一半、
+    # 合起来把**整仓**平掉，分批设计直接废掉。
+    # 正确口径：触发价在挂出那一刻固定，之后按 algoId 认单。
+    want = "SELL" if side > 0 else "BUY"
+    live = [o for o in orders
+            if is_take_profit_type(o) and algo_alive(o) and algo_side(o) == want]
+    recorded = [t for t in (rec.get("tp_orders") or [])
+                if int(t.get("stage") or 0) == idx and not t.get("filled")]
+    recorded_ids = {str(t.get("algo_id") or "") for t in recorded}
+    keep = next((o for o in live if algo_ident(o) in recorded_ids), None)
+
+    if keep is None and live:
+        # 账本丢了记录（进程重启且状态文件被清）时，认养最接近目标价的那张，
+        # 而不是再下一张。带宽取 0.5×ATR，足够吸收 ATR 的正常漂移。
+        near = min(live, key=lambda o: abs(algo_trigger(o) - level))
+        if abs(algo_trigger(near) - level) <= max(0.5 * float(atr_1h), tick * 5):
+            keep = near
+
+    if keep is not None:
+        keep_id = algo_ident(keep)
+        # 同一批次只允许留一张。重复止盈单会叠加成整仓平仓，必须清掉。
+        for o in live:
+            if algo_ident(o) == keep_id:
+                continue
+            print(f"[{symbol} 止盈去重] 撤销重复止盈单 {algo_ident(o)} "
+                  f"触发价 {algo_trigger(o):.2f}（保留 {keep_id}）")
+            await cancel_algo_by_id(client, symbol, algo_ident(o))
+        rec["tp_orders"] = [t for t in (rec.get("tp_orders") or [])
+                            if int(t.get("stage") or 0) != idx
+                            or t.get("filled")]
+        rec.setdefault("tp_orders", []).append({
+            "algo_id": keep_id, "trigger": algo_trigger(keep),
+            "qty": float(keep.get("quantity") or qty),
+            "stage": idx, "filled": False,
+            "pos_at_place": abs(float(ex_side)),
+        })
+        return None
+
+    # 走到这里说明账本里没有任何一张属于本批次的活单，现存止盈单都是残留
+    # （例如批次被误推进留下的）。先撤掉再下新的，否则会越堆越多。
+    for o in live:
+        print(f"[{symbol} 止盈清理] 撤销不属于第{idx + 1}批的残留止盈单 "
+              f"{algo_ident(o)} 触发价 {algo_trigger(o):.2f}")
+        await cancel_algo_by_id(client, symbol, algo_ident(o))
+
+    if not _protective_attempt_ok(f"{symbol}:tp"):
+        return None
+    _PROTECTIVE_ATTEMPT[f"{symbol}:tp"] = time.time() * 1000
+
+    res = await place_take_profit(
+        client, symbol=symbol, side=side, trigger_price=level, quantity=qty)
+    if not res.protects:
+        print(f"[{symbol} ⚠️ 止盈挂单未确认] 第{idx + 1}批 {level:.2f} × {qty}: "
+              f"{res.error}")
+        return {"action": "止盈挂单未确认", "note": res.error}
+
+    rec.setdefault("tp_orders", []).append({
+        "algo_id": res.algo_id, "trigger": res.trigger_price,
+        "qty": qty, "stage": idx, "filled": False,
+        "pos_at_place": abs(float(ex_side)),
+    })
+    detail = (f"{symbol} 第{idx + 1}批止盈挂出：{('多' if side > 0 else '空')} "
+              f"触发价 {res.trigger_price:.2f}（{mult}×ATR）"
+              f" 数量 {qty:.4f}/{abs(ex_side):.4f}")
+    print(f"[{symbol} 止盈] {detail}")
+    log_row([_fmt(0), f"{symbol_short(symbol)} 止盈第{idx + 1}批",
+             "多" if side > 0 else "空", f"{qty:.4f}",
+             f"{res.trigger_price:.2f}", "", "", "", "", "", "", detail])
+    return {"action": f"止盈第{idx + 1}批", "note": detail}
+
+
+async def reconcile_tp_fills(client: BinanceTestnetClient, st: dict, *,
+                             symbol: str, ex_side: float) -> bool:
+    """认定止盈成交，并把账本对齐到交易所实际净仓。
+
+    必要性：止盈单由**交易所**触发成交，运行器不是下单方。若不处理，账本仍
+    记着原仓位，净仓同步会认为「目标有仓、实际少了一半」，把刚止盈掉的部分
+    **买回来** —— 止盈就白做了。
+
+    判定保持保守：只有「账本里记的那张止盈单已不在 openAlgoOrders 里」才认。
+    无论是成交还是被撤，**交易所净仓才是事实**，所以一律按实际净仓对齐；
+    对齐是幂等的，净仓没变就不会有任何改动。
+    """
+    rec = protection_state(st, symbol)
+    tps = rec.get("tp_orders") or []
+    pending = [t for t in tps if not t.get("filled")]
+    if not pending:
+        return False
+    try:
+        orders = await fetch_open_protective_orders(client, symbol)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{symbol} 止盈成交判定] 查询失败，本轮不动账本: {exc}")
+        return False
+    alive = {algo_ident(o) for o in orders}
+    gone = [t for t in pending if str(t.get("algo_id")) not in alive]
+    if not gone:
+        return False
+
+    # ⚠ 「单子没了」不等于「成交了」—— 被撤销也会没。
+    # 实测事故：启动对账清理重复单时把止盈单一起撤了，这里就把「消失」当成
+    # 「成交」，直接跳过了 2×ATR 那个批次（BTC 的止盈被挪到 3×ATR）。
+    # 唯一可信的证据是**交易所净仓确实变小了**，且减小幅度与批次数量相符。
+    shrunk = []
+    for t in gone:
+        before = float(t.get("pos_at_place") or 0.0)
+        q = float(t.get("qty") or 0.0)
+        if before > 0 and abs(float(ex_side)) <= before - q * 0.5:
+            shrunk.append(t)
+        else:
+            # 净仓没变小 → 只是被撤了，不是成交。清掉这条记录让它重挂，
+            # 但**绝不**推进批次。
+            print(f"[{symbol} 止盈记录清理] {t.get('algo_id')} 已不在挂单里，"
+                  f"但净仓 {float(ex_side):+.4f} 未小于下单时的 "
+                  f"{before:.4f} —— 判为已撤销而非成交，退回重挂")
+    if not shrunk:
+        rec["tp_orders"] = [t for t in (rec.get("tp_orders") or [])
+                            if t not in gone]
+        return False
+    gone = shrunk
+
+    for t in gone:
+        t["filled"] = True
+        rec["tp_filled"] = max(int(rec.get("tp_filled") or 0),
+                               int(t.get("stage") or 0) + 1)
+    note = reconcile_symbol_books(st, symbol, float(ex_side))
+    detail = (f"{symbol} 止盈第{gone[0].get('stage', 0) + 1}批已成交"
+              f"（触发价 {float(gone[0].get('trigger') or 0):.2f}）；"
+              f"账本对齐到交易所净仓 {float(ex_side):+.4f}"
+              + (f"：{note}" if note else ""))
+    print(f"[{symbol} 止盈成交] {detail}")
+    log_row([_fmt(0), f"{symbol_short(symbol)} 止盈成交",
+             "", f"{abs(float(ex_side)):.4f}",
+             f"{float(gone[0].get('trigger') or 0):.2f}", "", "", "", "", "",
+             "", detail])
+    return True
+
+
+async def reconcile_protection(client: BinanceTestnetClient, st: dict, *,
+                               execute: bool) -> dict:
+    """启动/重启时的保护单对账：有仓没保护就立刻补，补不上就禁止开新仓。
+
+    需求 D：进程启动时以交易所实仓 + openAlgoOrders 为唯一事实来源对账。
+    """
+    summary = {}
+    for symbol in TRADE_SYMBOLS:
+        try:
+            pos = await client.get_position(symbol)
+            ex_side = _signed_qty(pos)
+            entry_px = float(getattr(pos, "entry_price", 0.0) or 0.0)
+        except Exception as exc:  # noqa: BLE001
+            set_protection_state(st, symbol, state="UNKNOWN",
+                                 note=f"持仓查询失败: {exc}")
+            summary[symbol] = {"state": "UNKNOWN", "note": str(exc)}
+            print(f"[{symbol} 启动对账] 持仓查询失败: {exc}")
+            continue
+
+        if abs(ex_side) < MIN_QTY:
+            # 空仓：清理残留保护单（上一笔的不能留到下一笔）
+            try:
+                res = await reconcile_protective(
+                    client, symbol=symbol, side=0, quantity=0.0,
+                    required_trigger=0.0)
+                set_protection_state(st, symbol, state="PROTECTED",
+                                     note=res.action)
+                summary[symbol] = {"state": "FLAT", "note": res.action}
+                print(f"[{symbol} 启动对账] 空仓；{res.action}")
+            except Exception as exc:  # noqa: BLE001
+                set_protection_state(st, symbol, state="UNKNOWN",
+                                     note=f"残留保护单清理失败: {exc}")
+                summary[symbol] = {"state": "UNKNOWN", "note": str(exc)}
+            continue
+
+        # 有仓：算出应挂的触发价，查交易所是否已有合格保护单
+        atr_1h = float("nan")
+        try:
+            pack = _fetch_symbol_bars(symbol, int(time.time() * 1000))
+            if pack:
+                b15, atr_al = pack["15m"]
+                i = len(b15["ts"]) - 1
+                if i >= 0:
+                    atr_1h = float(atr_al[i])
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{symbol} 启动对账] ATR 取数失败: {exc}")
+
+        side = 1 if ex_side > 0 else -1
+        if not (atr_1h > 0) or not np.isfinite(atr_1h):
+            set_protection_state(st, symbol, state="UNKNOWN",
+                                 note="ATR 不可用，无法确定保护触发价")
+            summary[symbol] = {"state": "UNKNOWN", "note": "ATR 不可用"}
+            print(f"[{symbol} 启动对账] ⚠️ ATR 不可用，无法建立保护单")
+            continue
+
+        target, armed, _tick = await _protective_target(
+            client, st, symbol=symbol, ex_side=ex_side, entry_px=entry_px,
+            atr_1h=atr_1h)
+        try:
+            res = await reconcile_protective(
+                client, symbol=symbol, side=side, quantity=abs(ex_side),
+                required_trigger=target)
+        except Exception as exc:  # noqa: BLE001
+            set_protection_state(st, symbol, state="UNKNOWN",
+                                 note=f"对账失败: {exc}")
+            summary[symbol] = {"state": "UNKNOWN", "note": str(exc)}
+            continue
+
+        if res.state == ProtectionState.PROTECTED:
+            book = book_for_symbol(st, symbol)
+            if book is not None and res.stop is not None:
+                book["exchange_stop"] = {"algo_id": res.stop.algo_id,
+                                         "trigger": res.stop.trigger_price,
+                                         "armed": armed}
+            set_protection_state(st, symbol, state="PROTECTED",
+                                 note=f"{res.action}（触发价 "
+                                      f"{res.stop.trigger_price if res.stop else 0:.2f}）",
+                                 algo_id=(res.stop.algo_id if res.stop else ""),
+                                 trigger=(res.stop.trigger_price if res.stop else 0.0))
+            summary[symbol] = {"state": "PROTECTED",
+                               "trigger": (res.stop.trigger_price if res.stop else 0.0)}
+            print(f"[{symbol} 启动对账] 已受保护：{res.action}"
+                  + (f"；触发价 {res.stop.trigger_price:.2f}" if res.stop else ""))
+            continue
+
+        # 没有合格保护单 → 立刻补一张（有仓裸奔是最高优先级）
+        print(f"[{symbol} 启动对账] ⚠️ 有仓但无合格保护单，立即补挂")
+        acted = await manage_exchange_stop(
+            client, st, symbol=symbol, ex_side=ex_side, entry_px=entry_px,
+            atr_1h=atr_1h, execute=execute)
+        ps = protection_state(st, symbol)
+        summary[symbol] = {"state": ps.get("state", "UNKNOWN"),
+                           "note": ps.get("note", "")}
+        if ps.get("state") != "PROTECTED":
+            print(f"[{symbol} 启动对账] ⚠️ 保护单仍未确认，该标的禁止开新仓")
+    return summary
+
+
 async def protective_stop(client: BinanceTestnetClient, st: dict, *,
                           symbol: str, ex_side: float, entry_px: float,
                           atr_1h: float, mark: float, execute: bool,
-                          tag: str = ORDER_TAG) -> Optional[dict]:
+                          tag: str = ORDER_TAG,
+                          exchange_protected: bool = False) -> Optional[dict]:
     """正常止损（1.5×ATR_1H）与保本止损（浮盈 +1.5×ATR 后移到入场价）。
 
     与 disaster_limit_stop 的分工：本函数管更近的两档，它在更远处（3×ATR），
@@ -908,6 +1866,17 @@ async def protective_stop(client: BinanceTestnetClient, st: dict, *,
     hit = (mark <= stop_px) if ex_side > 0 else (mark >= stop_px)
     if not hit:
         return None
+
+    # 交易所保护单已确认时，平仓由交易所的 STOP_MARKET 完成。这里再发一张
+    # 穿盘口限价单会和它抢同一笔仓位：先成交的那张平掉，后一张因 reduceOnly
+    # 无仓被拒（不会反向开仓，但会白白多付一次 taker 手续费）。
+    if exchange_protected:
+        if not book.get("stop_defer_logged"):
+            print(f"[{symbol} {why}已触发] 交易所保护单已接管平仓，"
+                  f"软件止损不再重复下单")
+            book["stop_defer_logged"] = True
+        return None
+    book.pop("stop_defer_logged", None)
 
     close_side = "SHORT" if ex_side > 0 else "LONG"
     result = await client.place_limit_chase(
@@ -998,18 +1967,36 @@ def _signed_qty(pos) -> float:
 
 
 def _fetch_symbol_bars(symbol: str, now: int):
+    # 15m 信号只在收盘后变化；同一根K线不重复拉400根历史数据。
+    # 5m 已退出实盘，避免为未启用策略继续消耗REST权重。
+    slot15 = (now // (15 * 60 * 1000)) * (15 * 60 * 1000)
+    slot1h = (now // (60 * 60 * 1000)) * (60 * 60 * 1000)
+    cache = getattr(_fetch_symbol_bars, "_cache", {})
+    old = cache.get(symbol)
+    if old and old["slot15"] == slot15 and old["slot1h"] == slot1h:
+        return old["pack"]
     try:
         b15 = _closed_bars(fetch("15m", 400, symbol), SPEC_15M.interval_ms, now)
-        b5 = _closed_bars(fetch("5m", 600, symbol), SPEC_5M.interval_ms, now)
-        b1h = _closed_bars(fetch("1h", 300, symbol), 60 * 60 * 1000, now)
+        b1h = (_closed_bars(fetch("1h", 300, symbol), 60 * 60 * 1000, now)
+               if not old or old["slot1h"] != slot1h else old["b1h"])
     except Exception as exc:  # noqa: BLE001
-        print(f"[{symbol}] 拉 K 线失败: {exc}")
+        n = int(_FETCH_FAIL_STREAK.get(symbol, 0)) + 1
+        _FETCH_FAIL_STREAK[symbol] = n
+        print(f"[{symbol}] 拉 K 线失败（连续 {n} 次）: {exc}")
+        notify("WARNING" if n < 20 else "CRITICAL",
+               f"kline_fetch_fail_{symbol}",
+               f"{symbol} 连续 {n} 次拉 K 线失败，该标的信号处理已停摆",
+               f"最后错误: {type(exc).__name__}: {exc}")
         return None
+    _FETCH_FAIL_STREAK.pop(symbol, None)
     atr1h = atr_wilder(b1h["high"], b1h["low"], b1h["close"], 14)
-    return {
+    pack = {
         "15m": (b15, _align_atr(b15["ts"], SPEC_15M.interval_ms, b1h, atr1h)),
-        "5m": (b5, _align_atr(b5["ts"], SPEC_5M.interval_ms, b1h, atr1h)),
+        "5m": None,
     }
+    cache[symbol] = {"slot15": slot15, "slot1h": slot1h, "b1h": b1h, "pack": pack}
+    _fetch_symbol_bars._cache = cache
+    return pack
 
 
 EXTERNAL_ORDER_SCAN_LIMIT = 500
@@ -1027,37 +2014,44 @@ async def detect_external(
     第一次见到该标的只记基线不判定，这样运行器重启后不会把「重启前就存在
     的仓位」误判成人工干预。
     """
-    last_ms = int(watch.get("last_check_ms") or 0)
-    ex_before = watch.get("last_net")
+    # 兼容字段：重启对账与既有测试依赖 last_check_ms / last_net 的精确值，
+    # 继续按 tick 维护。它们**不再**用作扫描窗口与判定基线。
+    # ⚠ 必须先读后写：下面要用上一 tick 的值给新观察状态做种子，写反了种子
+    # 就变成当前值，等于把基线悄悄推进 —— 又回到「漏检」的老问题。
+    legacy_net = watch.get("last_net")
+    legacy_ms = int(watch.get("last_check_ms") or 0)
     watch["last_check_ms"] = int(now)
     watch["last_net"] = float(ex_now)
-    if last_ms <= 0 or ex_before is None:
-        return None
-    try:
-        orders = await client.all_orders(
-            symbol, start_time=last_ms, limit=EXTERNAL_ORDER_SCAN_LIMIT
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"[{symbol}] 人工干预检测失败: {exc}")
-        return None
-    hits = external_fills(orders or [], since_ms=last_ms)
-    if not hits:
-        return None
-    kind = classify_external(float(ex_before), float(ex_now), min_qty=MIN_QTY)
-    if kind is None:
-        return None
-    parts = "；".join(
-        f"{o.get('side')} {o.get('executedQty')} @{o.get('avgPrice')} "
-        f"[{str(o.get('clientOrderId') or '')[:14]}]"
-        for o in hits[:4]
+
+    # ⚠ 2026-10-04 修复：旧实现每个 tick 推进 last_check_ms/last_net，却每 60
+    # 秒才扫一次订单，扫描执行时查询起点是「上一个 tick」而不是「上一次扫描」，
+    # 中间约 45 秒的窗口永远扫不到 —— 用户在非扫描 tick 手工平仓时，系统会
+    # 因为「没检出人工干预」而把仓位补回来。
+    #
+    # 现在扫描窗口 = 距上次扫描的全部时间，基线只在扫描时推进；并且净仓一变
+    # 就立刻立 pending 闸门，禁止自动补仓，直到扫描给出原因。见 external_guard。
+    ew = _ext_watch(symbol)
+    if ew.scan_net is None and legacy_net is not None:
+        # 进程重启后**续用**已落盘的基线，而不是盲目重新起算：停机期间发生的
+        # 净仓变化（无论谁造成的）下一轮就能定性，不会因为「重新起算」而漏掉。
+        # 若变化其实是本运行器自己的单子成交，扫描会认出委托号前缀并判为非
+        # 人工干预，闸门随即解除，不会误伤。
+        ew.scan_net = float(legacy_net)
+        ew.last_scan_ms = int(watch.get("last_scan_ms") or legacy_ms or 0)
+    note_net(ew, ex_now=ex_now, now=now, min_qty=MIN_QTY)
+    watch["scan_pending"] = bool(ew.pending)
+    hit = await scan_external(
+        client, symbol, ex_now=ex_now, now=now, watch=ew, min_qty=MIN_QTY,
+        classify=classify_external, fills_fn=external_fills,
     )
-    return {
-        "kind": kind,
-        "ex_before": float(ex_before),
-        "ex_after": float(ex_now),
-        "detail": (f"{symbol} 交易所净额 {float(ex_before):+.4f} → "
-                   f"{float(ex_now):+.4f}；{parts}"),
-    }
+    watch["scan_pending"] = bool(ew.pending)
+    watch["scan_reason"] = ew.last_reason
+    if hit:
+        return hit
+    if ew.pending:
+        print(f"[{symbol} 人工干预] 净仓变化未定性，已暂停自动补仓"
+              f"（{ew.last_reason}）")
+    return None
 
 
 async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
@@ -1077,6 +2071,23 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
     pos = await client.get_position(symbol)
     ex_side = _signed_qty(pos)
     entry_px = float(getattr(pos, "entry_price", 0.0) or 0.0)
+
+    # 交易所保护单已成交 → **必须先于人工干预判定**。
+    #
+    # 2026-10-04 实测事故：BTC 保护单 20:47 触发平仓，但本判定原先排在
+    # apply_external 之后 —— 账本已被当作「人工减仓」清空，前置守卫
+    # `if not book.get("entry")` 直接返回 False，保护单成交判定**永远不可能
+    # 生效**：成交被误记成人工干预，没有正确归属，也没有任何告警。
+    #
+    # 顺序原则：**先认出自己的动作，再怀疑别人。**
+    # 开销可忽略：有仓时首行就返回；只有「已空仓但账本还记着仓」才会查单。
+    try:
+        if await clear_ledger_if_stop_fired(client, st, symbol=symbol,
+                                           ex_side=ex_side):
+            return
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{symbol} 保护单成交判定] 异常: {exc}")
+
     # 人工干预检测：必须排在信号处理与净仓同步之前。
     # 2026-10-02 19:47 用户在网页手动平仓, 11/35 秒后被运行器原样补回 ——
     # 就是因为这里没有区分「谁动的仓」。
@@ -1143,12 +2154,50 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
             return True
         return False
 
+    # 止盈成交对账必须排在保护单管理之前：先把账本对齐到交易所实际净仓，
+    # 后面的「缺保护单」判断和净仓同步才不会被虚高的账本带偏。
+    if ex_side != 0.0 and TP_ENABLED and execute:
+        try:
+            await reconcile_tp_fills(client, st, symbol=symbol, ex_side=ex_side)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{symbol} 止盈成交判定] 异常: {type(exc).__name__}: {exc}")
+
+    # 交易所预挂保护单：先确保交易所有一张覆盖全仓的条件单。
+    # 顺序必须在软件止损之前 —— 后面要按它是否确认来决定要不要软件兜底下单。
+    ex_stop_state = ""
+    if ex_side != 0.0 and EXCHANGE_STOPS_ENABLED and execute:
+        try:
+            await manage_exchange_stop(
+                client, st, symbol=symbol, ex_side=ex_side,
+                entry_px=entry_px, atr_1h=atr_1h, execute=execute)
+            ex_stop_state = str(protection_state(st, symbol).get("state") or "")
+        except Exception as exc:  # noqa: BLE001 保护单管理失败不得拖垮整个标的
+            print(f"[{symbol} 保护单] 管理异常: {type(exc).__name__}: {exc}")
+            ex_stop_state = "UNKNOWN"
+
+    # 分批止盈：按 TP_STAGES 逐批挂单
+    if ex_side != 0.0 and TP_ENABLED and execute:
+        try:
+            await manage_take_profit(
+                client, st, symbol=symbol, ex_side=ex_side,
+                entry_px=entry_px, atr_1h=atr_1h, execute=execute)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{symbol} 止盈] 管理异常: {type(exc).__name__}: {exc}")
+
     # 正常止损（1.5×ATR）/ 保本止损：比灾难止损近，必须先判。
     try:
-        mark_now = float(await client.mark_price(symbol))
+        if ex_side == 0.0:
+            mark_now = 0.0
+        else:
+            mark_now = float(latest_mark_price(symbol) or 0.0)
+            if mark_now <= 0:
+                mark_now = float(getattr(pos, "mark_price", 0.0) or 0.0)
+            if mark_now <= 0:
+                mark_now = float(await client.mark_price(symbol))
         stopped = await protective_stop(
             client, st, symbol=symbol, ex_side=ex_side, entry_px=entry_px,
             atr_1h=atr_1h, mark=mark_now, execute=execute, tag=tag15,
+            exchange_protected=(ex_stop_state == "PROTECTED"),
         )
     except Exception:
         rollback("正常/保本止损调用失败")
@@ -1199,9 +2248,13 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
             before = json.dumps(book.get("entry"), sort_keys=True)
             did = process_strategy(
                 spec, book, bars, atr_al,
-                equity=equity, block=block or bool(watch.get("paused")),
+                equity=equity,
+                block=(block or bool(watch.get("paused"))
+                       or bool(protection_blocked(st, symbol))),
                 now=now, execute=execute,
                 trend=trend_side(st, symbol),
+                # 组合级保证金预算：其它标的已占的额度先扣掉（先到先得）。
+                others_margin=other_symbol_margin(st, symbol, float(LEVERAGE)),
             )
             after = json.dumps(book.get("entry"), sort_keys=True)
             if did or before != after:
@@ -1214,7 +2267,11 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
     if changed:
         # 人工平仓后「等下一根信号」：账本被新信号改动即解除持有。
         clear_hold_on_new_signal(st, symbol)
-    allow_sync = not watch.get("paused") and not watch.get("hold")
+    # 自动补仓闸门（需求 D）：
+    #   1) 人工干预净仓变化未定性 → 禁止用 desired_net 自动补仓
+    #   2) 保护单未确认 → 禁止开新仓（宁可错过信号，不能裸奔）
+    allow_sync = (not watch.get("paused") and not watch.get("hold")
+                  and not watch.get("scan_pending"))
     if allow_sync and (changed or
                        abs(desired_net(st, symbol) - ex_side) >= SYNC_MIN_DELTA):
         try:
@@ -1238,6 +2295,19 @@ async def process_symbol(client: BinanceTestnetClient, st: dict, symbol: str, *,
                 print(f"[{symbol} 幽灵仓位清零] 交易所空仓但账本有仓，"
                       f"已清零该标的账本，等下一根信号")
         elif result is not None:
+            # 首笔成交一出现就补挂保护单（需求 B）——不能等下一个 tick，
+            # 追价最长 180 秒，这段窗口里新仓位必须已经有保护。
+            if ex_side != 0.0 or abs(desired_net(st, symbol)) >= MIN_QTY:
+                try:
+                    pos_after = await client.get_position(symbol)
+                    side_after = _signed_qty(pos_after)
+                    px_after = float(getattr(pos_after, "entry_price", 0.0) or 0.0)
+                    if abs(side_after) >= MIN_QTY and px_after > 0:
+                        await manage_exchange_stop(
+                            client, st, symbol=symbol, ex_side=side_after,
+                            entry_px=px_after, atr_1h=atr_1h, execute=execute)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[{symbol} 保护单] 成交后补挂异常: {exc}")
             # 部分成交对齐：委托可能只成交了一部分，账本不能继续记着没成交的部分。
             # 2026-10-04 ETH 目标 -15.854 实际只到 -7.430，账本却一直虚高。
             raw = getattr(result, "raw", None)
@@ -1312,6 +2382,10 @@ async def main() -> int:
     ap.add_argument("--once", action="store_true")
     args = ap.parse_args()
 
+    # 单实例闸门（2026-10-04 验收 B1）。只在下单模式取锁，避免挡住只读观察脚本。
+    if args.execute and not acquire_single_instance_lock():
+        return 2
+
     client = BinanceTestnetClient()
     if not client.configured:
         print("未配置 Testnet 密钥"); return 1
@@ -1320,6 +2394,9 @@ async def main() -> int:
     if mode.value == "live":
         print("拒绝启动: TRADING_MODE=live 被安全闸门阻断"); return 1
     print(f"运行模式: {mode.value}")
+    notify("INFO", "runner_started", "交易运行器已启动",
+           f"pid={os.getpid()} mode={mode.value} "
+           f"{'真实下单' if args.execute else '仅观察'} interval={args.interval}s")
 
     # ---- 市场一致性闸门 ----------------------------------------------------
     # 2026-10-02 事故的硬性防复发措施: 行情腿与下单腿必须同市场。
@@ -1342,6 +2419,26 @@ async def main() -> int:
     await client.sync_time()
     print(f"已连接 {ep.label} | 模式={'真实下单' if args.execute else '仅观察'}")
 
+    # ---- 启动保护单对账（需求 D）----------------------------------------
+    # 以交易所实仓 + openAlgoOrders 为唯一事实来源。有仓没保护就立刻补挂；
+    # 补不上就把该标的标成 UNPROTECTED，主循环会禁止它开新仓。
+    if EXCHANGE_STOPS_ENABLED:
+        try:
+            _st0 = load_state()
+            summary = await reconcile_protection(client, _st0,
+                                                 execute=args.execute)
+            save_state(_st0)
+            print("启动保护单对账结果：")
+            for _sym, _info in summary.items():
+                print(f"  {_sym}: {_info}")
+        except Exception as exc:  # noqa: BLE001 对账失败不阻断启动，但会记录
+            print(f"[启动对账] 失败（不阻断启动，主循环仍会逐轮修复）："
+                  f"{type(exc).__name__}: {exc}")
+            notify("WARNING", "startup_reconcile_failed",
+                   "启动保护单对账失败，保护状态未知",
+                   f"{type(exc).__name__}: {exc}")
+            print(traceback.format_exc())
+
     if args.execute:
         try:
             prepared = await prepare_testnet_execution(client)
@@ -1363,6 +2460,7 @@ async def main() -> int:
     save_state(st)
     save_heartbeat(status="starting", execute=args.execute,
                    detail="市场一致性与启动预检通过")
+    start_market_stream(TRADE_SYMBOLS)
     try:
         while True:
             try:
