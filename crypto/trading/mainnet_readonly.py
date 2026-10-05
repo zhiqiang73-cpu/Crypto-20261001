@@ -63,7 +63,16 @@ def signed_account_query(api_secret: str, server_time_ms: int,
 def _safe_error(status: int, body: str) -> MainnetReadOnlyError:
     # 币安 body 只携带 code/msg；截断是为了避免代理页或异常页污染日志/前端。
     text = " ".join(str(body or "").split())[:300]
-    return MainnetReadOnlyError(f"主网 Futures 只读预检失败 HTTP {status}: {text}")
+    hint = ""
+    if "-2015" in text:
+        hint = (
+            "（常见原因：该 Key 未开启「合约」权限，或 IP 白名单未包含本机 IP。"
+            "请在币安 → API 管理中编辑该 Key：勾选「启用合约」，确认 IP 白名单后"
+            "保存，再回到本页重新测试。若现货可读、合约 401，通常是缺少合约权限。）"
+        )
+    return MainnetReadOnlyError(
+        f"主网 Futures 只读预检失败 HTTP {status}: {text}{hint}"
+    )
 
 
 async def verify_usdm_credentials_readonly(
