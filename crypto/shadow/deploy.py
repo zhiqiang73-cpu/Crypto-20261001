@@ -764,16 +764,35 @@ async def prepare_testnet_execution(client: BinanceTestnetClient) -> dict:
 
     检查顺序刻意保守：
 
-    1. 任一标的有外部挂单时拒绝启动，绝不擅自取消；
+    1. 放行与当前持仓匹配的、系统生成的 reduce-only 止盈挂单；
+       其他普通挂单仍拒绝启动，绝不混单或擅自取消；
     2. 需要改持仓模式 / 逐仓 / 杠杆但该标的有仓时拒绝启动，绝不混改；
     3. 空仓且没有挂单时才把该标的设成策略规格的「单向、10x、逐仓」；
     4. 每个写入操作之后重新读取并验证，不是只相信接口没有报错。
 
     本函数只有 `--execute` 才调用。观察模式严格只读。
     """
+    positions = {}
+    for symbol in TRADE_SYMBOLS:
+        positions[symbol] = await client.get_position(symbol)
+
     leftover = []
     for symbol in TRADE_SYMBOLS:
-        leftover.extend(await client.get_open_orders(symbol))
+        pos = positions[symbol]
+        qty = float(getattr(pos, "quantity", 0.0) or 0.0)
+        pos_side = str(getattr(pos, "side", "") or "").upper()
+        expected_close_side = "SELL" if pos_side == "LONG" else (
+            "BUY" if pos_side == "SHORT" else "")
+        for order in await client.get_open_orders(symbol):
+            client_id = str(order.get("clientOrderId", ""))
+            is_managed_tp = (
+                abs(qty) > 1e-12
+                and bool(order.get("reduceOnly"))
+                and str(order.get("side", "")).upper() == expected_close_side
+                and client_id.startswith("tp")
+            )
+            if not is_managed_tp:
+                leftover.append(order)
     if leftover:
         raise RuntimeError(
             f"检测到 {len(leftover)} 笔未完成委托；拒绝启动策略以免混单。"
@@ -784,7 +803,7 @@ async def prepare_testnet_execution(client: BinanceTestnetClient) -> dict:
     settings_by_symbol = {}
     occupied = []
     for symbol in TRADE_SYMBOLS:
-        pos = await client.get_position(symbol)
+        pos = positions[symbol]
         settings = await client.get_position_settings(symbol)
         settings_by_symbol[symbol] = settings
         has_position = abs(float(getattr(pos, "quantity", 0.0) or 0.0)) > 1e-12
