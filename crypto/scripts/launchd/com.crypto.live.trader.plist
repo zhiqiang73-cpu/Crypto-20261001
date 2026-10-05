@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+<key>WorkingDirectory</key>
+<string>/Users/zengyun/我的AI/crypto/.work/rt-dev/crypto</string>
+<key>RunAtLoad</key>
+<true/>
+<key>KeepAlive</key>
+<true/>
+<key>ThrottleInterval</key>
+<integer>10</integer>
+<key>ProcessType</key>
+<string>Background</string>
+<key>EnvironmentVariables</key>
+<dict>
+<key>TRADING_MODE</key>
+<string>live</string>
+<key>CONFIRM_MAINNET</key>
+<string>YES_I_UNDERSTAND</string>
+<key>PYTHONPATH</key>
+<string>/Users/zengyun/我的AI/crypto/.work/rt-dev/crypto</string>
+<key>PYTHONDONTWRITEBYTECODE</key>
+<string>1</string>
+<key>PYTHONUNBUFFERED</key>
+<string>1</string>
+</dict>
+<key>Label</key>
+<string>com.crypto.live.trader</string>
+<key>ProgramArguments</key>
+<array>
+<string>/usr/bin/python3</string>
+<string>-m</string>
+<string>shadow.deploy</string>
+<string>--execute</string>
+<string>--interval</string>
+<string>15</string>
+</array>
+<key>StandardOutPath</key>
+<string>/Users/zengyun/我的AI/crypto/.work/rt-dev/crypto/runtime/logs/com.crypto.live.trader.out.log</string>
+<key>StandardErrorPath</key>
+<string>/Users/zengyun/我的AI/crypto/.work/rt-dev/crypto/runtime/logs/com.crypto.live.trader.err.log</string>
+</dict>
+</plist>

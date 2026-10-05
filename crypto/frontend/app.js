@@ -1420,7 +1420,7 @@
           });
           if (d.ok) {
             note().textContent =
-              `已保存（${d.mainnet_key_masked}）。未启用主网交易，运行器未改动。`;
+              `已保存（${d.mainnet_key_masked}）。密钥已就绪，实盘运行器启动后生效。`;
             $("mainnetKeyInput").value = "";
             $("mainnetSecretInput").value = "";
           } else {

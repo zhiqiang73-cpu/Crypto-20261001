@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+<key>WorkingDirectory</key>
+<string>/Users/zengyun/我的AI/crypto/.work/rt-dev/crypto</string>
+<key>RunAtLoad</key>
+<true/>
+<key>KeepAlive</key>
+<true/>
+<key>ThrottleInterval</key>
+<integer>10</integer>
+<key>ProcessType</key>
+<string>Background</string>
+<key>EnvironmentVariables</key>
+<dict>
+<key>PYTHONPATH</key>
+<string>/Users/zengyun/我的AI/crypto/.work/rt-dev/crypto</string>
+<key>PYTHONDONTWRITEBYTECODE</key>
+<string>1</string>
+<key>PYTHONUNBUFFERED</key>
+<string>1</string>
+</dict>
+<key>Label</key>
+<string>com.crypto.live.panel</string>
+<key>ProgramArguments</key>
+<array>
+<string>/usr/bin/python3</string>
+<string>-m</string>
+<string>review.panel_server</string>
+</array>
+<key>StandardOutPath</key>
+<string>/Users/zengyun/我的AI/crypto/.work/rt-dev/crypto/runtime/logs/com.crypto.live.panel.out.log</string>
+<key>StandardErrorPath</key>
+<string>/Users/zengyun/我的AI/crypto/.work/rt-dev/crypto/runtime/logs/com.crypto.live.panel.err.log</string>
+</dict>
+</plist>
