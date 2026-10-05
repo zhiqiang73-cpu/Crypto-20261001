@@ -100,6 +100,10 @@ class _PassiveStub(BinanceTestnetClient):
         ask=83000.50,
         tick="0.10",
         step="0.001",
+        partial_fills=None,
+        cross_partial=None,
+        book_seq=None,
+        min_notional=0.0,
     ) -> None:
         super().__init__(
             api_key="stub-key",
@@ -112,6 +116,13 @@ class _PassiveStub(BinanceTestnetClient):
         self.fill_crossing = fill_crossing
         self.reject_steps = set(reject_steps)
         self.requery_filled = requery_filled
+        # {档位: 占请求量的比例} —— 模拟交易所只吃到一部分 (2026-10-04 P0 回归)。
+        self.partial_fills = dict(partial_fills or {})
+        self.cross_partial = cross_partial
+        # 逐次变化的盘口, 用来验证跨档成交的加权均价。
+        self.book_seq = list(book_seq or [])
+        self._book_i = 0
+        self._min_notional = float(min_notional)
         self._bid = float(bid)
         self._ask = float(ask)
         self._tick = float(tick)
@@ -122,10 +133,17 @@ class _PassiveStub(BinanceTestnetClient):
     async def _lot_step(self, symbol=None) -> float:
         return self._step
 
+    async def min_notional(self, symbol=None) -> float:
+        return self._min_notional
+
     async def price_tick(self, symbol=None) -> float:
         return self._tick
 
     async def book_ticker(self, symbol=None):
+        if self.book_seq:
+            b = self.book_seq[min(self._book_i, len(self.book_seq) - 1)]
+            self._book_i += 1
+            return {"bid": b[0], "ask": b[1]}
         return {"bid": self._bid, "ask": self._ask}
 
     # --- 下单 ---------------------------------------------------------
@@ -147,7 +165,14 @@ class _PassiveStub(BinanceTestnetClient):
                 ok=False, filled=0.0, qty=quantity,
                 error="POST_ONLY_REJECT: -5022 could not be executed as maker",
             )
-        if self.fill_crossing and not kw.get("post_only"):
+        post_only = bool(kw.get("post_only"))
+        if not post_only and self.cross_partial is not None:
+            return _order_result(ok=True, filled=quantity * self.cross_partial,
+                                 avg=price, qty=quantity)
+        if idx in self.partial_fills:
+            return _order_result(ok=True, filled=quantity * self.partial_fills[idx],
+                                 avg=price, qty=quantity)
+        if self.fill_crossing and not post_only:
             return _order_result(ok=True, filled=quantity, avg=price, qty=quantity)
         if self.fill_at_step is not None and idx == self.fill_at_step:
             return _order_result(ok=True, filled=quantity, avg=price, qty=quantity)
@@ -284,6 +309,79 @@ class TestPassiveFill(unittest.TestCase):
 class TestTimeoutFallback(unittest.TestCase):
     """窗口耗尽 → 兜底穿盘口保证成交 (taker)。"""
 
+    def test_partial_fill_does_not_end_the_chase(self):
+        """2026-10-04 P0 回归：部分成交后必须继续追剩余量。
+
+        真实事故：目标 0.2010 BTC 只成交 0.0048（2.4%），被动尝试仅 1 次就
+        收工，剩下 97.6% 既没继续挂、也没走兜底 —— 仓位凭空消失。
+        这里断言：第一档只吃到 40% 时，必须再挂一档把剩余 60% 追回来。
+        """
+        c = _PassiveStub(partial_fills={0: 0.4}, fill_at_step=1)
+        res = _run(c.place_limit_chase("LONG", 0.010))
+        self.assertTrue(res.ok, msg=f"error={res.error}")
+        self.assertEqual(len(c.calls), 2, "部分成交后必须继续挂下一档")
+        self.assertAlmostEqual(c.calls[1]["qty"], 0.006, places=6)
+        self.assertAlmostEqual(res.cum_filled_qty, 0.010, places=6)
+        self.assertEqual(res.raw["chase"]["maker_filled"], 0.010)
+        self.assertEqual(res.raw["chase"]["taker_filled"], 0.0)
+
+    def test_partial_fills_accumulate_across_three_attempts(self):
+        """连续三档各吃一部分，总量必须逐档累加而不是只记最后一次。"""
+        # 比例刻意取能落在最小变动单位 (0.001) 网格上的值：剩余量每次都会按
+        # lot_step 向下取整，取整损失是正确行为，不该被算成 bug。
+        c = _PassiveStub(partial_fills={0: 0.4, 1: 0.5, 2: 1.0})
+        res = _run(c.place_limit_chase("LONG", 0.010))
+        self.assertTrue(res.ok, msg=f"error={res.error}")
+        self.assertEqual(len(c.calls), 3)
+        self.assertAlmostEqual(res.cum_filled_qty, 0.010, places=6)
+        for got, want in zip([a["filled"] for a in res.raw["chase"]["attempts"]],
+                             [0.004, 0.003, 0.003]):
+            self.assertAlmostEqual(got, want, places=6)
+        for call, want in zip(c.calls, [0.010, 0.006, 0.003]):
+            self.assertAlmostEqual(call["qty"], want, places=6)
+
+    def test_avg_price_is_weighted_across_partial_fills(self):
+        """跨档成交的均价必须按成交额加权，不能取最后一档的价。"""
+        c = _PassiveStub(
+            partial_fills={0: 0.5}, fill_at_step=1,
+            book_seq=[(83000.00, 83000.50), (84000.00, 84000.50)],
+        )
+        res = _run(c.place_limit_chase("LONG", 0.010))
+        self.assertTrue(res.ok, msg=f"error={res.error}")
+        self.assertAlmostEqual(c.calls[0]["price"], 83000.00, places=4)
+        self.assertAlmostEqual(c.calls[1]["price"], 84000.00, places=4)
+        self.assertAlmostEqual(res.avg_price, 83500.00, places=4)
+
+    def test_partial_then_cross_completes_and_flags_both_sides(self):
+        """被动吃到一半 + 兜底补齐：总量是全部，且 maker/taker 分开记账。"""
+        c = _PassiveStub(partial_fills={0: 0.5}, fill_crossing=True)
+        res = _run(c.place_limit_chase("LONG", 0.010,
+                                       window_sec=_TINY_WINDOW))
+        self.assertTrue(res.ok, msg=f"error={res.error}")
+        self.assertAlmostEqual(res.cum_filled_qty, 0.010, places=6)
+        meta = res.raw["chase"]
+        self.assertAlmostEqual(meta["maker_filled"], 0.005, places=6)
+        self.assertAlmostEqual(meta["taker_filled"], 0.005, places=6)
+        # 兜底只对剩余量下单，不得重复整笔。
+        self.assertAlmostEqual(c.calls[-1]["qty"], 0.005, places=6)
+
+    def test_partial_then_exhausted_still_reports_the_partial_fill(self):
+        """兜底也没成交时，已拿到的被动成交量不得被丢掉。"""
+        c = _PassiveStub(partial_fills={0: 0.5}, fill_crossing=False)
+        res = _run(c.place_limit_chase("LONG", 0.010,
+                                       window_sec=_TINY_WINDOW))
+        self.assertTrue(res.ok, "部分成交不应被判为失败")
+        self.assertAlmostEqual(res.cum_filled_qty, 0.005, places=6)
+        self.assertIn("partial_then_exhausted", res.error)
+
+    def test_remainder_below_min_notional_stops_cleanly(self):
+        """剩余量小于最小名义金额时不再空转，按已成交量收工。"""
+        c = _PassiveStub(partial_fills={0: 0.9999}, min_notional=100.0)
+        res = _run(c.place_limit_chase("LONG", 0.010))
+        self.assertTrue(res.ok, msg=f"error={res.error}")
+        self.assertEqual(len(c.calls), 1, "剩余量已低于最小名义金额，不应再挂")
+        self.assertAlmostEqual(res.cum_filled_qty, 0.009999, places=6)
+
     def test_window_exhausted_crosses_the_book(self):
         c = _PassiveStub(fill_crossing=True)  # 被动单不成交, 兜底成交
         res = _run(c.place_limit_chase("LONG", 0.001, window_sec=_TINY_WINDOW))
@@ -329,6 +427,12 @@ class TestTimeoutFallback(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertIn("passive_exhausted", res.error)
         self.assertEqual(res.cum_filled_qty, 0.0)
+        # 2026-10-03: 失败路径也必须写全 chase meta 键, 否则日志把
+        # 「被动N次」读成「被动0次」, 真实失败原因 (如保证金不足) 无从判断。
+        meta = res.raw["chase"]
+        for key in ("attempts", "steps_used", "final_step", "likely_maker",
+                    "passive_attempts"):
+            self.assertIn(key, meta)
 
     def test_fallback_cannot_leave_a_resting_gtc_order(self):
         c = _PassiveStub(fill_crossing=False)
@@ -362,6 +466,107 @@ class TestTimeoutFallback(unittest.TestCase):
         _run(c.place_limit_chase("LONG", 0.001, window_sec=600))
         passive = [x for x in c.calls if x["post_only"]]
         self.assertLessEqual(len(passive), PASSIVE_MAX_REPRICE)
+
+
+class _RestingStub(_PassiveStub):
+    """让 place_limit_order 真的跑 price_watch 轮询, 以验证驻留行为。
+
+    _PassiveStub 直接替换了 place_limit_order, 因此跑不到新的「盘口不动就
+    不撤单」逻辑。本 stub 复刻它的轮询语义: 每轮问一次 price_watch, 返回真值
+    就收工(代表撤单), 否则一直等到本档耗尽。
+    """
+
+    def __init__(self, *, book_moves_after=None, **kw):
+        super().__init__(**kw)
+        self.book_moves_after = book_moves_after
+        self.book_reads = 0
+        self.polls = 0
+
+    async def book_ticker(self, symbol=None):
+        self.book_reads += 1
+        if (self.book_moves_after is not None
+                and self.book_reads > self.book_moves_after):
+            return {"bid": 83100.0, "ask": 83100.5}
+        return {"bid": 83000.0, "ask": 83000.5}
+
+    async def place_limit_order(self, side, qty, px, symbol=None, *,
+                                post_only=False, price_watch=None,
+                                fill_timeout_sec=6.0, **kw):
+        self.calls.append({"qty": qty, "price": px, "post_only": post_only,
+                           "fill_timeout_sec": fill_timeout_sec})
+        if not post_only:
+            return _order_result(ok=False, filled=0.0, qty=qty, cid="cross")
+        for _ in range(80):
+            self.polls += 1
+            await asyncio.sleep(0.004)      # 让 deadline 真实推进
+            if price_watch is not None and await price_watch():
+                break
+        return _order_result(ok=False, filled=0.0, qty=qty, cid="passive")
+
+
+class TestQueuePositionPreserved(unittest.TestCase):
+    """2026-10-04 改造: 盘口不变时不撤单, 保住排队位置。
+
+    交易所按「价格优先、时间优先」撮合, 撤单重挂等于排回队尾。
+    实测 17:00 那单 180 秒里撤挂 28 次, maker 成交率只剩 6%。
+    """
+
+    def test_stable_book_does_not_requote(self):
+        c = _RestingStub(fill_at_step=None)
+        _run(c.place_limit_chase("LONG", 0.001, window_sec=0.1))
+        passive = [x for x in c.calls if x["post_only"]]
+        self.assertEqual(len(passive), 1,
+                         "盘口没动就不该撤单重挂, 否则每次都在重排队尾")
+
+    def test_moving_book_still_requotes(self):
+        c = _RestingStub(fill_at_step=None, book_moves_after=3)
+        _run(c.place_limit_chase("LONG", 0.001, window_sec=0.1))
+        passive = [x for x in c.calls if x["post_only"]]
+        self.assertGreater(len(passive), 1, "盘口动了必须跟盘口重挂")
+        self.assertNotEqual(passive[0]["price"], passive[-1]["price"],
+                            "重挂价格应跟随盘口")
+
+    def test_resting_order_gets_full_window(self):
+        """盘口不动时, 挂单的等待时间应覆盖整个剩余窗口, 而不是只有几秒。"""
+        c = _RestingStub(fill_at_step=None)
+        _run(c.place_limit_chase("LONG", 0.001, window_sec=120))
+        first = [x for x in c.calls if x["post_only"]][0]
+        self.assertGreater(first["fill_timeout_sec"], 60,
+                           "盘口不动就该挂到窗口结束, 不能几秒一撤")
+
+    def test_safety_checkpoint_runs_while_resting(self):
+        """驻留期间主循环被占住, 安全检查点必须仍在每个轮询周期运行。"""
+        seen = {"n": 0}
+
+        async def on_step(bid, ask):
+            seen["n"] += 1
+            return seen["n"] >= 3
+
+        c = _RestingStub(fill_at_step=None)
+        res = _run(c.place_limit_chase("LONG", 0.001, window_sec=0.5,
+                                       on_step=on_step))
+        self.assertFalse(res.ok)
+        self.assertIn("chase_aborted", res.error)
+        self.assertGreaterEqual(seen["n"], 3)
+
+    def test_abort_keeps_already_filled_maker_qty(self):
+        """中止追价不得抹掉已经拿到的被动成交。"""
+        class PartialThenAbort(_RestingStub):
+            async def place_limit_order(self, side, qty, px, symbol=None, *,
+                                        post_only=False, price_watch=None, **kw):
+                self.calls.append({"qty": qty, "price": px,
+                                   "post_only": post_only,
+                                   "fill_timeout_sec": kw.get(
+                                       "fill_timeout_sec", 0.0)})
+                if not post_only:
+                    return _order_result(ok=False, filled=0.0, qty=qty, cid="x")
+                return _order_result(ok=True, filled=qty, avg=px,
+                                     qty=qty, cid="p")
+
+        c = PartialThenAbort(fill_at_step=None)
+        res = _run(c.place_limit_chase("LONG", 0.001, window_sec=0.1))
+        self.assertTrue(res.ok)
+        self.assertAlmostEqual(res.cum_filled_qty, 0.001, places=6)
 
 
 class TestGuards(unittest.TestCase):

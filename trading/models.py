@@ -102,6 +102,12 @@ class PositionInfo:
     unrealized_pnl: float = 0.0
     leverage: int = 1
     mark_price: float = 0.0
+    # 交易所自己的口径，与币安网页端「数量 / 保证金」两列逐位对应：
+    #   notional = positionRisk.notional（名义价值，USDT，按标记价）
+    #   margin   = positionRisk.isolatedMargin（逐仓实际占用保证金，USDT）
+    # 面板优先直接用这两个字段，不再自行换算，避免与网页端对不上。
+    notional: float = 0.0
+    margin: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

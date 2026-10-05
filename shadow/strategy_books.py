@@ -26,6 +26,15 @@ class StrategySpec:
     signal_rule: str
     cold_start: bool
     label: str
+    confirm_next: bool = False
+    require_break: bool = False
+    require_macd: bool = False
+    # 同向有效交叉可分层加仓；1 表示沿用旧版「同向忽略」。
+    # 它是硬上限，不是优化参数，防止趋势震荡中无限叠加杠杆。
+    max_layers: int = 1
+    # 每层风险比例；None 表示所有层沿用模块级 RISK_R。
+    # BTC 15m 采用「首层 1%，后续层 0.5%」的金字塔风险预算。
+    layer_risk_r: Optional[Tuple[float, ...]] = None
 
 
 SPEC_15M = StrategySpec(
@@ -37,9 +46,16 @@ SPEC_15M = StrategySpec(
     k_long_max=None,
     k_short_min=None,
     lookback=96,
-    signal_rule="金叉做多 / 死叉做空；不使用 K 极值过滤",
+    signal_rule="当根收盘金叉且 MACD 能量柱为正 → 首层做多 / 已多则同向加一层；"
+                "死叉且 MACD 能量柱为负 → 首层做空 / 已空则同向加一层；"
+                "方向背离丢弃不操作；有效反向则清空全部层后反手；最多 3 层",
     cold_start=False,
     label="BTC 15m",
+    confirm_next=False,
+    require_break=False,
+    require_macd=True,
+    max_layers=3,
+    layer_risk_r=(0.01, 0.005, 0.005),
 )
 SPEC_5M = StrategySpec(
     id="kdj5",
@@ -47,12 +63,16 @@ SPEC_5M = StrategySpec(
     interval="5m",
     interval_ms=5 * 60 * 1000,
     tag="kd5",
-    k_long_max=30.0,
-    k_short_min=70.0,
+    k_long_max=None,
+    k_short_min=None,
     lookback=288,
-    signal_rule="金叉且 K<30 做多 / 死叉且 K>70 做空",
+    signal_rule="当根收盘金叉且 MACD 能量柱为正 → 做多；死叉且能量柱为负 → 做空；"
+                "方向背离的交叉丢弃不操作；不使用 K 极值过滤",
     cold_start=True,
     label="BTC 5m",
+    confirm_next=False,
+    require_break=False,
+    require_macd=True,
 )
 SPEC_ETH_15M = StrategySpec(
     id="eth15",
@@ -63,9 +83,16 @@ SPEC_ETH_15M = StrategySpec(
     k_long_max=None,
     k_short_min=None,
     lookback=96,
-    signal_rule="金叉做多 / 死叉做空；不使用 K 极值过滤",
+    signal_rule="当根收盘金叉且 MACD 能量柱为正 → 首层做多 / 已多则同向加一层；"
+                "死叉且 MACD 能量柱为负 → 首层做空 / 已空则同向加一层；"
+                "方向背离丢弃不操作；有效反向则清空全部层后反手；最多 3 层",
     cold_start=True,
     label="ETH 15m",
+    confirm_next=False,
+    require_break=False,
+    require_macd=True,
+    max_layers=3,
+    layer_risk_r=(0.01, 0.005, 0.005),
 )
 SPEC_ETH_5M = StrategySpec(
     id="eth5",
@@ -73,14 +100,20 @@ SPEC_ETH_5M = StrategySpec(
     interval="5m",
     interval_ms=5 * 60 * 1000,
     tag="e5",
-    k_long_max=30.0,
-    k_short_min=70.0,
+    k_long_max=None,
+    k_short_min=None,
     lookback=288,
-    signal_rule="金叉且 K<30 做多 / 死叉且 K>70 做空",
+    signal_rule="当根收盘金叉且 MACD 能量柱为正 → 做多；死叉且能量柱为负 → 做空；"
+                "方向背离的交叉丢弃不操作；不使用 K 极值过滤",
     cold_start=True,
     label="ETH 5m",
+    confirm_next=False,
+    require_break=False,
+    require_macd=True,
 )
-SPECS = (SPEC_15M, SPEC_5M, SPEC_ETH_15M, SPEC_ETH_5M)
+# 2026-10-03 用户决定：停用 5m 实盘账本（研究建议停用），只保留两条 15m。
+# SPEC_5M / SPEC_ETH_5M 保留定义供回测与研究使用，但不参与实盘净仓。
+SPECS = (SPEC_15M, SPEC_ETH_15M)
 SPEC_BY_ID = {spec.id: spec for spec in SPECS}
 TRADE_SYMBOLS = ("BTCUSDT", "ETHUSDT")
 
@@ -128,17 +161,78 @@ def migrate_state(st: Dict[str, Any]) -> Dict[str, Any]:
     return st
 
 
+CONTRA_5M_MULT = 0.5
+
+
+def entry_layers(entry: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """返回虚拟仓的逐层明细，并兼容旧版单层 ``entry`` 状态。
+
+    旧运行状态只有 ``side/qty/px``，没有 ``layers``。升级后把它视作第 1 层，
+    不重写历史状态；只有下一次有效同向信号才会落为显式分层结构。
+    """
+    if not isinstance(entry, dict):
+        return []
+    raw = entry.get("layers")
+    if isinstance(raw, list):
+        layers = [dict(x) for x in raw if isinstance(x, dict)]
+        if layers:
+            return layers
+    try:
+        return [dict(entry)] if float(entry.get("qty") or 0.0) > 0 else []
+    except (TypeError, ValueError):
+        return []
+
+
+def layer_count(entry: Optional[Dict[str, Any]]) -> int:
+    """当前虚拟仓层数（旧单层状态返回 1）。"""
+    return len(entry_layers(entry))
+
+
 def book_signed_qty(book: Dict[str, Any]) -> float:
+    """策略账本的带方向数量；显式分层时逐层求和。"""
     entry = book.get("entry") or {}
-    qty = float(entry.get("qty") or 0.0)
-    if qty <= 0:
-        return 0.0
-    side = entry.get("side")
-    if side in (1, "LONG", "long"):
-        return qty
-    if side in (-1, "SHORT", "short"):
-        return -qty
-    return 0.0
+    total = 0.0
+    for layer in entry_layers(entry):
+        try:
+            qty = float(layer.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0:
+            continue
+        side = layer.get("side")
+        if side in (1, "LONG", "long"):
+            total += qty
+        elif side in (-1, "SHORT", "short"):
+            total -= qty
+    return total
+
+
+def trend_side(st: Dict[str, Any], symbol: str) -> int:
+    """同标的 15m 虚拟仓方向：多=1，空=-1，空仓=0。"""
+    books = st.get("strategies") or {}
+    for spec in specs_for_symbol(symbol):
+        if spec.interval != "15m":
+            continue
+        qty = book_signed_qty(books.get(spec.id) or {})
+        if qty > 0:
+            return 1
+        if qty < 0:
+            return -1
+        return 0
+    return 0
+
+
+def contra_5m_qty(qty: float, *, interval: str, want: int, trend: int,
+                  step: float = 0.001) -> Tuple[float, str]:
+    """5m 逆着同标的 15m 时仓位减半。15m 自己不减；15m 空仓则 5m 满仓。"""
+    if qty <= 0 or interval != "5m" or want == 0 or trend == 0:
+        return qty, ""
+    if want * trend > 0:
+        return qty, ""
+    halved = math.floor((qty * CONTRA_5M_MULT) / step + 1e-12) * step
+    if halved <= 0:
+        return 0.0, "逆15m减半后数量不足"
+    return halved, "逆15m，仓位减半"
 
 
 def desired_net(st: Dict[str, Any], symbol: str = "BTCUSDT") -> float:
@@ -154,11 +248,126 @@ def desired_nets(st: Dict[str, Any]) -> Dict[str, float]:
     return {symbol: desired_net(st, symbol) for symbol in TRADE_SYMBOLS}
 
 
+def book_margin(book: Dict[str, Any], leverage: float) -> float:
+    """该虚拟账本占用的保证金（按各层自己的入场价折算）。
+
+    逐层算而不是用均价：分层加仓时每层入场价不同，用均价会让「已占用」在
+    新层加入前后漂移，组合预算的判断就不稳。
+    """
+    if leverage <= 0:
+        return 0.0
+    total = 0.0
+    for layer in entry_layers((book or {}).get("entry")):
+        try:
+            qty = abs(float(layer.get("qty") or 0.0))
+            px = float(layer.get("px") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if qty > 0 and px > 0:
+            total += qty * px / leverage
+    return total
+
+
+def other_symbol_margin(st: Dict[str, Any], symbol: str,
+                        leverage: float) -> float:
+    """除本标的以外，其它标的的虚拟账本已占用的保证金。
+
+    组合级预算按「先到先得」分配：先建仓的标的先占额度，后来者只能用剩下的。
+    """
+    books = st.get("strategies") or {}
+    total = 0.0
+    for spec in SPECS:
+        if spec.symbol == symbol:
+            continue
+        total += book_margin(books.get(spec.id) or {}, leverage)
+    return total
+
+
 def clear_symbol_books(st: Dict[str, Any], symbol: str) -> None:
+    """仓位已平：清空账本，并**一并清掉属于上一笔仓位的止损记录**。
+
+    为什么必须清 exchange_stop（2026-10-04 实测 Bug）
+    ------------------------------------------------
+    旧实现只把 entry 置空，exchange_stop.algo_id 会永久留着上一笔的死单号。
+    后果有两层：
+
+      1. 表象：clear_ledger_if_stop_fired 的「形态 B」每 tick 都判定
+         「状态残留」并打印一行，永不停止 —— 实测刷屏。
+      2. 实质（更危险）：manage_exchange_stop 读 book["exchange_stop"] 作为
+         prev_id，非空时走**「收紧」分支**（tighten_protective_stop，先立后破、
+         要去撤一张已不存在的单），而不是「建立」分支。下一笔新仓的止损因此
+         走进异常路径；一旦旧单撤销失败被当成硬失败，res.protects 为假，
+         新仓会被判为「未受保护」并禁止开新仓 —— 止损失效。
+
+    所有调用点都发生在「仓位已平」时，所以清掉它是语义正确的：没有仓位，
+    就没有需要收紧或撤销的止损单。
+    """
     books = st.setdefault("strategies", {})
     for spec in specs_for_symbol(symbol):
         book = books.setdefault(spec.id, empty_book())
         book["entry"] = None
+        book.pop("exchange_stop", None)
+        book.pop("stop_defer_logged", None)
+
+
+def reconcile_symbol_books(st: Dict[str, Any], symbol: str,
+                           actual_signed: float, *,
+                           min_qty: float = 0.001) -> Optional[str]:
+    """把该标的的虚拟账本对齐到交易所**实际**净仓。返回说明；未改动返回 None。
+
+    为什么需要：账本在委托**之前**就写入意图，而委托可能只成交一部分。此前只有
+    「零成交」会回滚，部分成交会留下虚高账本 —— 2026-10-04 ETH 目标 -15.854、
+    实际只成交到 -7.430，账本却一直记着 -15.854。
+
+    差额只可能来自**最近一次下单**，所以从最新那一层往回削，语义正确：老层的
+    成交价与层号都保持不变，或被整层移除。
+
+    只处理「同向、实际比账本少」这一个方向。反手/交易所比账本多都属异常状态，
+    不做猜测，返回说明请人工复核。
+    """
+    books = [st.setdefault("strategies", {}).setdefault(spec.id, empty_book())
+             for spec in specs_for_symbol(symbol)]
+    book_total = sum(book_signed_qty(b) for b in books)
+    target = float(actual_signed)
+    if abs(target - book_total) < min_qty:
+        return None
+
+    if abs(target) < min_qty:                      # 交易所说空仓
+        if abs(book_total) < min_qty:
+            return None
+        clear_symbol_books(st, symbol)
+        return (f"交易所已空仓，账本由 {book_total:+.4f} 归零")
+
+    if book_total == 0 or (book_total > 0) != (target > 0):
+        return (f"账本 {book_total:+.4f} 与实际 {target:+.4f} 方向不符，"
+                f"不做猜测，请人工复核")
+    if abs(target) > abs(book_total):
+        return (f"实际 {target:+.4f} 多于账本 {book_total:+.4f}，"
+                f"非本轮成交所致，请人工复核")
+
+    shortfall = abs(book_total) - abs(target)
+    for book in reversed(books):                   # 从最新加的那本开始削
+        if shortfall < min_qty:
+            break
+        entry = book.get("entry")
+        if not entry:
+            continue
+        layers = entry_layers(entry)
+        want = 1 if book_signed_qty(book) > 0 else -1
+        while layers and shortfall >= min_qty:
+            top = layers[-1]
+            qty = max(0.0, float(top.get("qty") or 0.0))
+            take = min(qty, shortfall)
+            left = qty - take
+            if left < min_qty:
+                layers.pop()
+                shortfall -= qty
+            else:
+                top["qty"] = round(left, 8)
+                shortfall -= take
+        book["entry"] = _aggregate_layers(want, layers) if layers else None
+    return (f"部分成交对齐：账本 {book_total:+.4f} → {target:+.4f}"
+            f"（差额 {shortfall:.4f} 已从最新层扣除）")
 
 
 def signal_reason(spec: StrategySpec, *, gold: bool, dead: bool,
@@ -186,6 +395,44 @@ def _entry_record(want: int, qty: float, px: float, atr: float, ms: int,
     return rec
 
 
+def _aggregate_layers(want: int, layers: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """将同向层合成旧调用方仍可识别的 ``entry`` 顶层视图。
+
+    顶层 ``qty`` 与 ``px`` 分别是总数量和数量加权均价，确保净仓同步、面板与
+    灾难止损继续使用正确的账户级数据；逐层细节完整保留在 ``layers``。
+    """
+    clean = [dict(layer) for layer in layers]
+    total_qty = sum(max(0.0, float(layer.get("qty") or 0.0)) for layer in clean)
+    if total_qty <= 0:
+        raise ValueError("分层仓位总数量必须大于 0")
+    weighted_px = sum(
+        max(0.0, float(layer.get("qty") or 0.0)) * float(layer.get("px") or 0.0)
+        for layer in clean
+    ) / total_qty
+    weighted_atr = sum(
+        max(0.0, float(layer.get("qty") or 0.0)) * float(layer.get("atr") or 0.0)
+        for layer in clean
+    ) / total_qty
+    # 最新层的信号解释作为顶层原因；所有历史原因仍在 layers 内可审计。
+    merged = dict(clean[-1])
+    merged.update({
+        "side": want,
+        "qty": total_qty,
+        "px": weighted_px,
+        "atr": weighted_atr,
+        "layers": clean,
+        "layer_count": len(clean),
+    })
+    return merged
+
+
+def _new_layer(want: int, qty: float, px: float, atr: float, ms: int,
+               meta: Optional[Dict[str, Any]], number: int) -> Dict[str, Any]:
+    layer = _entry_record(want, qty, px, atr, ms, meta)
+    layer["layer"] = number
+    return layer
+
+
 def apply_virtual_signal(
     book: Dict[str, Any],
     *,
@@ -197,32 +444,59 @@ def apply_virtual_signal(
     ms: int,
     block: bool,
     min_qty: float,
+    max_layers: int = 1,
     meta: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], str, bool]:
-    """只改虚拟账本，不下单。返回 (动作, 备注, 是否变化)。"""
+    """只改虚拟账本，不下单。返回 (动作, 备注, 是否变化)。
+
+    有效同向信号可新增一层，最多 ``max_layers`` 层；方向背离在本函数外已经
+    归零为无信号，因此不会加仓、平仓或反手。有效反向会先丢弃全部旧层，再以
+    一层新方向仓位重建账本。
+    """
     want = 1 if sig_long else (-1 if sig_short else 0)
     if want == 0:
         return None, "观察", False
+    max_layers = max(1, int(max_layers))
     entry = book.get("entry")
     if entry is None:
         if block:
             return None, "风控闸门: 不开新仓", False
         if qty < min_qty:
             return None, f"数量不足 qty={qty:.4f}", False
-        book["entry"] = _entry_record(want, qty, px, atr, ms, meta)
+        book["entry"] = _aggregate_layers(
+            want, [_new_layer(want, qty, px, atr, ms, meta, 1)]
+        )
         return ("开多" if want == 1 else "开空"), f"qty={qty:.4f}", True
 
-    cur = 1 if float(entry.get("side") or 0) > 0 else -1
+    current_layers = entry_layers(entry)
+    current_signed = book_signed_qty({"entry": entry})
+    cur = 1 if current_signed > 0 else -1
     if cur == want:
-        return None, "同向持仓", False
+        if block:
+            return None, "风控闸门: 不加仓", False
+        if len(current_layers) >= max_layers:
+            return None, f"同向信号; 已达最大分层 {max_layers}层，不加仓", False
+        if qty < min_qty:
+            return None, f"同向信号; 加仓数量不足 {qty:.4f}", False
+        number = len(current_layers) + 1
+        current_layers.append(_new_layer(want, qty, px, atr, ms, meta, number))
+        book["entry"] = _aggregate_layers(want, current_layers)
+        action = "加多" if want == 1 else "加空"
+        return action, (f"第{number}/{max_layers}层; 本层 {qty:.4f}; "
+                        f"累计 {book['entry']['qty']:.4f}"), True
+
+    cleared = max(1, len(current_layers))
     book["entry"] = None
+    close_action = "平仓" if max_layers == 1 else f"清仓{cleared}层"
     if block:
-        return "平仓", "平仓; 风控阻止反手开新仓", True
+        return close_action, f"{close_action}; 风控阻止反手开新仓", True
     if qty < min_qty:
-        return "平仓", f"平仓; 反手数量不足 {qty:.4f}", True
-    book["entry"] = _entry_record(want, qty, px, atr, ms, meta)
-    action = "平仓并开多" if want == 1 else "平仓并开空"
-    return action, f"平仓; 反手 {qty:.4f}", True
+        return close_action, f"{close_action}; 反手数量不足 {qty:.4f}", True
+    book["entry"] = _aggregate_layers(
+        want, [_new_layer(want, qty, px, atr, ms, meta, 1)]
+    )
+    action = f"{close_action}并开多" if want == 1 else f"{close_action}并开空"
+    return action, f"{close_action}; 反手第1/{max_layers}层 {qty:.4f}", True
 
 
 def runtime_view(st: Dict[str, Any], strategy_id: str,
@@ -238,6 +512,8 @@ def runtime_view(st: Dict[str, Any], strategy_id: str,
     return {
         "last_ts": book.get("last_ts"),
         "entry": book.get("entry"),
+        "layer_count": layer_count(book.get("entry")),
+        "max_layers": spec.max_layers if spec else 1,
         "missed_bars": int(book.get("missed_bars") or 0),
         "missed_signals": int(book.get("missed_signals") or 0),
         "armed": bool(book.get("armed")),
@@ -344,6 +620,8 @@ def position_sources(st: Dict[str, Any],
             "reason": reason,
             "k": None if k_val is None else float(k_val),
             "d": None if d_val is None else float(d_val),
+            "layer_count": layer_count(entry),
+            "max_layers": spec.max_layers,
             "signal_rule": spec.signal_rule,
         })
     return out

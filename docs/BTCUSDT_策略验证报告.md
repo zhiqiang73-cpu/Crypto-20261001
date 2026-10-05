@@ -249,7 +249,7 @@
 ## 附录：复现命令
 
 ```bash
-cd /Users/zengyun/Downloads/我的AI/crypto
+cd /Users/zengyun/我的AI/crypto
 
 # 第一轮：全家族扫描（21 个策略 × 3 周期）
 python3 .work/scripts/edge_scan.py 1d

@@ -1,0 +1,16 @@
+{
+  "tasks": [
+    {
+      "id": "89ee1209",
+      "cron": "7 * * * *",
+      "prompt": "【整点巡检｜crypto 测试网交易系统】在 /Users/zengyun/我的AI/crypto 执行只读健康巡检并输出一行中文简报：1) `launchctl list | grep crypto`：trader/monitor/panel/frontend 四个服务是否都在（trader PID 是否变化）；2) runtime/shadow/runner_heartbeat.json 的 updated_ms 是否在 2 分钟内；3) runtime/shadow/deployed_state.json：halted 是否为 false、peak、四个 strategies（kdj15/kdj5/eth15/eth5）的 entry 持仓与 last_ts、external 各标净仓；4) tail runtime/shadow/monitor.log 最新一行（权益/熔断）；5) tail runtime/logs/com.crypto.btcusdt.testnet.trader.{out,err}.log：有无**新** Traceback/Error/熔断/下单失败（用 mtime 和时间戳判断，旧错误不算）；6) runtime/shadow/latest_reading.json 的 bar_utc/updated_ms 是否随新K线更新。简报格式示例：`[巡检 HH:MM] 权益=… halted=false 持仓=空/… 最后K线=… 异常=无/…`。若发现任何异常（服务退出/心跳停更/熔断触发/新报错/下单失败/账本与交易所净仓不一致），立即用 mcp__ccd_session__spawn_task 单独开一个任务会话做根因验证（prompt 必须自包含，注明 cwd=/Users/zengyun/我的AI/crypto），并在简报中注明『已开任务』。硬性约束：只读巡检，绝不停止/修改/重启任何服务、绝不写 runtime/ 文件；系统仅测试网。",
+      "createdAt": 1790990366459,
+      "lastFiredAt": 1791106825999,
+      "recurring": true,
+      "createdBySessionId": "fecddf27-12d3-4641-b199-1dfc4764fe46",
+      "createdByPid": 32225,
+      "createdByProcStart": "Sat Oct  3 00:25:56 2026",
+      "createdInProject": "/Users/zengyun/我的AI/crypto"
+    }
+  ]
+}

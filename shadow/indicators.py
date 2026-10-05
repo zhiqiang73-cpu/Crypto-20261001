@@ -19,6 +19,14 @@
         σ_t  = 最近 20 根收盘价的样本标准差 (ddof = 1)
         UP_t = MB_t + 2 × σ_t
         LB_t = MB_t − 2 × σ_t
+
+    MACD(12, 26, 9) —— 15 分钟 (2026-10-02 用户新增, 只取能量柱正负)
+        EMA_t  = α × C_t + (1 − α) × EMA_{t−1},   α = 2 / (n + 1)
+            初值: EMA_0 = C_0 (第一根收盘价, 与 TradingView / 币安同口径)
+        DIF_t  = EMA(12)_t − EMA(26)_t
+        DEA_t  = EMA(DIF, 9)_t,   初值 DEA_0 = DIF_0
+        HIST_t = DIF_t − DEA_t        绿柱 = HIST > 0, 红柱 = HIST < 0
+        闸门只认 HIST 的正负号; 与 DIF 相对 0 轴的位置无关。
 """
 
 from __future__ import annotations
@@ -107,3 +115,35 @@ def boll(close: np.ndarray, n: int = 20, k: float = 2.0
         up[i] = mean + k * sigma
         lb[i] = mean - k * sigma
     return mb, up, lb, sd
+
+
+def _ema(values: np.ndarray, n: int) -> np.ndarray:
+    """EMA(n): α = 2/(n+1), 初值取第一根。"""
+    size = len(values)
+    out = np.empty(size, dtype=np.float64)
+    if size == 0:
+        return out
+    alpha = 2.0 / (n + 1.0)
+    prev = float(values[0])
+    out[0] = prev
+    for i in range(1, size):
+        prev = alpha * float(values[i]) + (1.0 - alpha) * prev
+        out[i] = prev
+    return out
+
+
+def macd(close: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9
+         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """MACD(fast, slow, signal)。返回 (DIF, DEA, HIST), HIST = DIF − DEA。
+
+    口径与 TradingView / 币安一致: EMA 从第一根收盘价递推, 不做 SMA 预热。
+    数据不足 `slow` 根时前段数值不可信, 但仍是有限值 —— 15m 运行器每轮抓
+    400 根已收盘 K 线, 远多于收敛所需, 所以闸门不会被预热噪声触发。
+    """
+    size = len(close)
+    if size == 0:
+        empty = np.empty(0, dtype=np.float64)
+        return empty, empty, empty
+    dif = _ema(close, fast) - _ema(close, slow)
+    dea = _ema(dif, signal)
+    return dif, dea, dif - dea

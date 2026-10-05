@@ -1,8 +1,8 @@
 {
   "strategy_id": "deployed_kdj_extreme_v1",
   "runtime_key": "kdj15",
-  "name": "KDJ 交叉反手 (BTCUSDT 15m)",
-  "kind": "mean_reversion",
+  "name": "KDJ×MACD 趋势分层 (BTCUSDT 15m)",
+  "kind": "trend_following",
   "timeframe": "15m",
   "risk_timeframe": "1h",
   "symbol": "BTCUSDT",
@@ -11,35 +11,44 @@
   "entry": {
     "golden_cross": "K[t-1] <= D[t-1] and K[t] > D[t]",
     "dead_cross": "K[t-1] >= D[t-1] and K[t] < D[t]",
-    "long": "金叉做多（无 K 数值阈值）",
-    "short": "死叉做空（无 K 数值阈值）",
-    "execution": "t 收盘判定, t+1 开盘执行 (限价追价成交)",
+    "long": "金叉且 MACD 能量柱为正（绿柱）：空仓开多；已多则同向加一层；下一根开盘下限价单",
+    "short": "死叉且 MACD 能量柱为负（红柱）：空仓开空；已空则同向加一层；下一根开盘下限价单",
+    "execution": "当根收盘同时判定交叉与能量柱方向，下一根开盘限价追价",
+    "divergence": "金叉遇红柱 / 死叉遇绿柱 → 方向背离，丢弃不操作：不开新仓、不加仓、不平仓、不反手",
     "loose_long": "已废弃：无极值过滤",
-    "loose_short": "已废弃：无极值过滤"
+    "loose_short": "已废弃：无极值过滤",
+    "same_side_add": "只对同向且通过 MACD 方向闸门的 KDJ 回调恢复交叉加仓；每次加一层，最多 3 层；达到上限后忽略同向信号"
   },
   "exit": {
-    "mode_a": "对侧交叉 → 平旧仓，交易所确认归零后再开新方向",
+    "mode_a": "有效对侧交叉同样要过能量柱方向闸门：清空全部累计层，再以第 1 层反手；背离交叉不动仓",
     "mode_b": "对侧交叉平仓 (仅并行记录, 不执行)"
   },
   "indicators": {
     "KDJ": "(9,3,3) 15m; RSV=(C-LLV(L,9))/(HHV(H,9)-LLV(L,9))*100, 分母为0时取50; K=(2K'+RSV)/3; D=(2D'+K)/3; 初值 K0=D0=50; 不用 J",
+    "MACD": "(12,26,9) 15m —— 只取能量柱正负作为方向闸门; EMA_t=αC_t+(1-α)EMA_{t-1}, α=2/(n+1), 初值取第一根收盘价; DIF=EMA12-EMA26; DEA=EMA9(DIF); 柱=DIF-DEA; 绿柱>0, 红柱<0",
     "ATR": "(14) 1h Wilder; TR=max(H-L,|H-C'|,|L-C'|); ATR=(13ATR'+TR)/14; 初值前14根TR简单平均",
-    "BOLL": "(20,2) 15m —— 闸门已按用户指令移除, 仅记录不参与开仓"
+    "BOLL": "(20,2) 15m —— 仅记录不参与开仓"
   },
   "position_sizing": {
     "formula": "qty = 权益_USDT × r ÷ (k × ATR_1H)",
-    "r": 0.03,
+    "r": 0.01,
     "k": 2,
     "step": 0.001,
-    "note": "按交易所最小变动单位向下取整; 不足最小名义金额则跳过"
+    "note": "按交易所最小变动单位向下取整; 不足最小名义金额则跳过",
+    "per_layer": "第1层 r=0.01；第2/3层 r=0.005；qty = 权益_USDT × 分层r ÷ (k × ATR_1H)，向下取整",
+    "layer_risk_r": [0.01, 0.005, 0.005],
+    "max_layers": 3,
+    "total_exposure_note": "同向最多 3 层；第1层风险 1%，第2/3层各 0.5%，单标的保证金预算上限 70%"
   },
   "risk": {
     "leverage": 10,
     "margin": "isolated",
     "max_concurrent": 1,
     "daily_loss_stop": 0.03,
-    "max_drawdown_stop": 0.10,
-    "disaster_stop": "浮亏 ≥ 3 × ATR_1H → 立即穿盘口 LIMIT reduceOnly 平仓（不是 MARKET，可能为 taker）"
+    "max_drawdown_stop": 0.1,
+    "disaster_stop": "浮亏 ≥ 3 × ATR_1H → 立即穿盘口 LIMIT reduceOnly 平仓（不是 MARKET，可能为 taker）",
+    "max_layers": 3,
+    "layer_limit": "仅限同一标的同一15m策略；有效反向统一清仓后重新从第1层计数"
   },
   "execution_style": {
     "order_type": "LIMIT_GTX_POST_ONLY_THEN_LIMIT_CROSS",
@@ -52,5 +61,5 @@
   "status": "testnet_ready_manual_activation",
   "enabled": true,
   "source": "user_spec",
-  "note": "以 shadow/engine.py 常量为准; 本文件仅作展示与文档, 不覆盖代码。执行前会强制核对：测试网行情/账户同市场、无遗留挂单、单向、10x、逐仓。"
+  "note": "2026-10-04：BTC 15m 与 ETH 15m 统一采用首层 r=0.01、后续层 r=0.005，单标的保证金预算上限 70%。"
 }

@@ -12,6 +12,7 @@ from shadow.engine import BarRow, ShadowResult, Trade
 BAR_COLS = [
     "timestamp", "open", "high", "low", "close", "volume",
     "K", "D", "J", "ATR_1H", "UP", "MB", "LB", "带宽", "目标距离", "倍数",
+    "MACD柱",
     "金叉", "死叉", "触发做多", "触发做空", "宽松做多", "宽松做空",
     "持仓方向", "持仓数量",
 ]
@@ -42,6 +43,7 @@ def write_bar_log(res: ShadowResult, path: str) -> None:
                 f"{b.v:.4f}", f"{b.k:.4f}", f"{b.d:.4f}", f"{b.j:.4f}",
                 f"{b.atr_1h:.4f}", f"{b.up:.4f}", f"{b.mb:.4f}", f"{b.lb:.4f}",
                 f"{b.bandwidth:.4f}", f"{b.target_dist:.4f}", f"{b.multiple:.4f}",
+                f"{b.macd_hist:.4f}",
                 _yn(b.gold_cross), _yn(b.dead_cross), _yn(b.sig_long), _yn(b.sig_short),
                 _yn(b.loose_long), _yn(b.loose_short),
                 b.pos_side, f"{b.pos_qty:.4f}",
@@ -108,7 +110,8 @@ def daily_reports(res: ShadowResult, outdir: str, equity0: float) -> List[str]:
                     f"{b.c:.2f}", f"{b.v:.4f}", f"{b.k:.4f}", f"{b.d:.4f}",
                     f"{b.j:.4f}", f"{b.atr_1h:.4f}", f"{b.up:.4f}", f"{b.mb:.4f}",
                     f"{b.lb:.4f}", f"{b.bandwidth:.4f}", f"{b.target_dist:.4f}",
-                    f"{b.multiple:.4f}", _yn(b.gold_cross), _yn(b.dead_cross),
+                    f"{b.multiple:.4f}", f"{b.macd_hist:.4f}",
+                    _yn(b.gold_cross), _yn(b.dead_cross),
                     _yn(b.sig_long), _yn(b.sig_short), _yn(b.loose_long),
                     _yn(b.loose_short), b.pos_side, f"{b.pos_qty:.4f}",
                 ])

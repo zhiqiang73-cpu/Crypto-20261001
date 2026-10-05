@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Hourly read-only observe. Does not change trading/config/positions.
 set -euo pipefail
-ROOT="/Users/zengyun/Downloads/我的AI/crypto"
+ROOT="/Users/zengyun/我的AI/crypto"
 RAW="$ROOT/docs/observe_hourly_raw.jsonl"
 STAMP=$(date '+%Y-%m-%d %H:%M:%S %z')
 mkdir -p "$ROOT/docs"
@@ -26,16 +26,16 @@ hist = get("/api/trading/history")
 items = hist if isinstance(hist, list) else (hist.get("items") or hist.get("history") or hist.get("trades") or [])
 if not isinstance(items, list):
     items = []
-pos_path = pathlib.Path("/Users/zengyun/Downloads/我的AI/crypto/runtime/review/positions.json")
+pos_path = pathlib.Path("/Users/zengyun/我的AI/crypto/runtime/review/positions.json")
 pos = {}
 if pos_path.exists():
     try:
         pos = json.loads(pos_path.read_text())
     except Exception as e:
         pos = {"_error": str(e)}
-ledger = pathlib.Path("/Users/zengyun/Downloads/我的AI/crypto/runtime/review/trade_ledger.jsonl")
-hist_file = pathlib.Path("/Users/zengyun/Downloads/我的AI/crypto/runtime/review/trading_history.jsonl")
-audit = pathlib.Path("/Users/zengyun/Downloads/我的AI/crypto/runtime/review/decision_audit.jsonl")
+ledger = pathlib.Path("/Users/zengyun/我的AI/crypto/runtime/review/trade_ledger.jsonl")
+hist_file = pathlib.Path("/Users/zengyun/我的AI/crypto/runtime/review/trading_history.jsonl")
+audit = pathlib.Path("/Users/zengyun/我的AI/crypto/runtime/review/decision_audit.jsonl")
 rec = {
     "ts_local": now,
     "unix": time.time(),

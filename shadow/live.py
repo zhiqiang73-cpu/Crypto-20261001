@@ -1,7 +1,8 @@
 """影子模式实时运行器 (阶段 1).
 
 每 60 秒轮询一次币安公开行情, 只处理【已收盘】的 15m K 线,
-按规格判定信号、做虚拟成交、追加日志。不触碰任何下单接口。
+按规格判定信号 (金叉且 MACD 能量柱为正 → 多; 死叉且为负 → 空;
+背离的交叉丢弃不操作)、做虚拟成交、追加日志。不触碰任何下单接口。
 
 状态保存在 runtime/shadow/live_state.json, 中断后可续跑。
 """
@@ -9,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import json
 import os
@@ -18,11 +20,17 @@ from datetime import datetime, timezone
 import numpy as np
 import urllib.request
 
+try:
+    import websockets
+except ImportError:  # pragma: no cover
+    websockets = None
+
 from shadow.engine import (ATR_MULT_K, BOLL_GATE_ENABLED, DISASTER_ATR, FEE_PER_SIDE, GATE_FEE_RATE,
                            GATE_STRONG, GATE_WEAK, MIN_NOTIONAL, MIN_QTY, RISK_R, STEP_SIZE,
                            floor_step)
 from shadow.indicators import atr_wilder, boll, kdj
-from shadow.signals import crossing
+from shadow.indicators import atr_wilder, boll, kdj, macd
+from shadow.signals import crossing, macd_gate
 from shadow.reporting import BAR_COLS, TRADE_COLS
 from config.market_endpoints import resolve_for_account
 
@@ -44,6 +52,45 @@ MARKET = ENDPOINTS.market
 BASE = ENDPOINTS.rest + "/fapi/v1/klines"
 UA = {"User-Agent": "crypto-quant-shadow/1.0"}
 
+# 运行器启动后由一个组合流接收 BTC/ETH 的 15m、1h K线和标记价。
+# REST 只负责首次历史预热及 WebSocket 断线后的兜底，不再每轮重复拉历史。
+_STREAM_ROWS = {}
+_STREAM_MARK = {}
+_STREAM_LAST_EVENT = {}
+_STREAM_LAST_MARK_EVENT = {}
+_STREAM_TASK = None
+_STREAM_HEALTH = os.path.join(OUT, "market_stream_health.json")
+_STREAM_LAST_WRITE = 0.0
+_STREAM_STATE = {"state": "not_started", "note": "", "url": "", "events": 0}
+
+
+def _write_stream_health(state: str, note: str = "", force: bool = False) -> None:
+    """只读遥测：记录行情 WebSocket 的连接状态与事件新鲜度。
+
+    只写 runtime/shadow 下的一个 JSON，不参与任何交易判定；写失败也必须
+    静默忽略，绝不能让遥测影响运行器。
+    """
+    global _STREAM_LAST_WRITE
+    now = time.time()
+    if not force and now - _STREAM_LAST_WRITE < 5.0:
+        return
+    _STREAM_LAST_WRITE = now
+    _STREAM_STATE.update({"state": state, "note": note})
+    payload = dict(_STREAM_STATE)
+    payload["updated_ms"] = int(now * 1000)
+    payload["kline_age_sec"] = {f"{k[0]}|{k[1]}": round(now - v, 1)
+                                for k, v in _STREAM_LAST_EVENT.items()}
+    payload["mark_age_sec"] = {k: round(now - v, 1)
+                               for k, v in _STREAM_LAST_MARK_EVENT.items()}
+    try:
+        os.makedirs(OUT, exist_ok=True)
+        tmp = _STREAM_HEALTH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, _STREAM_HEALTH)
+    except Exception:  # noqa: BLE001
+        pass
+
 
 INTERVAL_MS = {
     "5m": 5 * 60 * 1000,
@@ -53,9 +100,27 @@ INTERVAL_MS = {
 
 
 def fetch(interval: str, limit: int, symbol: str = "BTCUSDT") -> dict:
+    cached = _STREAM_ROWS.get((symbol, interval))
+    fresh_for = 120 if interval == "15m" else 600
+    step_ms = INTERVAL_MS.get(interval, INTERVAL_MS["15m"])
+    current_slot = (int(time.time() * 1000) // step_ms) * step_ms
+    if (cached and len(cached) >= min(limit, 80)
+            and int(cached[-1][0]) >= current_slot
+            and time.time() - _STREAM_LAST_EVENT.get((symbol, interval), 0) < fresh_for):
+        rows = cached[-limit:]
+        return {
+            "ts": np.array([r[0] for r in rows], dtype=np.int64),
+            "open": np.array([float(r[1]) for r in rows]),
+            "high": np.array([float(r[2]) for r in rows]),
+            "low": np.array([float(r[3]) for r in rows]),
+            "close": np.array([float(r[4]) for r in rows]),
+            "volume": np.array([float(r[5]) for r in rows]),
+        }
     url = ENDPOINTS.klines_url(interval=interval, symbol=symbol, limit=limit)
     req = urllib.request.Request(url, headers=UA)
     rows = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
+    _STREAM_ROWS[(symbol, interval)] = rows[-limit:]
+    _STREAM_LAST_EVENT[(symbol, interval)] = time.time()
     ts = np.array([r[0] for r in rows], dtype=np.int64)
     return {
         "ts": ts,
@@ -65,6 +130,70 @@ def fetch(interval: str, limit: int, symbol: str = "BTCUSDT") -> dict:
         "close": np.array([float(r[4]) for r in rows]),
         "volume": np.array([float(r[5]) for r in rows]),
     }
+
+
+def latest_mark_price(symbol: str):
+    value = _STREAM_MARK.get(symbol)
+    return float(value) if value else None
+
+
+async def _market_stream_loop(symbols):
+    if websockets is None:
+        _write_stream_health("unavailable", "未安装 websockets 库，行情走 REST", force=True)
+        return
+    streams = []
+    for symbol in symbols:
+        s = symbol.lower()
+        streams.extend((f"{s}@kline_15m", f"{s}@kline_1h", f"{s}@markPrice@1s"))
+    url = ENDPOINTS.ws.rstrip("/") + "/stream?streams=" + "/".join(streams)
+    _STREAM_STATE["url"] = url
+    delay = 1.0
+    while True:
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                delay = 1.0
+                _write_stream_health("connected", f"已连接 {len(streams)} 条子流", force=True)
+                async for message in ws:
+                    event = json.loads(message).get("data", {})
+                    symbol = event.get("s")
+                    if not symbol:
+                        continue
+                    if event.get("e") == "markPriceUpdate":
+                        _STREAM_MARK[symbol] = float(event.get("p") or 0.0)
+                        _STREAM_LAST_MARK_EVENT[symbol] = time.time()
+                        _STREAM_STATE["events"] = int(_STREAM_STATE.get("events", 0)) + 1
+                        _write_stream_health("connected")
+                        continue
+                    k = event.get("k") or {}
+                    interval = k.get("i")
+                    if interval not in ("15m", "1h"):
+                        continue
+                    row = [int(k["t"]), k["o"], k["h"], k["l"], k["c"], k.get("v", "0")]
+                    rows = _STREAM_ROWS.setdefault((symbol, interval), [])
+                    if rows and int(rows[-1][0]) == row[0]:
+                        rows[-1] = row
+                    else:
+                        rows.append(row)
+                        del rows[:-800]
+                    _STREAM_LAST_EVENT[(symbol, interval)] = time.time()
+                    _STREAM_STATE["events"] = int(_STREAM_STATE.get("events", 0)) + 1
+                    _write_stream_health("connected")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"[行情WS] 断线，{delay:.0f}s后重连: {type(exc).__name__}: {exc}")
+            _write_stream_health("disconnected",
+                                 f"{type(exc).__name__}: {exc}", force=True)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2.0, 60.0)
+
+
+def start_market_stream(symbols):
+    global _STREAM_TASK
+    if _STREAM_TASK is None and websockets is not None:
+        _STREAM_TASK = asyncio.create_task(_market_stream_loop(symbols))
+        print(f"[行情WS] 已启动组合流: {','.join(symbols)} / 15m,1h,markPrice")
+    return _STREAM_TASK
 
 
 def closed_kdj_series(interval: str, n: int = 36, symbol: str = "BTCUSDT") -> dict:
@@ -136,6 +265,7 @@ def cycle(st: dict) -> int:
     ts = b15["ts"]
     o, h, l, c, v = (b15[x] for x in ("open", "high", "low", "close", "volume"))
     k, d, j = kdj(h, l, c)
+    _dif, _dea, hist = macd(c)
     mb, up, lb, _ = boll(c, 20, 2.0)
 
     atr1h = atr_wilder(b1h["high"], b1h["low"], b1h["close"], 14)
@@ -197,8 +327,9 @@ def cycle(st: dict) -> int:
 
         # --- 信号 ---
         gold, dead = crossing(k[i - 1], d[i - 1], k[i], d[i])
-        sig_long, sig_short = gold, dead
-        loose_long, loose_short = gold, dead  # 兼容旧日志列名
+        # 15m 方向闸门: 交叉方向必须与 MACD 能量柱正负一致, 背离丢弃。
+        loose_long, loose_short = gold, dead  # 兼容旧日志列名 (裸交叉)
+        sig_long, sig_short, _macd_note = macd_gate(gold, dead, float(hist[i]))
 
         bw = float(up[i] - lb[i])
         target = bw / 2.0

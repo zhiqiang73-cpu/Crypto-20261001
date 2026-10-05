@@ -1,4 +1,4 @@
-# Claude 本地继续开发提示词：BTCUSDT 量化交易系统
+> **更新 2026-10-04 11:06 CST**：`RISK_R` 已改为 **0.01**（见 `docs/maintenance/HANDOFF_TO_CLAUDE.md` / `CLAUDE_NOTIFY_RISK_R.md`）。用户要求先**不要重启** trader。\n\n# Claude 本地继续开发提示词：BTCUSDT 量化交易系统
 
 你现在接手一个已经完成第一阶段搭建的本地 BTCUSDT 量化交易系统。请**不要从零重写**，也**不要只做静态页面**。你的任务是：先完整审计现有代码与运行状态，再按优先级修复真实存在的交易正确性问题。
 
@@ -10,7 +10,7 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 项目目录 | `/Users/zengyun/Downloads/我的AI/crypto` |
+| 项目目录 | `/Users/zengyun/我的AI/crypto` |
 | 前端地址 | `http://127.0.0.1:8788/` |
 | 后端地址 | `http://127.0.0.1:8787/` |
 | 默认运行模式 | `paper` |
@@ -25,14 +25,14 @@
 当前工作目录虽然是 `crypto`，但 **Git 实际根目录在上一级**：
 
 ```text
-/Users/zengyun/Downloads/我的AI
+/Users/zengyun/我的AI
 ```
 
 这意味着直接 `git add -A` 会把上一级的无关内容全部带进来。实测会污染提交的项包括：`../README.md` 的删除状态、`../Auto-computer-driver/`、`../Codex/`、`../claude/` 等目录。
 
 正确做法是在 `crypto` 目录下执行 `git add -A .`（注意那个点号，它会被解析为 `crypto/` 前缀），并且在提交前用 `git diff --cached --name-status` 确认清单里只有 `crypto/...` 路径。
 
-另外，Git 元数据目录 `/Users/zengyun/Downloads/我的AI/.git` 在某些沙箱执行环境下不可写，需要单独申请写权限才能提交。
+另外，Git 元数据目录 `/Users/zengyun/我的AI/.git` 在某些沙箱执行环境下不可写，需要单独申请写权限才能提交。
 
 ### 1.2 已有备份仓库
 
@@ -342,7 +342,7 @@ LONG 0.001 BTC  →  FLAT 0 BTC
 ### 只启动前端预览
 
 ```bash
-cd /Users/zengyun/Downloads/我的AI/crypto
+cd /Users/zengyun/我的AI/crypto
 sh scripts/start_new_frontend.sh
 ```
 
@@ -351,7 +351,7 @@ sh scripts/start_new_frontend.sh
 ### 启动完整本地控制台
 
 ```bash
-cd /Users/zengyun/Downloads/我的AI/crypto
+cd /Users/zengyun/我的AI/crypto
 TRADING_MODE=paper sh scripts/run_local_console.sh
 ```
 
@@ -360,7 +360,7 @@ TRADING_MODE=paper sh scripts/run_local_console.sh
 ### 测试与语法检查
 
 ```bash
-cd /Users/zengyun/Downloads/我的AI/crypto
+cd /Users/zengyun/我的AI/crypto
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile review/panel_server.py trading/binance_client.py trading/executor.py trading/position_manager.py
 node --check frontend/app.js

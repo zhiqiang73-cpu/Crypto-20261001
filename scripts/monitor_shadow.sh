@@ -32,15 +32,36 @@ if os.path.exists(state_p):
 
 rows = []
 if os.path.exists(trade_p):
+    # 2026-10-04：曾因 CSV 无表头 / 半行而 KeyError('动作')，整条监控崩掉。
+    # 这里先验列名、再逐行容错，坏数据只报一行、不抛异常。
     try:
-        rows = list(csv.DictReader(open(trade_p, encoding="utf-8")))
-    except Exception:
-        pass
+        with open(trade_p, encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            fields = reader.fieldnames or []
+            if "动作" in fields and "权益" in fields:
+                rows = [r for r in reader
+                        if isinstance(r.get("动作"), str)
+                        and isinstance(r.get("权益"), str)]
+            else:
+                print(f"[{now}] trade_log_invalid: 缺少动作/权益列 "
+                      f"(fields={fields[:4]})")
+    except Exception as exc:  # noqa: BLE001  监控不因台账坏而崩
+        print(f"[{now}] trade_log_invalid: {type(exc).__name__}: {exc}")
 
-opened = [r for r in rows if r["动作"].startswith("开")]
-closed = [r for r in rows if r["动作"] == "反手平仓"]
-halt = [r for r in rows if r["动作"] == "熔断"]
-eq = rows[-1]["权益"] if rows else "?"
+def _act(r):
+    """台账「动作」原文，例如 'BTC 15m开多' / 'BTC 15m清仓2层并开空'。"""
+    return r.get("动作") or ""
+
+
+# 2026-10-04：原判据是 startswith("开") 与 == "反手平仓"，而真实取值带
+# 「BTC 15m」前缀（"BTC 15m开多"），于是开仓/平仓计数恒为 0 —— 不是没有成交，
+# 是匹配写错了。改为按动作词匹配。
+opened = [r for r in rows
+          if any(k in _act(r) for k in ("开多", "开空", "加多", "加空"))]
+closed = [r for r in rows
+          if any(k in _act(r) for k in ("平仓", "清仓", "人工减仓"))]
+halt = [r for r in rows if "熔断" in _act(r)]
+eq = rows[-1].get("权益") if rows else "?"
 print(f"[{now}] running={running} 权益={eq} 开仓={len(opened)} 平仓={len(closed)} "
       f"熔断={len(halt)} halted={state.get('halted')} 最后K线={state.get('last_ts')}")
 PY

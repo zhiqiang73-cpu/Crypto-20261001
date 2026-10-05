@@ -65,7 +65,7 @@
 ## D. 可重复验收
 
 ```bash
-cd /Users/zengyun/Downloads/我的AI/crypto
+cd /Users/zengyun/我的AI/crypto
 python3 scripts/round3_verify.py
 # 或
 python3 -m unittest tests.test_round3_acceptance tests.test_round2_acceptance -v

@@ -43,8 +43,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 CHASE_POLL_INTERVAL = 3.0          # 订单状态轮询间隔 (秒)
 
-PASSIVE_REPRICE_SEC = 5.0      # 每个挂单挂多久, 未成交则撤单跟盘口重挂
+PASSIVE_REPRICE_SEC = 5.0      # 被 post-only 拒单后的最短重挂间隔
 PASSIVE_WINDOW_SEC = 180.0     # 被动窗口总时长 (秒), 耗尽后走兜底
+# 2026-10-04 改造: 盘口不变时**不再**撤单重挂, 而是让挂单一直躺在队里。
+#
+# 交易所按「价格优先、时间优先」撮合, 撤单重挂 = 放弃排队位置、排回队尾。
+# 实测 2026-10-04 17:00 那单: 目标 0.0980 BTC, 在 180 秒里撤挂 28 次
+# (每 6 秒一次), 只有 6% 的量拿到 maker, 其余 94% 落到 taker 兜底;
+# 而 15:45 那单只重挂 6 次就整笔 maker 成交。差别就在挂单有没有时间攒排队位置。
+#
+# 现在: 价格一动立刻撤单跟盘口, 价格不动就一直挂着 —— 既不失去跟随性,
+# 也不再每 6 秒白扔一次排队位置。
+PASSIVE_REST_POLL_SEC = 3.0    # 驻留期间的轮询间隔 (订单状态 + 盘口)
 PASSIVE_MAX_REPRICE = 60       # 最多重挂次数 (防止窗口内空转)
 PASSIVE_MAX_PAD = 5            # 被 post-only 拒单后最多退几个 tick
 PASSIVE_CROSS_TICKS = 5        # 兜底穿盘口时超出盘口几个 tick (=滑点上限)
@@ -99,6 +109,13 @@ class BinanceTestnetClient:
         self._time_offset_ms: int = 0
         self._time_synced: bool = False
         self._hedge_mode: Optional[bool] = None  # True=双向持仓
+        self._position_risk_cache: Optional[List[Dict[str, Any]]] = None
+        self._position_risk_cache_ms: int = 0
+        self._balance_cache: Optional[AccountBalance] = None
+        self._balance_cache_ms: int = 0
+        self._account_cache_ttl_ms: int = 5_000
+        self._rate_limit_until: float = 0.0
+        self._rate_limit_backoff: float = 5.0
 
     @property
     def configured(self) -> bool:
@@ -148,6 +165,9 @@ class BinanceTestnetClient:
         _skip_time_sync: bool = False,
         _retried: bool = False,
     ) -> Any:
+        wait = self._rate_limit_until - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
         if signed and not self.configured:
             raise BinanceAuthError("未配置 Binance Testnet API key/secret")
         if signed and not _skip_time_sync and not self._time_synced:
@@ -188,15 +208,32 @@ class BinanceTestnetClient:
                         signed=True,
                         _retried=True,
                     )
+                if resp.status == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    try:
+                        delay = max(float(retry_after or 0), self._rate_limit_backoff)
+                    except (TypeError, ValueError):
+                        delay = self._rate_limit_backoff
+                    self._rate_limit_until = time.monotonic() + min(delay, 60.0)
+                    self._rate_limit_backoff = min(self._rate_limit_backoff * 2.0, 60.0)
+                    raise BinanceClientError(
+                        f"Binance 429 {path}: 请求被限流，退避 {delay:.1f}s"
+                    )
                 if resp.status >= 400:
                     raise BinanceClientError(
                         f"Binance {resp.status} {path}: {text[:300]}"
                     )
                 if not text:
                     return {}
+                self._rate_limit_backoff = 5.0
                 return __import__("json").loads(text)
-        except aiohttp.ClientError as exc:
-            raise BinanceClientError(f"连接 Binance 失败: {exc}") from exc
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            # 2026-10-04: aiohttp 的 ClientTimeout 抛的是 asyncio.TimeoutError，
+            # 它**不是** ClientError，此前直接逃逸出 _request。追价一个 tick 要发
+            # 上百次请求，任一次超时就会冒泡到 step()，把整个 tick（含另一标的）打断。
+            raise BinanceClientError(
+                f"连接 Binance 失败: {type(exc).__name__}: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------ public
     async def ping(self) -> bool:
@@ -283,6 +320,10 @@ class BinanceTestnetClient:
                 self._hedge_mode = True
 
     async def get_balance(self) -> AccountBalance:
+        now_ms = int(time.time() * 1000)
+        if (self._balance_cache is not None
+                and now_ms - self._balance_cache_ms < self._account_cache_ttl_ms):
+            return self._balance_cache
         data = await self._request("GET", "/fapi/v2/balance", signed=True)
         bal = AccountBalance()
         for item in data or []:
@@ -296,13 +337,42 @@ class BinanceTestnetClient:
                     item.get("crossUnPnl") or 0
                 )
                 break
+        # 2026-10-04: 本系统跑 10× **逐仓**，而 /fapi/v2/balance 的 crossUnPnl 只统计
+        # 全仓未实现盈亏 —— 逐仓账户上恒为 0。于是「未实现盈亏」在面板与权益口径里
+        # 一直是 0，持仓浮亏完全不可见（当晚 ETH 浮亏 -33 时读数仍是 0；权益也因此
+        # 少算了浮盈浮亏，直接影响回撤闸门与按权益的仓位定量）。
+        #
+        # ⚠ 字段名是币安的 **unRealizedProfit**（大写 R，历史拼法）——不是
+        #   unrealizedProfit。写错只会静默拿到 0，与整个 bug 的表现一模一样。
+        #   两种拼法都接受，避免再踩。
+        if not bal.total_unrealized_pnl:
+            try:
+                risk = await self.get_position_risk_snapshot()
+                bal.total_unrealized_pnl = sum(
+                    float(r.get("unRealizedProfit")
+                          or r.get("unrealizedProfit") or 0)
+                    for r in (risk or [])
+                )
+            except Exception as exc:  # noqa: BLE001  取不到就保留原值
+                logger.warning("读取逐仓未实现盈亏失败: %s", exc)
+        self._balance_cache = bal
+        self._balance_cache_ms = now_ms
         return bal
+
+    async def get_position_risk_snapshot(self, force: bool = False) -> List[Dict[str, Any]]:
+        """一次读取全标的逐仓风险快照，供 BTC/ETH 共用。"""
+        now_ms = int(time.time() * 1000)
+        if (not force and self._position_risk_cache is not None
+                and now_ms - self._position_risk_cache_ms < self._account_cache_ttl_ms):
+            return self._position_risk_cache
+        data = await self._request("GET", "/fapi/v2/positionRisk", signed=True)
+        self._position_risk_cache = list(data or [])
+        self._position_risk_cache_ms = now_ms
+        return self._position_risk_cache
 
     async def get_position(self, symbol: Optional[str] = None) -> PositionInfo:
         symbol = symbol or self.symbol
-        data = await self._request(
-            "GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True
-        )
+        data = await self.get_position_risk_snapshot()
         info = PositionInfo(symbol=symbol, side="FLAT")
         net = 0.0
         entry_num = 0.0
@@ -310,6 +380,8 @@ class BinanceTestnetClient:
         upnl = 0.0
         mark = 0.0
         lev = 1
+        notional = 0.0
+        margin = 0.0
         for item in data or []:
             if item.get("symbol") != symbol:
                 continue
@@ -323,6 +395,15 @@ class BinanceTestnetClient:
             ep = float(item.get("entryPrice") or 0)
             entry_num += ep * abs(amt)
             entry_den += abs(amt)
+            # 交易所自己的口径, 直接透传给面板:
+            # notional = positionRisk.notional (名义价值, 按标记价, 与网页端一致)
+            # margin   = positionRisk.isolatedMargin (逐仓实际占用保证金)
+            notional += float(item.get("notional") or 0)
+            margin += float(
+                item.get("isolatedMargin")
+                or item.get("positionInitialMargin")
+                or 0
+            )
         if abs(net) < 1e-12:
             return info
         info.quantity = abs(net)
@@ -331,6 +412,8 @@ class BinanceTestnetClient:
         info.unrealized_pnl = upnl
         info.leverage = lev
         info.mark_price = mark
+        info.notional = notional if abs(notional) > 0 else net * mark
+        info.margin = margin if margin > 0 else abs(info.notional) / max(lev, 1)
         return info
 
     async def get_position_settings(self, symbol: Optional[str] = None) -> Dict[str, Any]:
@@ -426,6 +509,17 @@ class BinanceTestnetClient:
         filled = float(raw.get("executedQty") or 0)
         status = str(raw.get("status") or "")
         cid = str(raw.get("clientOrderId") or client_order_id or "")
+        # 均价回填（2026-10-04 修复）。
+        # 币安只在订单**完全成交**时才填 avgPrice；部分成交（含被撤单的被动
+        # 挂单）avgPrice 恒为 0。此前直接取 avgPrice，导致台账里出现
+        # 「filled=0.0048 / avg_price=0.00」——成交量和成交价对不上，滑点与
+        # 成本都没法算。成交额字段是可靠的：USDⓈ-M 用 cumQuote，现货用
+        # cummulativeQuoteQty，两者都取。
+        avg_price = float(raw.get("avgPrice") or 0)
+        if avg_price <= 0 and filled > 0:
+            quote = float(raw.get("cumQuote") or raw.get("cummulativeQuoteQty") or 0)
+            if quote > 0:
+                avg_price = quote / filled
         return ManagedOrder(
             client_order_id=cid,
             state=self._map_binance_status(status, filled, qty),
@@ -440,7 +534,7 @@ class BinanceTestnetClient:
             cum_filled_qty=filled,
             filled_qty=filled,
             last_fill_qty=filled,
-            avg_price=float(raw.get("avgPrice") or 0),
+            avg_price=avg_price,
             reduce_only=bool(raw.get("reduceOnly")),
             is_stop=str(raw.get("type") or "").upper().startswith("STOP"),
             is_algo=bool(raw.get("algoId") or raw.get("algoType")),
@@ -502,8 +596,14 @@ class BinanceTestnetClient:
         *,
         client_order_id: Optional[str] = None,
         close_position: bool = False,
+        order_type: str = "STOP_MARKET",
     ) -> ManagedOrder:
-        """Algo 条件单 STOP_MARKET — POST /fapi/v1/algoOrder (官方已迁出 /order)."""
+        """Algo 条件单 — POST /fapi/v1/algoOrder (官方已迁出 /order).
+
+        order_type: STOP_MARKET（止损）或 TAKE_PROFIT_MARKET（止盈）。
+            两者的方向相同（多仓都是 SELL），**只有 orderType 能区分** ——
+            这也是查询侧必须按 orderType 过滤的原因。
+        """
         symbol = symbol or self.symbol
         side_u = side.upper()
         order_side = "SELL" if side_u == "LONG" else "BUY"
@@ -526,7 +626,7 @@ class BinanceTestnetClient:
             "algoType": "CONDITIONAL",
             "symbol": symbol,
             "side": order_side,
-            "type": "STOP_MARKET",
+            "type": order_type,
             "triggerPrice": trigger,
             "workingType": "MARK_PRICE",
             "clientAlgoId": cid,
@@ -573,7 +673,13 @@ class BinanceTestnetClient:
             text = str(exc)
             is_reject = any(
                 code in text
-                for code in ("-2015", "-1111", "-1102", "-4014", "-2021", "Invalid")
+                for code in ("-2015", "-1111", "-1102", "-4014", "-2021",
+                             # -4130: 已有同向 closePosition 保护单 —— 交易所
+                             # **明确拒绝**了新单，必须归为 REJECTED。2026-10-05
+                             # 实测它被降级成 UNKNOWN，导致「先立后破」的收紧
+                             # 永远确认不了、两个标的被永久禁止开仓。
+                             "-4130",
+                             "Invalid")
             )
             return ManagedOrder(
                 client_order_id=cid,
@@ -666,6 +772,29 @@ class BinanceTestnetClient:
                         tick = 0.1
                     return tick if tick > 0 else 0.1
         return 0.1
+
+    async def min_notional(self, symbol: Optional[str] = None) -> float:
+        """读取 MIN_NOTIONAL.notional；失败时退回 0（表示不做该约束）。
+
+        2026-10-04：追价改为「成交多少、继续追多少」之后，剩余量会越追越小。
+        小于交易所最小名义金额的单子必然被拒，继续挂在窗口里只是空转，
+        所以提前判掉、直接按已成交量收工。
+        """
+        try:
+            info = await self.exchange_info()
+        except BinanceClientError:
+            return 0.0
+        sym = symbol or self.symbol
+        for s in info.get("symbols") or []:
+            if s.get("symbol") != sym:
+                continue
+            for f in s.get("filters") or []:
+                if f.get("filterType") == "MIN_NOTIONAL":
+                    try:
+                        return float(f.get("notional") or 0)
+                    except (TypeError, ValueError):
+                        return 0.0
+        return 0.0
 
     async def market_open(
         self,
@@ -819,6 +948,7 @@ class BinanceTestnetClient:
         poll_interval_sec: float = 0.5,
         cancel_if_unfilled: bool = False,
         post_only: bool = False,
+        price_watch: Optional[Any] = None,
     ) -> OrderResult:
         """限价单：提交后轮询确认成交，绝不把 NEW 当作失败。
 
@@ -831,6 +961,10 @@ class BinanceTestnetClient:
         post_only=True 时改用 GTX (币安期货的 post-only TIF): 若该单会立即
         成交, 交易所直接拒单 (-5022), 调用方应把价格让开重挂。
         这是唯一能从交易所层面硬保证成交即 maker 的方式。
+
+        price_watch: 可选的异步回调, 每个轮询周期调用一次; 返回真值即中止等待,
+            由调用方决定撤单还是重挂。追价用它实现「盘口一变就撤单重挂、
+            盘口不动就一直挂着攒排队位置」。
         """
         symbol = symbol or self.symbol
         step = await self._lot_step(symbol)
@@ -942,18 +1076,46 @@ class BinanceTestnetClient:
                 break
             if last.state == OrderState.UNKNOWN and last.error and not submit_error:
                 break  # 查询本身失败：保持 UNKNOWN，不冒充失败
+            if price_watch is not None:
+                try:
+                    if await price_watch():
+                        break
+                except Exception as exc:  # noqa: BLE001 监控故障不得影响订单
+                    logger.debug("price_watch 失败(已忽略): %s", exc)
 
         filled = float(last.cum_filled_qty or last.filled_qty or 0)
-        if filled > 0:
-            return last.to_order_result()
 
-        if cancel_if_unfilled:
+        # 只要不是「完全成交」，就必须把剩余挂单撤掉。
+        #
+        # 2026-10-02 21:46 事故根因（务必保留这段说明）:
+        # 这里原本是 `if filled > 0: return last.to_order_result()` —— 只要
+        # 有一点部分成交就直接返回、**不撤单**，未成交的剩余量继续以 GTC
+        # post-only 挂在盘口。运行器以为这张单已经结束，下一步的净仓同步
+        # 又下了一张补差单，两张单在同一秒全部成交：
+        #   目标 5.070 → 实际 0.130（部分成交）→ 补差单 4.940
+        #   → 原单剩余 4.940 也成交 → 持仓 10.010（正好翻倍）
+        # 一分钟后被迫反向卖出 4.939 纠正，白付一次买卖价差与手续费。
+        if cancel_if_unfilled and last.state not in (
+            OrderState.REJECTED,
+        ):
             canceled = await self.cancel_order(client_order_id=cid, symbol=symbol)
-            canceled.cum_filled_qty = float(canceled.cum_filled_qty or 0)
-            canceled.filled_qty = canceled.cum_filled_qty
+            # 撤单回执可能不带成交量（-2011 等），此时用轮询到的值兜底，
+            # 绝不把已经成交的部分当成 0。
+            cum = float(canceled.cum_filled_qty or 0) or filled
+            canceled.cum_filled_qty = cum
+            canceled.filled_qty = cum
             if canceled.state == OrderState.UNKNOWN and not canceled.error:
                 canceled.state = OrderState.CANCELED
-            return canceled.to_order_result()
+            result = canceled.to_order_result()
+            if cum > 0:
+                # 有真实成交就是「成功的一部分」，与改动前
+                # （部分成交直接返回、ok=True）保持一致的语义；
+                # order_state 仍如实记为 CANCELED，不粉饰订单真实状态。
+                result.ok = True
+            return result
+
+        if filled > 0:
+            return last.to_order_result()
 
         return OrderResult(
             ok=False,
@@ -977,6 +1139,128 @@ class BinanceTestnetClient:
             raw=last.raw if isinstance(last.raw, dict) else {},
         )
 
+    async def place_resting_limit_order(
+        self,
+        side: str,
+        quantity: float,
+        price: float,
+        symbol: Optional[str] = None,
+        *,
+        reduce_only: bool = False,
+        client_order_id: Optional[str] = None,
+        time_in_force: str = "GTC",
+    ) -> OrderResult:
+        """挂一张**留在盘口**的限价单，提交成功即返回。
+
+        与 place_limit_order 的本质差别：后者是「追价成交」语义 —— 超时未成交
+        会返回 ok=False（unfilled_after_timeout），因为它假设调用方要的是成交。
+        而挂单止盈要的恰恰是**挂着不成交**，用它会得到假失败，进而重复下单。
+
+        2026-10-04：止盈腿从 TAKE_PROFIT_MARKET 改为 LIMIT + reduceOnly，目的
+        是吃 maker 费率（2bp）而不是 taker（4bp），同时避免市价成交的滑点。
+        多头的止盈价在市场上方，所以一张挂在那里的 SELL LIMIT 天然是 maker，
+        **不需要触发机制**。
+
+        与 place_limit_order 相同的安全规则：
+          * 刚提交返回 NEW/PENDING_NEW 是正常的，必须查一次确认
+          * 提交异常时先按 clientOrderId 回查，确认没下出去才报失败
+          * 只有明确拒单才标记 REJECTED
+        **绝不撤单** —— 留在盘口就是目的。
+        """
+        symbol = symbol or self.symbol
+        step = await self._lot_step(symbol)
+        qty = self._qty_precision(quantity, step)
+        if qty <= 0:
+            return OrderResult(
+                ok=False, error=f"quantity too small: {quantity}", symbol=symbol
+            )
+        tick = await self.price_tick(symbol)
+        limit_price = self._price_precision(price, tick)
+        if limit_price <= 0:
+            return OrderResult(
+                ok=False, error=f"price invalid: {price}", symbol=symbol
+            )
+        side_u = side.upper()
+        # side 是持仓方向，不是买卖方向：止盈必须平仓。
+        # 多仓 SELL、空仓 BUY；写反会变成给多仓加仓，触发 -2022。
+        order_side = "SELL" if side_u == "LONG" else "BUY"
+        cid = client_order_id or _new_client_order_id("tp")
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": order_side,
+            "type": "LIMIT",
+            "quantity": qty,
+            "price": limit_price,
+            "timeInForce": (time_in_force or "GTC").upper(),
+            "newClientOrderId": cid,
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        hedge = False
+        try:
+            hedge = await self.get_position_mode()
+        except Exception:
+            hedge = bool(self._hedge_mode)
+        if hedge:
+            # 双向持仓模式下 reduceOnly 不被接受，用 positionSide 表达「只减仓」
+            params["positionSide"] = (
+                "LONG" if order_side == "SELL" else "SHORT"
+            )
+            params.pop("reduceOnly", None)
+        submit_raw = None
+        submit_error = ""
+        try:
+            submit_raw = await self._request(
+                "POST", "/fapi/v1/order", params, signed=True
+            )
+        except BinanceClientError as exc:
+            submit_error = str(exc)
+            if "-1116" in submit_error or "-1102" in submit_error \
+                    or "-4014" in submit_error:
+                return OrderResult(
+                    ok=False, error=submit_error, symbol=symbol,
+                    side=order_side, client_order_id=cid,
+                    order_state=OrderState.REJECTED.value,
+                    requested_qty=quantity, submitted_qty=qty,
+                    cum_filled_qty=0.0, quantity=0.0,
+                )
+            # 其余网络类错误：走回查，不判定失败
+        entry = (
+            self._raw_to_managed(submit_raw, client_order_id=cid)
+            if submit_raw
+            else ManagedOrder(
+                client_order_id=cid, state=OrderState.UNKNOWN,
+                symbol=symbol, side=order_side, raw={},
+            )
+        )
+        # 查一次确认挂单真的在盘口。挂单成功时状态是 NEW / PARTIALLY_FILLED。
+        if entry.state == OrderState.UNKNOWN:
+            try:
+                entry = await self.query_order(client_order_id=cid, symbol=symbol)
+            except Exception:  # noqa: BLE001 回查失败不得冒充失败
+                pass
+        # 注意：OrderState 没有 NEW —— 币安的 NEW 映射为 ACKNOWLEDGED。
+        # 「挂单成功」= ACKNOWLEDGED（在盘口待成交）/ PARTIALLY_FILLED / FILLED
+        if entry.state in (OrderState.ACKNOWLEDGED, OrderState.PARTIALLY_FILLED,
+                           OrderState.FILLED):
+            res = entry.to_order_result()
+            res.ok = True
+            return res
+        if entry.state == OrderState.REJECTED:
+            return entry.to_order_result()
+        return OrderResult(
+            ok=False,
+            order_id=entry.exchange_order_id or "",
+            symbol=symbol, side=order_side, position_side=side_u,
+            quantity=0.0, requested_qty=quantity, submitted_qty=qty,
+            cum_filled_qty=0.0, avg_price=0.0,
+            status=entry.state.value, client_order_id=cid,
+            order_state=entry.state.value,
+            error=(f"submitted_unknown: {submit_error}" if submit_error
+                   else "resting_order_unconfirmed"),
+            raw=entry.raw if isinstance(entry.raw, dict) else {},
+        )
+
     async def place_limit_chase(
         self,
         side: str,
@@ -989,6 +1273,53 @@ class BinanceTestnetClient:
         window_sec: Optional[float] = None,
         tag: str = "ps",
         force_cross: bool = False,
+        on_step: Optional[Any] = None,
+    ) -> OrderResult:
+        """下单入口 —— **契约: 永不抛异常**, 失败一律返回 ok=False 的 OrderResult.
+
+        2026-10-04: 追价内部要发上百次 HTTP, 任何一次超时/网络抖动此前都以异常
+        形式逃逸, 冒泡到运行器 step() 把整个 tick 打断(另一标的也不再处理、状态
+        不落盘)。现在统一兜底, 由调用方按"下单未成功"处理。
+
+        on_step: 可选的 async 回调 ``on_step(bid, ask) -> bool``, 在**每次挂单
+        之前**调用。返回真值即中止追价(返回 ok=False), 供调用方插入安全检查点
+        —— 追价最长 180 秒, 期间主循环被占住, 此前没有任何机会评估止损。
+        回调抛异常只记警告, 不影响下单。
+        """
+        symbol = symbol or self.symbol
+        try:
+            return await self._place_limit_chase_impl(
+                side, quantity, symbol,
+                reduce_only=reduce_only, mark_price=mark_price,
+                max_steps=max_steps, window_sec=window_sec,
+                tag=tag, force_cross=force_cross, on_step=on_step,
+            )
+        except Exception as exc:  # noqa: BLE001  契约要求兜住一切非取消异常
+            logger.error("place_limit_chase 失败(已降级为失败结果): %s: %s",
+                         type(exc).__name__, exc)
+            return OrderResult(
+                ok=False, symbol=symbol,
+                side="BUY" if side.upper() == "LONG" else "SELL",
+                position_side=side.upper(),
+                quantity=0.0, requested_qty=float(quantity or 0),
+                cum_filled_qty=0.0, avg_price=0.0,
+                order_state=OrderState.UNKNOWN.value,
+                error=f"chase_error: {type(exc).__name__}: {exc}",
+            )
+
+    async def _place_limit_chase_impl(
+        self,
+        side: str,
+        quantity: float,
+        symbol: str,
+        *,
+        reduce_only: bool = False,
+        mark_price: Optional[float] = None,
+        max_steps: Optional[int] = None,
+        window_sec: Optional[float] = None,
+        tag: str = "ps",
+        force_cross: bool = False,
+        on_step: Optional[Any] = None,
     ) -> OrderResult:
         """被动限价挂单 (post-only) + 跟盘口重挂, 超时兜底.
 
@@ -1000,9 +1331,10 @@ class BinanceTestnetClient:
             做多: min(best_bid - pad*tick, best_ask - tick)   —— 绝不碰 best_ask
             做空: max(best_ask + pad*tick, best_bid + tick)   —— 绝不碰 best_bid
 
-        跟随逻辑: 每 PASSIVE_REPRICE_SEC 秒撤单重读盘口重挂。
-            市场朝我有利走 → 挂价跟着走 → 一路贴住最优价
-            市场朝我不利走 → 挂价也跟着走 → 始终留在盘口第一档等对手方
+        跟随逻辑: **盘口目标价一变就撤单重挂，不变就一直挂着**。
+            市场动了 → 挂价跟着走 → 一路贴住最优价
+            市场没动 → 挂单原地驻留 → 攒排队位置，而不是每 6 秒白排一次队尾
+            （2026-10-04 实测：无脑每 6 秒重挂 28 次，maker 成交率只剩 6%）
 
         兜底: 窗口 PASSIVE_WINDOW_SEC 用尽仍未成交, 按 PASSIVE_ON_TIMEOUT 处理:
             "cross"   → 穿盘口限价单成交 (taker, 与市价等价, 但有滑点上限)
@@ -1037,49 +1369,182 @@ class BinanceTestnetClient:
         attempts: List[Dict[str, Any]] = []
         pad = 0
 
-        while time.time() < deadline and len(attempts) < PASSIVE_MAX_REPRICE:
+        # 2026-10-04 修复「部分成交即结束」（P0）：
+        #
+        # 此前只要被动挂单成交了哪怕 0.0001，就立刻 return —— 剩下的量既不继续
+        # 追、也不走兜底。实测 13:46 那笔目标 0.2010 BTC 只成交 0.0048（2.4%），
+        # 被动尝试仅 1 次就收工，仓位凭空少掉 97.6%，风险暴露从计划的 1% 权益
+        # 掉到 0.024%。做对了也赚不到钱。
+        #
+        # 现在改成「成交多少、剩余多少继续追」：每次成交后把剩余量减掉，重新
+        # 挂下一档；直到全部成交、窗口耗尽、或剩余量小到交易所必然拒单为止。
+        # 窗口耗尽仍未补齐时，兜底只对**剩余量**下单，不重复整笔。
+        remaining = qty
+        maker_filled = 0.0
+        taker_filled = 0.0
+        # 安全检查点是否要求中止（在轮询回调里被置位，主循环据此收工）
+        abort: Dict[str, bool] = {"stop": False}
+        filled_quote = 0.0        # 累计成交额，用于算加权均价
+        min_notional = await self.min_notional(symbol)
+        last_res: Optional[OrderResult] = None
+
+        def below_min(q: float, price: float) -> bool:
+            """剩余量是否已经小到交易所必然拒单（再挂只是空转）。"""
+            if q <= 0:
+                return True
+            if min_notional > 0 and price > 0 and q * price < min_notional:
+                return True
+            return q < lot_step
+
+        def fill_px(r: Optional[OrderResult], fallback: float) -> float:
+            p = float(getattr(r, "avg_price", 0) or 0)
+            return p if p > 0 else fallback
+
+        def finalize(ok: bool, *, error: str = "",
+                     state: str = "") -> OrderResult:
+            """把多次成交合并成一个结果：数量累加、均价按成交额加权。"""
+            total = maker_filled + taker_filled
+            base = last_res if isinstance(last_res, OrderResult) else OrderResult(
+                ok=ok, symbol=symbol,
+                side="BUY" if is_long else "SELL",
+                position_side=side.upper(),
+            )
+            base.ok = ok
+            base.cum_filled_qty = total
+            base.quantity = total
+            base.avg_price = (filled_quote / total) if total > 0 else 0.0
+            base.requested_qty = quantity
+            base.submitted_qty = qty
+            if error:
+                base.error = error
+            if state:
+                base.status = state
+                base.order_state = state
+            return base
+
+        while (remaining > 0 and time.time() < deadline
+               and len(attempts) < PASSIVE_MAX_REPRICE):
             book = await self.book_ticker(symbol)
             bid, ask = book["bid"], book["ask"]
             if bid <= 0 or ask <= 0:
                 return OrderResult(
                     ok=False, error="book ticker unavailable", symbol=symbol
                 )
+            if on_step is not None:
+                # 安全检查点: 追价最长 180 秒, 这期间主循环被占住, 此前完全
+                # 没有机会评估灾难止损。回调返回真值即中止本次追价(此时尚未
+                # 挂出任何单, 不会有遗留挂单), 让主循环去处理止损。
+                try:
+                    if await on_step(bid, ask):
+                        return OrderResult(
+                            ok=False, symbol=symbol,
+                            side="BUY" if is_long else "SELL",
+                            position_side=side.upper(),
+                            quantity=0.0, requested_qty=quantity,
+                            submitted_qty=qty, cum_filled_qty=0.0,
+                            avg_price=0.0, client_order_id="",
+                            order_state=OrderState.CANCELED.value,
+                            error="chase_aborted: 安全检查点要求中止追价",
+                            raw={"chase": {"attempts": attempts,
+                                           "likely_maker": False}},
+                        )
+                except Exception as exc:  # noqa: BLE001 检查点故障不得影响下单
+                    logger.warning("chase on_step 回调失败(已忽略): %s", exc)
             if is_long:
                 px = min(bid - pad * tick, ask - tick)
             else:
                 px = max(ask + pad * tick, bid + tick)
             px = self._price_precision(px, tick)
 
+            if below_min(remaining, px):
+                # 剩余量已不可能再成交：按已成交量收工，不再空转。
+                break
+
             idx = len(attempts)
             cid = _new_client_order_id(f"{tag}{idx}")
+
+            async def _watch(_px: float = px, _pad: int = pad) -> bool:
+                """每个轮询周期跑一次：安全检查点 + 盘口变化检测。
+
+                返回真值 = 「该撤单了」。两种情况：
+                  1. 安全检查点要求中止追价（on_step 返回真值）；
+                  2. 盘口目标价已经变了，挂单价格不再贴盘口。
+                两者都必须放在轮询里：挂单驻留期间主循环被占住，这里是唯一
+                能及时发现灾难止损的机会，也是唯一能跟上盘口的地方。
+                """
+                book = await self.book_ticker(symbol)
+                nb, na = book["bid"], book["ask"]
+                if on_step is not None:
+                    try:
+                        if await on_step(nb, na):
+                            abort["stop"] = True
+                            return True
+                    except Exception as exc:  # noqa: BLE001 检查点故障不得影响下单
+                        logger.warning("chase on_step 回调失败(已忽略): %s", exc)
+                if nb <= 0 or na <= 0:
+                    return False
+                npx = self._price_precision(
+                    (min(nb - _pad * tick, na - tick) if is_long
+                     else max(na + _pad * tick, nb + tick)), tick
+                )
+                return abs(npx - _px) >= tick / 2
+
+            # 盘口不动就挂到窗口结束（价格一变由 _watch 提前叫停）；
+            # 刚被 post-only 拒过则只等一小会儿再试，避免在同一价位空转。
+            wait_sec = (
+                PASSIVE_REPRICE_SEC if pad > 0
+                else max(PASSIVE_REPRICE_SEC, deadline - time.time())
+            )
             res = await self.place_limit_order(
                 side,
-                qty,
+                remaining,
                 px,
                 symbol,
                 reduce_only=reduce_only,
                 client_order_id=cid,
-                fill_timeout_sec=PASSIVE_REPRICE_SEC,
-                poll_interval_sec=CHASE_POLL_INTERVAL,
+                fill_timeout_sec=wait_sec,
+                poll_interval_sec=PASSIVE_REST_POLL_SEC,
                 cancel_if_unfilled=True,
                 post_only=True,
+                price_watch=_watch,
             )
-            filled = float(res.cum_filled_qty or 0)
-            if filled > 0:
-                attempts.append({"step": idx, "price": px, "filled": filled,
+            last_res = res
+            got = float(res.cum_filled_qty or 0)
+            if got <= 0:
+                # 撤单后复核: 撤单与成交可能竞态
+                final = await self.query_order(client_order_id=cid, symbol=symbol)
+                final_filled = float(final.cum_filled_qty or final.filled_qty or 0)
+                if final.state == OrderState.FILLED or final_filled > 0:
+                    last_res = final.to_order_result()
+                    got = final_filled
+            if got > 0:
+                # post-only 成交必为 maker（GTX 会直接拒掉会立即成交的单）。
+                maker_filled += got
+                filled_quote += got * fill_px(last_res, px)
+                remaining = self._qty_precision(remaining - got, lot_step)
+                attempts.append({"step": idx, "price": px, "filled": got,
                                  "bid": bid, "ask": ask, "maker": True})
-                return self._finish_passive(res, attempts, maker=True,
-                                            reduce_only=reduce_only)
+                pad = 0
+                if abort["stop"]:
+                    break
+                continue
 
-            # 撤单后复核: 撤单与成交可能竞态
-            final = await self.query_order(client_order_id=cid, symbol=symbol)
-            final_filled = float(final.cum_filled_qty or final.filled_qty or 0)
-            if final.state == OrderState.FILLED or final_filled > 0:
-                attempts.append({"step": idx, "price": px, "filled": final_filled,
-                                 "bid": bid, "ask": ask, "maker": True})
-                return self._finish_passive(
-                    final.to_order_result(), attempts, maker=True,
-                    reduce_only=reduce_only,
+            if abort["stop"]:
+                # 安全检查点要求中止：已经拿到的被动成交不能被抹掉，
+                # 没有成交则明确返回中止，让主循环去处理止损。
+                if maker_filled + taker_filled > 0:
+                    break
+                return OrderResult(
+                    ok=False, symbol=symbol,
+                    side="BUY" if is_long else "SELL",
+                    position_side=side.upper(),
+                    quantity=0.0, requested_qty=quantity,
+                    submitted_qty=qty, cum_filled_qty=0.0,
+                    avg_price=0.0, client_order_id="",
+                    order_state=OrderState.CANCELED.value,
+                    error="chase_aborted: 安全检查点要求中止追价",
+                    raw={"chase": {"attempts": attempts,
+                                   "likely_maker": False}},
                 )
 
             if res.error and "POST_ONLY_REJECT" in res.error:
@@ -1092,8 +1557,21 @@ class BinanceTestnetClient:
             attempts.append({"step": idx, "price": px, "filled": 0.0,
                              "bid": bid, "ask": ask})
 
+        # 被动阶段已经把整笔吃满 —— 最好结果，不付任何 taker 费。
+        if remaining <= 0 and (maker_filled + taker_filled) > 0:
+            return self._finish_passive(
+                finalize(True, state=OrderState.FILLED.value),
+                attempts, maker=True, reduce_only=reduce_only,
+            )
+
         # ---- 兜底 --------------------------------------------------------
         if PASSIVE_ON_TIMEOUT == "abandon":
+            if maker_filled > 0:
+                # 已经拿到的 maker 成交不能被「放弃」抹掉。
+                return self._finish_passive(
+                    finalize(True, state=OrderState.CANCELED.value),
+                    attempts, maker=True, reduce_only=reduce_only,
+                )
             return OrderResult(
                 ok=False, symbol=symbol,
                 side="BUY" if is_long else "SELL", position_side=side.upper(),
@@ -1112,30 +1590,59 @@ class BinanceTestnetClient:
             (ask + PASSIVE_CROSS_TICKS * tick) if is_long
             else (bid - PASSIVE_CROSS_TICKS * tick), tick
         )
-        cid = _new_client_order_id(f"{tag}x")
-        res = await self.place_limit_order(
-            side, qty, cross_px, symbol,
-            # IOC 仍然是 LIMIT：立即成交可成交部分，余量由交易所取消。
-            # 不留下 GTC 挂单，避免运行器认为失败后该单又延迟成交。
-            time_in_force="IOC",
-            reduce_only=reduce_only, client_order_id=cid,
-            fill_timeout_sec=10.0, poll_interval_sec=CHASE_POLL_INTERVAL,
-            cancel_if_unfilled=False,
-        )
-        filled = float(res.cum_filled_qty or 0)
-        if filled > 0:
-            res.ok = True  # IOC 余量取消不抹掉已经确认的部分成交。
-            attempts.append({"step": len(attempts), "price": cross_px,
-                             "filled": filled, "bid": bid, "ask": ask,
-                             "maker": False, "cross": True})
-            return self._finish_passive(res, attempts, maker=False,
-                                        reduce_only=reduce_only)
+        # 兜底只对**剩余量**下单；被动阶段已经成交的部分不重复买。
+        cross_qty = remaining if remaining > 0 else 0.0
+        res = None
+        if cross_qty > 0 and not below_min(cross_qty, cross_px):
+            cid = _new_client_order_id(f"{tag}x")
+            res = await self.place_limit_order(
+                side, cross_qty, cross_px, symbol,
+                # IOC 仍然是 LIMIT：立即成交可成交部分，余量由交易所取消。
+                # 不留下 GTC 挂单，避免运行器认为失败后该单又延迟成交。
+                time_in_force="IOC",
+                reduce_only=reduce_only, client_order_id=cid,
+                fill_timeout_sec=10.0, poll_interval_sec=CHASE_POLL_INTERVAL,
+                cancel_if_unfilled=False,
+            )
+            last_res = res
+            got = float(res.cum_filled_qty or 0)
+            if got > 0:
+                taker_filled += got
+                filled_quote += got * fill_px(res, cross_px)
+                remaining = self._qty_precision(remaining - got, lot_step)
+                attempts.append({"step": len(attempts), "price": cross_px,
+                                 "filled": got, "bid": bid, "ask": ask,
+                                 "maker": False, "cross": True})
+        total_filled = maker_filled + taker_filled
+        mixed_maker = maker_filled > 0 and taker_filled <= 0
+        if total_filled > 0:
+            # 被动部分成交 + 兜底补齐（或兜底没补齐）：都按「成功的一部分」返回，
+            # 绝不因为兜底没成交就丢掉已经拿到的被动成交量。
+            tail = ""
+            if res is not None and remaining > 0:
+                tail = (f"partial_then_exhausted: 被动 {maker_filled:.6f} + "
+                        f"IOC 未补齐剩余 {remaining:.6f}; "
+                        f"{res.error or res.order_state}")
+            elif remaining > 0:
+                tail = (f"partial_below_min: 被动 {maker_filled:.6f}, "
+                        f"剩余 {remaining:.6f} 低于最小下单量")
+            return self._finish_passive(
+                finalize(True, state=OrderState.CANCELED.value, error=tail),
+                attempts, maker=mixed_maker, reduce_only=reduce_only,
+            )
         # 保留交易所实际订单状态/ID；网络未知不能伪称已经撤销。
-        res.error = (f"passive_exhausted: 被动 {len(attempts)} 次 + IOC限价兜底未确认成交; "
-                     f"{res.error or res.order_state}")
-        res.raw = {**(res.raw or {}),
-                   "chase": {"attempts": attempts, "likely_maker": False}}
-        return res
+        base = res if isinstance(res, OrderResult) else OrderResult(
+            ok=False, symbol=symbol,
+            side="BUY" if is_long else "SELL", position_side=side.upper(),
+        )
+        base.ok = False
+        base.requested_qty = quantity
+        base.submitted_qty = qty
+        base.error = (f"passive_exhausted: 被动 {len(attempts)} 次 + IOC限价兜底未确认成交; "
+                      f"{getattr(base, 'error', '') or getattr(base, 'order_state', '')}")
+        # 复用同一套 chase meta 键名；2026-10-03 手写 {"attempts","likely_maker"} 导致
+        # 日志把 steps/passive 读成 0（「taker 被动0次」），真实原因被挡住。
+        return self._with_passive_meta(base, attempts, maker=False)
 
     @staticmethod
     def _finish_passive(
@@ -1164,6 +1671,16 @@ class BinanceTestnetClient:
             "likely_maker": bool(maker),
             "passive_attempts": sum(
                 1 for a in attempts if a.get("maker") or a.get("reject")
+            ),
+            # 2026-10-04: 一笔追价可能「被动成交一部分 + 兜底再成交一部分」，
+            # 单一 likely_maker 布尔量说不清成本结构，所以把两部分成交量分开记。
+            # 面板/日志可以据此算真实加权费率（maker 2bps / taker 4bps）。
+            "maker_filled": sum(
+                float(a.get("filled") or 0.0) for a in attempts if a.get("maker")
+            ),
+            "taker_filled": sum(
+                float(a.get("filled") or 0.0) for a in attempts
+                if a.get("filled") and not a.get("maker")
             ),
         }
         raw = res.raw if isinstance(res.raw, dict) else {}
@@ -1199,13 +1716,20 @@ class BinanceTestnetClient:
         *,
         limit: int = 50,
         start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        strict: bool = False,
     ) -> List[Dict[str, Any]]:
         """历史成交 (GET /fapi/v1/userTrades) —— 含 realizedPnl 与 commission.
 
         这是「赚了多少」的唯一可信来源: 逐笔已实现盈亏与手续费都取自交易所,
         不由本地账本推算。
 
-        start_time 为毫秒时间戳, 用于只取统计起点之后的成交。
+        start_time / end_time 为毫秒时间戳。**币安硬性要求两者跨度不超过 7 天**，
+        超出会直接报错；需要更长区间时必须自己按 ≤7 天分窗多次调用。
+
+        strict=False（默认）保持历史行为：接口报错时返回空列表。这在回放/面板
+        里会把「查询失败」伪装成「没有成交」，所以做对账时必须传 strict=True，
+        让错误显式抛出来。
         """
         symbol = symbol or self.symbol
         params: Dict[str, Any] = {
@@ -1214,9 +1738,54 @@ class BinanceTestnetClient:
         }
         if start_time:
             params["startTime"] = int(start_time)
+        if end_time:
+            params["endTime"] = int(end_time)
         raw = await self._request(
             "GET", "/fapi/v1/userTrades", params, signed=True
         )
+        if isinstance(raw, list):
+            return raw
+        if strict:
+            raise BinanceClientError(
+                f"userTrades 返回非列表（可能超出 7 天跨度限制）: {str(raw)[:200]}"
+            )
+        return []
+
+    async def income(
+        self,
+        symbol: Optional[str] = None,
+        *,
+        income_type: Optional[str] = None,
+        limit: int = 100,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        strict: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """账户收支明细 (GET /fapi/v1/income) —— 只读查询.
+
+        资金费 (incomeType=FUNDING_FEE) 只有这里能拿到: userTrades 的
+        commission 不含资金费, 所以成本必须分两处取, 不能混成一个数。
+
+        与 user_trades 同样受 7 天跨度限制；strict=True 时错误显式抛出。
+        """
+        symbol = symbol or self.symbol
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "limit": max(1, min(int(limit), 1000)),
+        }
+        if income_type:
+            params["incomeType"] = income_type
+        if start_time:
+            params["startTime"] = int(start_time)
+        if end_time:
+            params["endTime"] = int(end_time)
+        raw = await self._request(
+            "GET", "/fapi/v1/income", params, signed=True
+        )
+        if not isinstance(raw, list) and strict:
+            raise BinanceClientError(
+                f"income 返回非列表（可能超出 7 天跨度限制）: {str(raw)[:200]}"
+            )
         return raw if isinstance(raw, list) else []
 
     async def market_close(self, symbol: Optional[str] = None) -> OrderResult:

@@ -1,8 +1,8 @@
 {
   "strategy_id": "deployed_kdj_eth_extreme_v1",
   "runtime_key": "eth15",
-  "name": "KDJ 交叉反手 (ETHUSDT 15m)",
-  "kind": "mean_reversion",
+  "name": "KDJ×MACD 趋势分层 (ETHUSDT 15m)",
+  "kind": "trend_following",
   "timeframe": "15m",
   "risk_timeframe": "1h",
   "symbol": "ETHUSDT",
@@ -11,32 +11,41 @@
   "entry": {
     "golden_cross": "K[t-1] <= D[t-1] and K[t] > D[t]",
     "dead_cross": "K[t-1] >= D[t-1] and K[t] < D[t]",
-    "long": "金叉做多（无 K 数值阈值）",
-    "short": "死叉做空（无 K 数值阈值）",
-    "execution": "t 收盘判定, 与同标的 5m 策略合成净仓后限价追价"
+    "long": "金叉且 MACD 能量柱为正（绿柱）：空仓开多；已多则同向加一层；下一根开盘下限价单",
+    "short": "死叉且 MACD 能量柱为负（红柱）：空仓开空；已空则同向加一层；下一根开盘下限价单",
+    "execution": "当根收盘同时判定交叉与能量柱方向，下一根开盘与 5m 合成净仓再限价追价",
+    "divergence": "金叉遇红柱 / 死叉遇绿柱 → 方向背离，丢弃不操作：不开新仓、不加仓、不平仓、不反手",
+    "same_side_add": "只对同向且通过 MACD 方向闸门的 KDJ 回调恢复交叉加仓；每次加一层，最多 3 层；达到上限后忽略同向信号"
   },
   "exit": {
-    "mode_a": "对侧交叉 → 平旧仓，交易所确认归零后再开新方向"
+    "mode_a": "有效对侧交叉同样要过能量柱方向闸门：清空全部累计层，再以第 1 层反手；背离交叉不动仓"
   },
   "indicators": {
     "KDJ": "(9,3,3) 15m",
+    "MACD": "(12,26,9) 15m —— 只取能量柱正负作为方向闸门; DIF=EMA12-EMA26; DEA=EMA9(DIF); 柱=DIF-DEA; 绿柱>0, 红柱<0",
     "ATR": "(14) 1h Wilder，用于仓位",
     "BOLL": "(20,2) 15m —— 仅记录"
   },
   "position_sizing": {
     "formula": "qty = 权益_USDT × r ÷ (k × ATR_1H)",
-    "r": 0.03,
+    "r": 0.01,
     "k": 2,
     "step": 0.001,
-    "note": "与 5m 策略各记各的仓，ETHUSDT 只下净额；不与 BTC 混仓"
+    "note": "与 5m 策略各记各的仓，ETHUSDT 只下净额；不与 BTC 混仓",
+    "per_layer": "第1层 r=0.01；第2/3层 r=0.005；qty = 权益_USDT × 分层r ÷ (k × ATR_1H)，向下取整",
+    "layer_risk_r": [0.01, 0.005, 0.005],
+    "max_layers": 3,
+    "total_exposure_note": "同向最多 3 层；第1层风险 1%，第2/3层各 0.5%，单标的保证金预算上限 70%"
   },
   "risk": {
     "leverage": 10,
     "margin": "isolated",
     "max_concurrent": 1,
     "daily_loss_stop": 0.03,
-    "max_drawdown_stop": 0.10,
-    "disaster_stop": "ETHUSDT 净仓浮亏 ≥ 3 × ATR_1H → 清掉 ETH 两条虚拟仓并同步净仓"
+    "max_drawdown_stop": 0.1,
+    "disaster_stop": "ETHUSDT 净仓浮亏 ≥ 3 × ATR_1H → 清掉 ETH 两条虚拟仓并同步净仓",
+    "max_layers": 3,
+    "layer_limit": "仅限同一标的同一15m策略；有效反向统一清仓后重新从第1层计数"
   },
   "execution_style": {
     "order_type": "LIMIT_GTX_POST_ONLY_THEN_LIMIT_CROSS",
@@ -46,5 +55,5 @@
   "status": "testnet_ready_manual_activation",
   "enabled": true,
   "source": "user_spec",
-  "note": "2026-10-02 第三条策略。ETH 15m 与 BTC 15m 同一套交叉规则。冷启动不追溯旧 K 线。"
+  "note": "2026-10-04：BTC 15m 与 ETH 15m 统一采用首层 r=0.01、后续层 r=0.005，单标的保证金预算上限 70%。"
 }

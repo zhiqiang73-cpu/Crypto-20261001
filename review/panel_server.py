@@ -14,38 +14,347 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import datetime
 import json
 import logging
 import os
 import sys
+import time
 from typing import Any, Dict, Optional
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
 # ---------------------------------------------------------------------------
-# 统计起点
+# 记录起点（用户要求：历史清零，系统从某一刻起重新记录）
 #
-# 用户要求：「赚了多少」与胜率等**统计指标**从 2026-10-02 起算。
+# 优先级：config/record_start.json > 环境变量 STATS_START_DATE > 默认值。
+# 时间按本机时区（北京时间 UTC+8）解释，支持 "YYYY-MM-DD" 或
+# "YYYY-MM-DD HH:MM"，精确到分钟。
 #
-# ⚠ 起算日只作用于统计指标（/api/account/summary）。历史委托与历史成交
-# 必须返回**完整**历史 —— 它们曾经错误地复用了这个过滤，导致起算日之前的
-# 委托/成交在页面上凭空消失。不要再把它们接回来。
+# ⚠ 交易所的委托/成交记录无法删除，只能按起点过滤显示；本地运行日志另行
+#   归档重置（见 runtime/shadow/_archive_reset_*）。持仓、余额、挂单是
+#   实时状态，不受记录起点影响。
 #
-# 日期按本机时区的当日 00:00 解释，可用环境变量 STATS_START_DATE 覆盖。
+# 历史教训：起算日曾经只作用于统计指标，而委托/成交复用它会「凭空消失」。
+# 现在的语义是明确的「记录起点」：用户要求页面上从此刻起只显示新记录，
+# 因此 /api/binance/orders 与 /api/binance/trades 也按同一起点过滤。
 # ---------------------------------------------------------------------------
-STATS_START_DATE = os.getenv("STATS_START_DATE", "2026-10-02")
+# 净仓对齐死区：与 shadow/deploy.py::SYNC_MIN_DELTA 同口径（2 个最小步长）。
+# 步长取整会让账本与交易所偶尔差一个步长，那种差值不构成「不属于同一笔仓」。
+MIN_SYNC_STEP = 0.002
+
+# 账本缓存：完整持仓周期要按 ≤7 天分窗拉多页成交与资金费，若每次刷新都全量
+# 重拉会明显加重 REST 负担（此前已因轮询过密被交易所限流）。默认 30 秒内复用。
+LEDGER_TTL_MS = 30_000
+_LEDGER_CACHE: Dict[str, Any] = {"at_ms": 0, "data": None}
+
+DEFAULT_RECORD_START = "2026-10-02"
+RECORD_START_FILE = os.path.join(ROOT, "config", "record_start.json")
+
+
+def record_start_text() -> str:
+    """记录起点原文：配置文件优先，其次环境变量，最后默认值。"""
+    try:
+        with open(RECORD_START_FILE, encoding="utf-8") as fh:
+            value = str((json.load(fh) or {}).get("record_start") or "").strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return os.getenv("STATS_START_DATE", DEFAULT_RECORD_START)
+
+
+def parse_local_ms(text: str) -> int:
+    """本机时区 "YYYY-MM-DD[ HH:MM[:SS]]" → 毫秒；无法解析返回 0。"""
+    from datetime import datetime as _dt
+
+    raw = str(text or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return int(_dt.strptime(raw, fmt).timestamp() * 1000)
+        except Exception:
+            continue
+    return 0
 
 
 def stats_start_ms() -> int:
-    """统计起点的毫秒时间戳；日期无效时返回 0，表示不过滤。"""
+    """记录起点的毫秒时间戳；无法解析时返回 0，表示不过滤。"""
+    return parse_local_ms(record_start_text())
+
+
+def record_start_label() -> str:
+    """记录起点的展示文案（北京时间）。"""
+    ms = stats_start_ms()
+    if not ms:
+        return "不限"
     from datetime import datetime as _dt
 
+    return _dt.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
+
+
+def _trade_row_ms(row: Dict[str, Any]) -> int:
+    """运行记录 deployed_trades.csv 的「时间」列 → 毫秒。
+
+    ⚠ 该列由运行器 shadow/deploy.py 的 _fmt() 写成 **UTC**
+    （datetime.fromtimestamp(..., tz=timezone.utc)），不是北京时间。
+    面板内部统一用毫秒时间戳比较，展示时才换算为北京时间；这里必须按
+    UTC 解析，否则北京时间会被当成 UTC，记录起点的过滤会整体偏移 8 小时。
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    raw = str(row.get("时间") or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return int(
+                _dt.strptime(raw, fmt).replace(tzinfo=_tz.utc).timestamp() * 1000
+            )
+        except Exception:
+            continue
+    return 0
+
+
+def _quality_context(start_ms: int = 0) -> Dict[str, Any]:
+    """读取本地运行记录，提供前端风险质量卡的可审计上下文。
+
+    这里只读 runtime/shadow；不修改状态、不清理日志，也不把观察行冒充成交。
+    start_ms > 0 时只统计记录起点之后的行，使回撤与原因记录从起点重新累计。
+    """
+    from collections import Counter
+
+    state_path = os.path.join(ROOT, "runtime", "shadow", "deployed_state.json")
+    trade_path = os.path.join(ROOT, "runtime", "shadow", "deployed_trades.csv")
+    heartbeat_path = os.path.join(ROOT, "runtime", "shadow", "runner_heartbeat.json")
+    state: Dict[str, Any] = {}
+    heartbeat: Dict[str, Any] = {}
+    reasons: Counter[str] = Counter()
+    equity: list[float] = []
     try:
-        d = _dt.strptime(STATS_START_DATE.strip(), "%Y-%m-%d")
+        with open(state_path, encoding="utf-8") as fh:
+            state = json.load(fh)
     except Exception:
-        return 0
-    return int(d.timestamp() * 1000)
+        pass
+    try:
+        with open(heartbeat_path, encoding="utf-8") as fh:
+            heartbeat = json.load(fh)
+    except Exception:
+        pass
+    try:
+        with open(trade_path, encoding="utf-8", newline="") as fh:
+            rows = list(csv.DictReader(fh))
+            if start_ms:
+                rows = [r for r in rows if _trade_row_ms(r) >= start_ms]
+            for row in rows[-300:]:
+                note = str(row.get("说明") or "").strip()
+                if note and note not in {"观察", "同向持仓"}:
+                    reasons[note] += 1
+                try:
+                    value = float(str(row.get("权益") or "").replace(",", ""))
+                    if value > 0:
+                        equity.append(value)
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        pass
+    max_drawdown = 0.0
+    peak = 0.0
+    for value in equity:
+        peak = max(peak, value)
+        if peak > 0:
+            max_drawdown = max(max_drawdown, (peak - value) / peak)
+    strategies = [str(x) for x in (heartbeat.get("strategies") or [])]
+    return {
+        "recorded_max_drawdown": max_drawdown,
+        "recorded_equity_points": len(equity),
+        # 日亏额度与峰值：从运行器状态文件带出，供前端风控状态条使用。
+        "day_start_eq": float(state.get("day_start_eq") or 0) or None,
+        "peak": float(state.get("peak") or 0) or None,
+        "recent_reasons": [
+            {"text": text, "count": count}
+            for text, count in reasons.most_common(4)
+        ],
+        "active_strategies": strategies,
+        # 2026-10-04: 原判据是 `"5" in x`，而 kdj15/eth15 里也含字符 5，
+        # 于是 5m 已停用时该标志仍为 False（误报「5m 还在跑」）。
+        # 现在问的是「运行进程上报的策略里，有没有 5m 的 id」。
+        "five_minute_disabled": not any(
+            s in FIVE_MINUTE_STRATEGY_IDS for s in strategies
+        ),
+        "halted": bool(state.get("halted")),
+        "missed_bars": int(state.get("missed_bars") or 0),
+        "missed_signals": int(state.get("missed_signals") or 0),
+        "source": "runtime/shadow/deployed_state.json + deployed_trades.csv + runner_heartbeat.json",
+    }
+
+
+def shadow_ledger_claim(symbol: str, exchange_signed: float) -> str:
+    """交易所这笔净仓是否属于 shadow runner 的策略账本？属于则返回原因。
+
+    2026-10-04：面板的 legacy executor 只认它自己的账本，看不到 runner 的仓位，
+    因此把 runner 的 BTC/ETH 仓当成「孤儿仓」。面板上点「清孤儿仓 / 立即平仓」
+    会真的把策略仓平掉。
+
+    这里只做**只读**归属判定，证据来自 runner 自己的状态文件：
+      方向一致 且 数量差 ≤ 2 个最小步长  → 认定归 runner，面板不得平。
+    证据不足返回空串（不阻断），以免误伤面板自己的仓。
+
+    判定刻意保守：宁可不拦，也不误判方向相反的仓位。
+    """
+    if abs(exchange_signed) < 1e-9:
+        return ""
+    path = os.path.join(ROOT, "runtime", "shadow", "deployed_state.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            st = json.load(fh)
+    except Exception:  # noqa: BLE001  读不到就不拦（保底不误伤）
+        return ""
+    try:
+        ledger = float((desired_nets(st) or {}).get(symbol) or 0.0)
+    except Exception:  # noqa: BLE001
+        return ""
+    if abs(ledger) < 1e-9 or ledger * exchange_signed <= 0:
+        return ""
+    if abs(ledger - exchange_signed) > 2 * MIN_SYNC_STEP:
+        return ""
+    return (f"{symbol} 这笔净仓归 shadow runner 策略账本"
+            f"（账本 {ledger:+.4f} / 交易所 {exchange_signed:+.4f}）。"
+            f"面板不会平掉策略仓；要平请走运行器流程或人工确认。")
+
+
+def _slippage_estimate(positions: Optional[Dict[str, Any]] = None,
+                       start_ms: int = 0) -> Dict[str, Any]:
+    """执行滑点：交易所实际成交价 vs 策略账本参考价。
+
+    只读本机 runtime/shadow，不改交易链路。两条口径，逐笔精确配对，
+    绝不用时间猜测把不相干的成交和信号硬凑在一起：
+
+    1. 台账口径：deployed_orders.jsonl 里带 signal_price 的委托
+       （下单时写入的虚拟仓参考价）逐笔对比成交均价。
+    2. 持仓口径：当前持仓用交易所 entry_price 对比账本 entry.px，
+       这是此刻真实存在的执行偏差，可立即核对。
+
+    两条都拿不到时返回 None，并在口径说明里写清原因，不编造数字。
+    start_ms > 0 时只统计记录起点之后的持仓，避免把清零前的开仓滑点算进新账。
+    """
+    total = 0.0
+    matched = 0
+    considered = 0
+
+    # 1) 台账口径（逐笔精确）
+    try:
+        with open(
+            os.path.join(ROOT, "runtime", "shadow", "deployed_orders.jsonl"),
+            encoding="utf-8",
+        ) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                action = str(o.get("action") or "")
+                if "LONG" not in action and "SHORT" not in action:
+                    continue
+                try:
+                    fill = float(o.get("avg_price") or 0)
+                    qty = float(o.get("filled") or 0)
+                    ref = float(o.get("signal_price") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if fill <= 0 or qty <= 0:
+                    continue
+                considered += 1
+                if ref <= 0:
+                    continue
+                direction = 1 if "LONG" in action else -1
+                total += (fill - ref) * direction * qty
+                matched += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+    if matched:
+        return {
+            "slippage_est": total,
+            "slippage_matched": matched,
+            "slippage_candidates": considered,
+            "slippage_basis": (
+                f"台账逐笔口径：成交均价 − 策略参考价（{matched}/{considered} 笔）"
+            ),
+        }
+
+    # 2) 持仓口径（当前持仓，交易所 entry_price vs 账本 entry.px）
+    state: Dict[str, Any] = {}
+    try:
+        with open(
+            os.path.join(ROOT, "runtime", "shadow", "deployed_state.json"),
+            encoding="utf-8",
+        ) as fh:
+            state = json.load(fh)
+    except Exception:  # noqa: BLE001
+        state = {}
+    books = state.get("strategies") or {}
+    hold_total = 0.0
+    hold_matched = 0
+    for symbol in TRADE_SYMBOLS:
+        pos = (positions or {}).get(symbol) or {}
+        try:
+            ex_px = float(pos.get("entry_price") or 0)
+            ex_qty = abs(float(pos.get("quantity") or 0))
+        except (TypeError, ValueError):
+            continue
+        if ex_px <= 0 or ex_qty <= 0:
+            continue
+        ref_px = 0.0
+        ref_qty = 0.0
+        for book in books.values():
+            entry = book.get("entry") or {}
+            if str(entry.get("symbol") or "") != symbol:
+                continue
+            try:
+                q = abs(float(entry.get("qty") or 0))
+                p = float(entry.get("px") or 0)
+                entry_ms = int(entry.get("ms") or 0)
+            except (TypeError, ValueError):
+                continue
+            if start_ms and entry_ms and entry_ms < start_ms:
+                # 清零前开的仓不计入新账（持仓本身保留）。
+                continue
+            if q > 0 and p > 0:
+                ref_px += p * q
+                ref_qty += q
+        if ref_qty <= 0:
+            continue
+        ref = ref_px / ref_qty
+        side = str(pos.get("side") or "FLAT").upper()
+        direction = 1 if side == "LONG" else (-1 if side == "SHORT" else 0)
+        if not direction:
+            continue
+        hold_total += (ex_px - ref) * direction * ex_qty
+        hold_matched += 1
+
+    if hold_matched:
+        return {
+            "slippage_est": hold_total,
+            "slippage_matched": hold_matched,
+            "slippage_candidates": hold_matched,
+            "slippage_basis": (
+                f"持仓口径：交易所开仓价 − 账本参考价（{hold_matched} 个标的，"
+                "逐笔台账参考价自下次运行器重启后开始记录）"
+            ),
+        }
+
+    return {
+        "slippage_est": None,
+        "slippage_matched": 0,
+        "slippage_candidates": considered,
+        "slippage_basis": (
+            f"暂不可测：记录起点之后暂无带参考价的台账成交（台账 {considered} 笔）"
+            "，也没有起点之后新开的持仓可比对"
+        ),
+    }
 
 
 try:
@@ -57,6 +366,7 @@ from config.review import (
     PANEL_HOST,
     PANEL_HTML,
     PANEL_PORT,
+    PANEL_STATIC_DIR,
     SETTLE_CONFIG,
     VALID_SAMPLE_TARGET,
 )
@@ -65,11 +375,18 @@ from config.strategy_registry import load_registry, upsert_strategy
 from engine.scorer import FactorScoringEngine
 from models.review import SettleStatus, TradeRecord, now_ms
 from models.signals import DimensionScores, StrategyHorizon
-from review import meta_review, overrides, review_loop
+from review import cycle_pnl, meta_review, overrides, review_loop
 from review.order_sources import (SOURCE_LABELS, annotate_orders, annotate_trades,
                                   load_strategy_order_ids, summarize)
-from shadow.strategy_books import (TRADE_SYMBOLS, desired_net, desired_nets,
-                                   position_sources, runtime_view)
+from shadow.strategy_books import (SPEC_5M, SPEC_ETH_5M, TRADE_SYMBOLS,
+                                   desired_net, desired_nets, position_sources,
+                                   runtime_view)
+# 5m 策略的 id 取自规格定义（SPEC_5M / SPEC_ETH_5M 保留定义但不在 SPECS 里，
+# 表示「已停用」）。不要用 `"5" in strategy_id` 之类的字符串包含判断：
+# kdj15 / eth15 里也含字符 5。
+FIVE_MINUTE_STRATEGY_IDS = (SPEC_5M.id, SPEC_ETH_5M.id)
+from shadow.external_watch import request_resume as request_external_resume
+from shadow.external_watch import summarize as external_summary
 from review.journal import TradeJournal, new_trade_id
 from review.settle import settle_pending
 from review.stats import compute_stats
@@ -154,6 +471,11 @@ def create_app(
             response = web.Response(status=204)
         else:
             response = await handler(request)
+        # 面板接口是实时账户状态，绝不能被浏览器缓存：
+        # 否则页面可能显示上一次请求的仓位/盈亏/干预状态（已实际踩到）。
+        if request.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
         origin = request.headers.get("Origin", "")
         if origin in {"http://127.0.0.1:8788", "http://localhost:8788"}:
             response.headers["Access-Control-Allow-Origin"] = origin
@@ -192,6 +514,17 @@ def create_app(
         if not PANEL_HTML.exists():
             return web.Response(text="panel html missing", status=404)
         return web.FileResponse(PANEL_HTML)
+
+    async def static_asset(request):
+        """前端静态资源与 /api/* 同源，避免跨端口与缓存不一致。"""
+        name = os.path.basename(request.match_info.get("name") or "")
+        allowed = {"app.js", "chart.js", "styles.css", "index.html"}
+        if name not in allowed:
+            return web.Response(text="not found", status=404)
+        path = PANEL_STATIC_DIR / name
+        if not path.exists():
+            return web.Response(text="not found", status=404)
+        return web.FileResponse(path)
 
     # ------------------------------------------------------------------ live
     async def api_live(request):
@@ -478,9 +811,45 @@ def create_app(
                 status["exchange_position"] = exchange_positions["BTCUSDT"]
         status["exchange_positions"] = exchange_positions
         status["open_orders"] = open_orders
+        # 人工干预状态：运行器检测到网页/面板手动下单后会写进状态文件。
+        # 页面据此显示「已暂停自动开仓」并提供人工确认恢复。
+        status["external_interventions"] = external_summary(live)
         return web.json_response(status)
 
-    async def api_trading_flatten_orphan(_request):
+    async def api_external_resume(request):
+        """人工确认恢复：写入一次性请求，运行器下一轮消费。"""
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        symbol = str((body or {}).get("symbol") or "").strip().upper()
+        if symbol not in TRADE_SYMBOLS:
+            return web.json_response(
+                {"ok": False, "error": f"未知标的: {symbol or '(空)'}"}, status=400
+            )
+        at = request_external_resume(symbol, now=now_ms())
+        return web.json_response({"ok": True, "symbol": symbol, "requested_ms": at})
+
+    async def api_trading_flatten_orphan(request):
+        # 归属闸门：属于 shadow runner 的仓位，面板不得平掉。
+        client0 = review.executor.client
+        symbol0 = getattr(client0, "symbol", None) or "BTCUSDT"
+        if client0.configured:
+            try:
+                pos0 = await client0.get_position(symbol0)
+                signed0 = float(getattr(pos0, "quantity", 0) or 0) * (
+                    1.0 if (getattr(pos0, "side", "FLAT") or "").upper() == "LONG"
+                    else -1.0 if (getattr(pos0, "side", "FLAT") or "").upper() == "SHORT"
+                    else 0.0)
+                blocked = shadow_ledger_claim(symbol0, signed0)
+                if blocked:
+                    return web.json_response(
+                        {"ok": False, "stage": "ownership_gate",
+                         "error": "shadow_owned_position", "detail": blocked},
+                        status=409,
+                    )
+            except Exception as exc:  # noqa: BLE001  闸门自身出错不阻断既有流程
+                logger.warning("flatten_orphan 归属判定失败: %s", exc)
         out = await review.executor.flatten_orphan()
         return web.json_response(out)
 
@@ -577,11 +946,19 @@ def create_app(
                 "reconciliation": recon,
             }, status=502)
 
-    async def api_testnet_flatten_now(_request):
+    async def api_testnet_flatten_now(request):
         """平掉当前观测到的 Testnet BTCUSDT 仓位，并强制重新对账。
 
         平仓后必须对账，否则本地账本会与交易所脱节并永久阻塞开仓。
+
+        归属闸门（2026-10-04）：若该仓位归 shadow runner 策略账本，默认拒绝；
+        只有请求体显式带 {"force": true} 才放行——避免面板误点平掉策略仓。
         """
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001  无 body / 非 JSON 都按未强制处理
+            body = {}
+        force = bool((body or {}).get("force"))
         client = review.executor.client
         if not client.configured:
             return web.json_response(
@@ -601,6 +978,17 @@ def create_app(
                     "position_after": {"side": "FLAT", "quantity": 0.0},
                     "reconciliation": recon,
                 })
+            # 归属闸门：属于 shadow runner 的仓位必须显式强制才允许平。
+            signed_now = qty if side == "LONG" else (-qty if side == "SHORT" else 0.0)
+            blocked = shadow_ledger_claim(getattr(client, "symbol", None) or "BTCUSDT",
+                                          signed_now)
+            if blocked and not force:
+                return web.json_response(
+                    {"ok": False, "stage": "ownership_gate",
+                     "error": "shadow_owned_position", "detail": blocked,
+                     "hint": '确认要由面板强平时，请带 {"force": true} 重发。'},
+                    status=409,
+                )
             close = await client.place_limit_chase(
                 "SHORT" if side == "LONG" else "LONG", qty, reduce_only=True,
                 tag="usr",
@@ -943,12 +1331,20 @@ def create_app(
             orders = annotate_orders(
                 orders, strategy_order_ids=load_strategy_order_ids()
             )
+            # 记录起点：用户要求历史清零，交易所记录无法删除，只能过滤显示。
+            start = stats_start_ms()
+            if start:
+                orders = [
+                    o for o in orders
+                    if int(o.get("updateTime") or o.get("time") or 0) >= start
+                ]
             counts = summarize(orders)
             return web.json_response({
                 "connected": True,
                 "orders": orders,
                 "scope": "recent_7d", "limit": limit,
                 "truncated": len(orders) >= limit,
+                "record_start": record_start_label(),
                 "source_counts": counts,
                 "source_labels": SOURCE_LABELS,
             })
@@ -983,12 +1379,19 @@ def create_app(
             trades = annotate_trades(
                 trades, parents, strategy_order_ids=load_strategy_order_ids()
             )
+            # 记录起点：与委托同一起点，避免「委托已清零、成交还在」。
+            start = stats_start_ms()
+            if start:
+                trades = [
+                    t for t in trades if int(t.get("time") or 0) >= start
+                ]
             counts = summarize(trades)
             return web.json_response({
                 "connected": True,
                 "trades": trades,
                 "scope": "recent_7d", "limit": limit,
                 "truncated": len(trades) >= limit,
+                "record_start": record_start_label(),
                 "source_counts": counts,
                 "source_labels": SOURCE_LABELS,
             })
@@ -1002,8 +1405,13 @@ def create_app(
     async def api_account_summary(_request):
         """账户汇总: 余额 + 已实现/未实现盈亏 + 手续费 + 胜率与盈亏比.
 
-        顶层是最近七天内且在起算日之后；available_history 是最近七天最多200笔。
-        不能将默认近七天窗口伪称「全部历史」或「累计收益」。
+        口径（2026-10-04 审计后修正）: 顶层是**自记录起点起的完整持仓周期**。
+        每一笔 = 一次从空仓到再次空仓的完整交易（开仓/加层/减仓/反手/平仓
+        配对），净额 = 已实现 − 手续费 + 资金费。不再是「每标的最近 200 笔
+        成交腿」——那会把分批平仓算成多笔交易、并漏掉窗口外的开仓手续费。
+
+        覆盖度由 coverage 字段给出：数据起点、是否被截断、以及有没有被窗口
+        切成两半的持仓（orphan_closes）。
         """
         client = review.executor.client
         if not client.configured:
@@ -1016,45 +1424,128 @@ def create_app(
             upnl = float(getattr(bal, "total_unrealized_pnl", 0) or 0)
             if not upnl:
                 upnl = float(getattr(pos, "unrealized_pnl", 0) or 0)
-            all_trades = []
-            try:
-                all_trades = await _rows_for_symbols(client, "user_trades", 200)
-            except Exception as exc:
-                return web.json_response({"connected": False,
-                                          "reason": f"成交查询失败: {type(exc).__name__}: {exc}"})
-
-            def bucket(rows):
-                pnls = [float(t.get("realizedPnl", 0) or 0) for t in rows]
-                realized = sum(pnls)
-                commission = sum(float(t.get("commission", 0) or 0) for t in rows)
-                wins = sum(1 for p in pnls if p > 0)
-                losses = sum(1 for p in pnls if p < 0)
-                gross_win = sum(p for p in pnls if p > 0)
-                gross_loss = -sum(p for p in pnls if p < 0)
-                return {
-                    "trade_count": len(rows),
-                    "realized_pnl": realized,
-                    "commission": commission,
-                    "net_pnl": realized - commission,
-                    "closed_trades": wins + losses,
-                    "wins": wins,
-                    "losses": losses,
-                    "win_rate": (wins / (wins + losses)) if (wins + losses) else 0.0,
-                    "profit_factor": (
-                        (gross_win / gross_loss) if gross_loss > 0 else None
-                    ),
-                }
-
+            # 完整持仓周期账本：分页取全部成交（不再用每标的 200 笔上限，
+            # 那会把开仓腿截断在窗口之外、漏掉开仓手续费），再按开仓/加层/
+            # 减仓/反手/平仓配成完整交易，最后按时间把资金费归属到周期。
+            # 因此下面每一个「笔」= 一个完整持仓周期，而不是一笔成交腿。
             start = stats_start_ms()
-            scoped = bucket(
-                [t for t in all_trades if int(t.get("time", 0) or 0) >= start]
-            ) if start else bucket(all_trades)
-            every = bucket(all_trades)
+            now_ms = int(time.time() * 1000)
+            cached = _LEDGER_CACHE.get("data")
+            if cached is None or now_ms - int(_LEDGER_CACHE.get("at_ms") or 0) > LEDGER_TTL_MS:
+                # 回看 7 天：足以接上跨记录起点的持仓，又不会把窗口拉太长。
+                try:
+                    from review.order_sources import load_strategy_order_ids
+                    strat_orders = set(load_strategy_order_ids())
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("策略委托台账读取失败，全部记为未识别: %s", exc)
+                    strat_orders = set()
+                cached = await cycle_pnl.build_ledger(
+                    client, TRADE_SYMBOLS, start, context_days=7,
+                    strategy_orders=strat_orders,
+                )
+                _LEDGER_CACHE["data"] = cached
+                _LEDGER_CACHE["at_ms"] = now_ms
+            ledger = cached
+            if ledger["errors"] and not ledger["per_symbol"]:
+                first = next(iter(ledger["errors"].values()))
+                return web.json_response(
+                    {"connected": False, "reason": f"成交查询失败: {first}"}
+                )
+
+            scoped = dict(ledger["total"])
+            every = dict(scoped)
+
+            pos_by_symbol: Dict[str, Any] = {}
+            for sym in TRADE_SYMBOLS:
+                try:
+                    p = await client.get_position(sym)
+                    pos_by_symbol[sym] = {
+                        "symbol": sym,
+                        "side": str(getattr(p, "side", "FLAT") or "FLAT"),
+                        "quantity": float(getattr(p, "quantity", 0) or 0),
+                        "entry_price": float(getattr(p, "entry_price", 0) or 0),
+                        "unrealized_pnl": float(
+                            getattr(p, "unrealized_pnl", 0) or 0
+                        ),
+                        "notional": float(getattr(p, "notional", 0) or 0),
+                        "margin": float(getattr(p, "margin", 0) or 0),
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("summary position %s: %s", sym, exc)
+            by_symbol: Dict[str, Any] = {}
+            extra = set(ledger["per_symbol"]) - set(TRADE_SYMBOLS)
+            for sym in list(TRADE_SYMBOLS) + sorted(s for s in extra if s):
+                item = dict(ledger["per_symbol"].get(sym) or {})
+                if not item:
+                    item = dict(cycle_pnl.summarize([]))
+                item["symbol"] = sym
+                item["unrealized_pnl"] = float(
+                    (pos_by_symbol.get(sym) or {}).get("unrealized_pnl", 0) or 0
+                )
+                by_symbol[sym] = item
+            # 本地权益回撤与原因记录同样从记录起点重新累计。
+            quality_ctx = _quality_context(start)
+            # 单笔净边际：分母用开仓名义金额（不依赖复利），口径与分标的完全一致。
+            edge_bps = scoped.get("unit_edge_bps")
+            slippage = _slippage_estimate(pos_by_symbol, start)
+            drawdown = {
+                # 账户权益口径：运行器落盘的权益曲线峰值回撤。
+                "account_recorded": quality_ctx["recorded_max_drawdown"],
+                "account_basis": "runtime/shadow/deployed_trades.csv 权益字段（运行记录口径）",
+                # 按标的分组：各自已实现净额曲线回撤，绝不混加。
+                "by_symbol": {
+                    sym: (by_symbol.get(sym) or {}).get("realized_max_drawdown")
+                    for sym in by_symbol
+                },
+                "by_symbol_basis": "各标的按完整持仓周期净额（已实现 − 手续费 + 资金费）在平仓时刻推进的峰值回撤，USDT",
+            }
+            costs = {
+                "maker_fee": float(scoped.get("maker_fee") or 0),
+                "taker_fee": float(scoped.get("taker_fee") or 0),
+                "total_fee": float(scoped.get("commission") or 0),
+                "funding_fee": float(scoped.get("funding_fee") or 0),
+                "funding_orphan": float(scoped.get("funding_orphan") or 0),
+                "funding_basis": (
+                    "交易所 income 明细 incomeType=FUNDING_FEE，按时间归属到当时"
+                    "持仓的完整周期；归属不上的记为 funding_orphan 单列"
+                ),
+                "slippage_est": slippage["slippage_est"],
+                "slippage_matched": slippage["slippage_matched"],
+                "slippage_candidates": slippage["slippage_candidates"],
+                "slippage_basis": slippage["slippage_basis"],
+            }
+            reasons = list(quality_ctx["recent_reasons"])
+            if quality_ctx["five_minute_disabled"]:
+                reasons.insert(0, {
+                    "text": "当前运行器仅启用 BTC/ETH 15m；5m 已停用，避免趋势中无正常出口导致灾难止损",
+                    "count": 1,
+                })
+            actions = [
+                "继续固定 15m-only 测试网窗口，不在盈利后临时改参数或扩大仓位",
+                "累计至少 4 周或 30 个完整平仓样本，再评估单笔净边际和跨 BTC/ETH 一致性",
+                "单笔口径已改为完整持仓周期（开仓/加层/减仓/反手/平仓配对 + 资金费归属），继续累计完整平仓样本再评估边际",
+            ]
+            if quality_ctx["halted"]:
+                actions.insert(0, "运行器处于熔断状态：先人工核对交易所净仓与本地账本，再决定是否恢复")
             return web.json_response({
                 "connected": True,
-                "stats_start": STATS_START_DATE,
-                "scope": "recent_7d", "history_limit": 200,
-                "truncated": len(all_trades) >= 200,
+                # 记录起点：stats_start 保留为日期，record_start 是精确到分钟的文案。
+                "stats_start": record_start_label()[:10],
+                "record_start": record_start_label(),
+                "record_start_ms": start,
+                "record_start_note": (
+                    "历史清零后重新记录：委托、成交、成本、回撤与明细均自该时刻起"
+                    "统计；持仓、余额、挂单为实时状态，不受影响。"
+                ),
+                # 口径：自记录起点起的**完整持仓周期**，不再是「最近 7 天
+                # 每标的 200 笔成交腿」。coverage 说明数据从哪开始、有没有被
+                # 截断、有没有被窗口切成两半的持仓。
+                "scope": "record_start_full_cycles",
+                "history_limit": None,
+                "truncated": bool((scoped.get("coverage") or {}).get("truncated")),
+                "coverage": scoped.get("coverage"),
+                "funding_rows": scoped.get("funding_rows"),
+                "funding_note": scoped.get("funding_note"),
                 "wallet_balance": float(
                     getattr(bal, "total_wallet_balance", 0) or 0
                 ),
@@ -1064,6 +1555,9 @@ def create_app(
                 "unrealized_pnl": upnl,
                 # 起算日口径（用户指定的「赚了多少」）
                 **scoped,
+                # 分标的（BTC / ETH 各自统计，不混加）
+                "by_symbol": by_symbol,
+                "positions_by_symbol": pos_by_symbol,
                 # 与最近七天、最多200笔的表格对齐，不提供假「全历史」。
                 "available_history": every,
                 "position": {
@@ -1071,14 +1565,122 @@ def create_app(
                     "quantity": float(getattr(pos, "quantity", 0) or 0),
                     "entry_price": float(getattr(pos, "entry_price", 0) or 0),
                 },
+                "quality": {
+                    "realized_net_pnl": float(scoped["net_pnl"]),
+                    "unrealized_pnl": float(upnl),
+                    "unit_edge_bps": edge_bps,
+                    "unit_edge_basis": "开仓名义金额口径：净额（已实现 − 手续费 + 资金费）÷ 开仓名义 × 10000，按完整持仓周期统计（不依赖复利）",
+                    "open_notional": float(scoped.get("open_notional") or 0),
+                    "recorded_max_drawdown": quality_ctx["recorded_max_drawdown"],
+                    "drawdown": drawdown,
+                    "drawdown_basis": drawdown["account_basis"],
+                    # 胜率与盈亏比必须一起看，不能只报胜率。
+                    "win_rate": float(scoped.get("win_rate") or 0),
+                    "profit_factor": scoped.get("profit_factor"),
+                    "payoff_ratio": scoped.get("payoff_ratio"),
+                    "wins": scoped.get("wins"),
+                    "losses": scoped.get("losses"),
+                    "avg_win": scoped.get("avg_win"),
+                    "avg_loss": scoped.get("avg_loss"),
+                    # 交易成本单列：maker / taker / 资金费 / 滑点估算。
+                    "costs": costs,
+                    "window": record_start_label(),
+                    "reasons": reasons,
+                    "next_actions": actions,
+                    "context": quality_ctx,
+                },
             })
         except Exception as exc:
             return web.json_response({
                 "connected": False, "reason": f"{type(exc).__name__}: {exc}"
             })
 
+    async def api_chart(request):
+        """图片显示确认模块：K 线 + KDJ + MACD + B/S 信号（只读，仅测试网）。
+
+        行情地址由 config.market_endpoints 从账户地址反推，与运行器同一条序列；
+        KDJ/MACD 直接复用 shadow/indicators.py 的同一份函数，不另立口径。
+        """
+        symbol = (request.query.get("symbol") or "BTCUSDT").upper()
+        interval = (request.query.get("interval") or "15m").lower()
+        try:
+            bars = int(request.query.get("bars") or 200)
+        except Exception:
+            bars = 200
+        try:
+            from review import chart_data
+
+            payload = await chart_data.get_chart(symbol, interval, bars)
+            return web.json_response(payload)
+        except Exception as exc:
+            return web.json_response({
+                "ok": False,
+                "module": "图片显示确认模块",
+                "symbol": symbol,
+                "interval": interval,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }, status=502)
+
+    async def api_equity_curve(_request):
+        """只读：运行器记录口径的权益曲线。
+
+        取自 runtime/shadow/deployed_trades.csv 的「权益」列，与
+        quality.recorded_max_drawdown 同一口径。不修改任何状态、不联网。
+        """
+        path = os.path.join(ROOT, "runtime", "shadow", "deployed_trades.csv")
+        points: list = []
+        try:
+            with open(path, encoding="utf-8", newline="") as fh:
+                for row in csv.DictReader(fh):
+                    try:
+                        value = float(str(row.get("权益") or "").replace(",", ""))
+                    except (TypeError, ValueError):
+                        continue
+                    if value <= 0:
+                        continue
+                    points.append({
+                        "t": _trade_row_ms(row),
+                        "equity": value,
+                        "action": str(row.get("动作") or ""),
+                    })
+        except FileNotFoundError:
+            points = []
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response(
+                {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+            )
+        # 同一根 K 线会有 BTC/ETH 两行；时间戳还可能乱序，
+        # 直接按行画曲线会来回折返，所以先按时间排序再按时刻去重。
+        points.sort(key=lambda item: item["t"])
+        dedup: list = []
+        for item in points:
+            if dedup and dedup[-1]["t"] == item["t"]:
+                dedup[-1] = item
+            else:
+                dedup.append(item)
+        points = dedup
+        peak = 0.0
+        max_dd = 0.0
+        for item in points:
+            peak = max(peak, item["equity"])
+            if peak > 0:
+                max_dd = max(max_dd, (peak - item["equity"]) / peak)
+        return web.json_response({
+            "ok": True,
+            "points": points,
+            "count": len(points),
+            "first": points[0]["equity"] if points else None,
+            "last": points[-1]["equity"] if points else None,
+            "peak": peak or None,
+            "max_drawdown": max_dd,
+            "basis": "deployed_trades.csv 权益字段（运行记录口径）",
+        })
+
     # routes
     app.router.add_get("/", index)
+    app.router.add_get(
+        "/{name:app\\.js|chart\\.js|styles\\.css|index\\.html}", static_asset
+    )
     app.router.add_get("/api/live", api_live)
     app.router.add_get("/api/market", api_market)
     app.router.add_get("/api/health", api_health)
@@ -1092,6 +1694,7 @@ def create_app(
     app.router.add_get("/api/binance/orders", api_binance_orders)
     app.router.add_get("/api/binance/trades", api_binance_trades)
     app.router.add_get("/api/account/summary", api_account_summary)
+    app.router.add_get("/api/equity/curve", api_equity_curve)
     app.router.add_post("/api/strategies", api_strategy_add)
     app.router.add_post("/api/settle/run", api_settle_run)
     app.router.add_post("/api/review/run", api_review_run)
@@ -1107,6 +1710,7 @@ def create_app(
     app.router.add_post("/api/testnet/smoke-limit-close", api_testnet_limit_then_close)
     app.router.add_post("/api/testnet/flatten-now", api_testnet_flatten_now)
     app.router.add_post("/api/trading/toggle", api_trading_toggle)
+    app.router.add_post("/api/external/resume", api_external_resume)
     app.router.add_get("/api/trading/history", api_trading_history)
     app.router.add_post("/api/paper/test-order", api_paper_test_order)
     app.router.add_post("/api/paper/test-close", api_paper_test_close)
@@ -1116,6 +1720,7 @@ def create_app(
     app.router.add_get("/api/review/convergence", api_convergence)
     app.router.add_post("/api/scheduler/run", api_scheduler_run)
     app.router.add_get("/api/daily_summaries", api_daily_summaries)
+    app.router.add_get("/api/chart", api_chart)
     return app
 
 

@@ -2,8 +2,10 @@
 
 > 本文档是项目的**唯一进度基线**。每个里程碑都有明确的完成标准（DoD）。状态只能在有可复现证据时才能推进，不允许口头宣称完成。
 
-**最后更新**：2026-10-01
+**最后更新**：2026-10-03（治理核对）
 **维护方式**：每次提交代码后同步更新状态列，并追加到文末的变更记录。
+
+> **当前运行事实覆盖声明（2026-10-03）**：本文保留里程碑与历史验收证据，不是 KDJ 实盘行为的唯一来源。当前测试网心跳和运行代码只运行 `kdj15`/`eth15` 两条 BTCUSDT/ETHUSDT 15m；`kdj5`/`eth5` 仅定义保留、实盘停用。当前信号、风险和字段合同以 `docs/strategy_governance.v1.json`、`shadow/strategy_books.py`、`shadow/signals.py`、`shadow/engine.py`、心跳/状态文件和治理审计报告为准。
 
 ---
 
@@ -25,7 +27,7 @@
 **基线验证命令**（改动后必须重跑）：
 
 ```bash
-cd /Users/zengyun/Downloads/我的AI/crypto
+cd /Users/zengyun/我的AI/crypto
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'
 ```
 
@@ -861,3 +863,165 @@ post-only 拒单退档、竞态成交、兜底穿盘口、滑点上限、重挂�
 用户拍板：不要 MA/OBV；5m 以 KD 金叉死叉为大前提，金叉且 K<30 做多、死叉且 K>70 做空；与 15m 共用一个 BTCUSDT 单向账户。
 
 实现：`shadow/strategy_books.py` 各记虚拟仓，交易所只下净额；5m 冷启动不追溯旧 K 线；委托前缀 `kd5` 也算策略单；面板按 `runtime_key` 挂运行态，读数接口同时返回 15m/5m。`r` 仍为 0.03，未改。全量测试 **475 项通过**。仍是测试网限价，不宣称能赚钱、不能当实盘。
+
+### 2026-10-02 21:14 · 人工干预检测落地 + 界面按用户要求精简
+
+**用户指令**：左边已配置策略看不清；未实现/已实现盈亏按 BTCUSDT、ETHUSDT 分开统计；删掉「最近一根信号读数」与「账户盈亏核对」两个板块。
+
+**已完成**
+1. **人工干预检测真正生效（生产验证）**：21:02:10 用户在币安网页手动平掉 BTC(-0.001) 与
+   ETH(-2.366)，运行器按订单来源识别为 `web_*` 人工单，判定 `reduce` → **清零该标的策略
+   账本、不补回**，等下一根信号再开仓。账本 `entry` 已清空，仓位保持 FLAT。这是本轮修复的
+   实盘证据，不再是单元测试推断。
+2. **左侧策略列表可读性**：侧栏 268→312px；名称 13.5→14.5px；规则原文取消
+   `-webkit-line-clamp:1` 截断，改为完整换行；行距与对比度上调。
+3. **分标的盈亏**：`/api/account/summary` 新增 `by_symbol` 与 `positions_by_symbol`；
+   未实现与已实现（净 = 已实现 − 手续费）都按 BTC / ETH 各自一行显示，不混加。
+4. **移除两个板块**：最近一根信号读数、账户盈亏核对（PNL EVENTS / 正负笔数 / 胜率 / 盈亏比）
+   连同相关 JS 渲染一并删除；`loadReading` 精简为只更新运行器心跳的 `loadRunner`。
+5. **两个隐藏缺陷顺手修掉**：
+   - `#externalBar` 的 `hidden` 属性被 `.notice-bar{display:flex}` 覆盖，导致提示条一直显示；
+     补 `.notice-bar[hidden]{display:none!important}`。
+   - 面板 API 未禁缓存，浏览器可能复用上一次的仓位/盈亏响应；中间件对 `/api/` 统一加
+     `Cache-Control: no-store`。
+   - `renderExternal` 曾被写到 IIFE 之外（`})();` 之后），引用闭包内 `$ / coin / num / fmtTime`
+     触发 ReferenceError 并被 `loadStatus` 的 try/catch 吞掉，提示条永不显示；已移回闭包内。
+
+**验证**：518 项测试通过；`node --check frontend/app.js` 通过；浏览器实测提示条文案
+「已跟随人工操作：BTC · ETH」与两张分标的卡片（BTC +124.35 / ETH −7.74）均正确渲染，
+控制台无错误。
+
+### 2026-10-02 21:50 · 15m 策略换成 KDJ×MACD 双指标闸门
+
+**用户指令**：把 MACD 加进技术指标后有了新想法 —— KDJ 交叉负责择时，MACD 能量柱负责
+方向。确认口径：**MACD 方向按红绿柱（能量柱）正负为准；做双向；背离类信号直接丢弃不
+操作；周期固定 15m**。这套思路**整条替换**原来的 15m 思路，**只改 BTCUSDT 与 ETHUSDT
+两条 15m 策略**，5m 两条不动。
+
+**规则（替换前 → 替换后，仅 15m）**
+
+| | 替换前 | 替换后 |
+| --- | --- | --- |
+| 做多 | 金叉 + 收盘涨破上一根最高（≥0.15×ATR_1H） | 金叉 + MACD 能量柱为正（绿柱） |
+| 做空 | 死叉 + 收盘跌破上一根最低（≥0.15×ATR_1H） | 死叉 + MACD 能量柱为负（红柱） |
+| 背离 | 不适用 | 金叉遇红柱 / 死叉遇绿柱 → **丢弃**：不开仓、不平仓、不反手 |
+
+**已完成**
+
+1. `shadow/indicators.py::macd` 新增 MACD(12,26,9)：EMA 自第一根收盘价递推
+   （α=2/(n+1)），DIF=EMA12−EMA26，DEA=EMA9(DIF)，柱=DIF−DEA，与 TradingView / 币安
+   同口径。闸门只取柱的正负号。
+2. `shadow/signals.py::macd_gate` / `macd_side`：闸门判定与「背离」文案的唯一来源；
+   柱为 0 或数值不可用同样丢弃。
+3. `shadow/strategy_books.py`：`StrategySpec` 增加 `require_macd`；`SPEC_15M` 与
+   `SPEC_ETH_15M` 改为 `require_macd=True` / `require_break=False`，规则原文同步。
+   5m 两条保持 `require_break=False` / `require_macd=False`。
+4. `shadow/deploy.py`：`process_strategy()` 与 `save_signal_reading()` 都过闸门；停机
+   补记的「错过」根数只统计过闸门的信号；读数快照新增 `MACD_DIF` / `MACD_DEA` /
+   `MACD_HIST` / `macd_side` / `require_macd` / `macd_note`，并新增 `series.hist`。
+5. `shadow/engine.py`（回测）+ `shadow/reporting.py`：同样过闸门，逐根日志新增
+   「MACD柱」列；「宽松」列保留为未经闸门的裸交叉，用于量化闸门挡掉了多少。
+   `shadow/live.py`（阶段 1 影子运行器）同步。
+6. 策略卡 `config/strategies/deployed_kdj_extreme_v1.json` 与
+   `deployed_kdj_eth_extreme_v1.json` 改写 entry/exit/indicators/note；5m 两张卡未动。
+7. 前端 `frontend/app.js::signalView` 增加闸门文案（「金叉且 MACD 绿柱」/
+   「MACD 不是绿柱」等）。
+8. 测试：新增 `tests/test_macd_gate_strategy.py`（20 项：EMA 口径、闸门矩阵、引擎信号
+   必须与能量柱同向、规格与策略卡一致性）；改写 `tests/test_dual_strategy_books.py`
+   的 15m 用例（改用 `patch(shadow.deploy.macd)` 控制柱方向）与
+   `tests/test_cross_only_strategy.py` 的策略卡断言。
+
+**验证**
+
+- 全量测试 **539 项通过**（含新增 20 项）。
+- 真实历史回放（`python3 -m shadow.run --tail 60`，BTCUSDT 15m 5,761 根）：裸交叉
+  1,020 个 → 过闸门 404 个，**闸门挡掉 616 个（60.4%）**；模式 A 9 笔成交、净
+  +25.92 USDT、盈亏比 2.51；模式 B 22 笔、净 −26.68 USDT。闸门确实在挡背离，不是空转。
+- `price_breaks()` / `BREAK_ATR_MULT` 保留但已无规格使用；5m 行为未受影响。
+- 未改：`r=0.03`、10x 逐仓、日亏 3%、回撤 10% 熔断、灾难止损 3×ATR_1H、限价追价与
+  maker 优先执行、委托前缀。`_IMPL_FILES` 不含 `shadow/`，**本次无需 reseal**。
+
+### 2026-10-02 22:13 · 追价下单「部分成交不撤单」缺陷（真实事故）
+
+**现象**：21:46 日志出现 `[ETHUSDT 净仓] 目标 5.0700 原 10.0100 → 5.0710`，
+持仓凭空多出 4.94 ETH，一分钟后被迫反向卖出纠正。
+
+**排查**：拉交易所逐笔委托核对，21:28 之后 ETH 只有一笔外部单（22:05 用户手动平仓
+`web_Atbiyv4NXd`），**加仓那 4.94 并不是人下的**：
+
+```
+21:46:30  策略 BUY 4.940 @2762.27  FILLED   ← 补差单
+21:46:30  策略 BUY 5.070 @2760.67  FILLED   ← 原单剩余部分
+```
+
+**根因**（`trading/binance_client.py` 的 `place_limit_order` 收尾）：
+
+```python
+filled = float(last.cum_filled_qty or last.filled_qty or 0)
+if filled > 0:
+    return last.to_order_result()      # ← 部分成交直接返回，跳过撤单
+```
+
+部分成交（0.13 / 5.070）后函数**不撤单就返回**，剩余 4.94 继续以 GTC post-only
+挂在盘口。运行器以为这单已结束，下一步净仓同步又下了 4.940 的补差单，两张单在同一秒
+全部成交 → 持仓正好翻倍，随后被迫反向纠正，白付一次价差与手续费。
+
+**修复**：只要不是完全成交，就必须撤掉剩余挂单；撤单回执缺成交量时用轮询值兜底；
+有真实成交时保持 `ok=True`（与改动前语义一致），`order_state` 仍如实记为 CANCELED。
+
+**验证**：新增 `tests/test_partial_fill_cancel.py`（4 项）；全量 **543 项通过**。
+**注意**：人工加仓检测逻辑本身没有问题 —— 本次并非人工下单，故未触发暂停。
+
+### 2026-10-03 06:45 · 凌晨两笔灾难止损复盘 + 项目迁出 Downloads
+
+**现象**：10-03 凌晨出现两笔大额亏损，账户权益从峰值 5253.74 降到 4475.20。
+
+**核对**（交易所口径）：钱包余额 4475.20，已实现 −455.26，手续费 −91.99，
+净盈亏 −547.25；胜率 71.7%（43 胜 17 负），但盈亏比仅 **0.364**（ETH 0.048）。
+
+**两笔亏损的真实来源 —— 都是 3×ATR_1H 灾难止损，不是正常反手**
+
+| 时间（北京） | 标的 | 动作 | 数量 | 入场 | 强平价 | 亏损 |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 02:37 | ETHUSDT | 灾难止损平仓 | 4.821 | 2725.34 | 2674.71 | ≈ −244 |
+| 02:43 | BTCUSDT | 灾难止损平仓 | 0.164 | 85580.00 | 83983.00 | ≈ −262 |
+
+日志原文：
+
+```
+ETHUSDT 浮亏 50.63 ≥ 3×ATR 50.58; LIMIT 强平 成交价=2674.71; 剩余 0.0000 ETH
+BTCUSDT 浮亏 1557.27 ≥ 3×ATR 1475.50; LIMIT 强平 成交价=83983.00; 剩余 0.0000 BTC
+```
+
+**为什么会亏这么多（结构性原因，不是故障）**
+
+1. 仓位是 `qty = 权益 × 0.03 ÷ (2 × ATR_1H)`，灾难止损在 `3 × ATR_1H`，
+   两者相除 ⇒ **每次灾难止损必然亏掉 3% × 3 ÷ 2 = 4.5% 权益**。两次≈9%。
+2. 这两笔都是 **5m 仓位**。5m 的出场只有「反向交叉 + K 极值」和灾难止损两条路；
+   **下跌途中 K 值一直很低，永远回不到 K>70**，所以反向平仓条件无法成立，
+   多仓没有任何正常出口，只能一路扛到 3×ATR。凌晨逐根日志里 ETH 5m / BTC 5m
+   全程都是 `观察`（K=13.75、20.25…），没有任何一次满足平仓阈值。
+3. 结果就是「赢很多次小钱、两笔大亏全部吃回」的低盈亏比结构。
+
+**衍生问题（已处理）**
+
+- 22:39 起本机同时存在两份运行器（手动 + launchd），02:29–02:32 触发交易所限频：
+  `{"code":-1003,"msg":"Way too many requests; IP banned until ..."}`；
+  另有多次 `拉 K 线失败: handshake/read timed out`。
+- `launchd` 服务放在 `~/Downloads` 下会被 macOS「下载文件夹」隐私保护拦截：
+  `[Errno 1] Operation not permitted: deployed_trades.csv`、
+  `run_testnet_monitor_loop.sh: Operation not permitted`、
+  `ModuleNotFoundError: No module named 'shadow'`。四个服务全部失效，已卸载。
+
+**熔断**：累计回撤 14.8% ≥ 10% ⇒ `halted=True`，停止开新仓，等待人工指令。
+
+**目录迁移（用户指令）**：整仓 `/Users/zengyun/Downloads/我的AI` →
+`/Users/zengyun/我的AI`，项目现位于 **`/Users/zengyun/我的AI/crypto`**。
+只搬 `crypto` 会掏空仓库（200 个跟踪文件全在 `crypto/` 下），故整仓搬迁，
+git 历史与 `backup` 远程保持完好。迁移后已批量更新 16 个文件里写死的旧绝对路径，
+并在新路径下复跑全量测试：**543 项通过**。
+
+**launchd 托管现状**：Manus 的执行沙箱无法注册 GUI LaunchAgent
+（`Bootstrap failed: 5: Input/output error`），需由用户在本机终端执行
+`ENABLE_TESTNET_EXECUTION=YES bash scripts/install_testnet_services.sh`。
+安装脚本已改为幂等：加载服务前先停掉手动实例，避免重复运行器与端口抢占。
