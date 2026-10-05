@@ -1,4 +1,4 @@
-"""用户 2026-10-02 新规则：15m 用 MACD 能量柱方向做闸门，5m 用 K 极值。"""
+"""用户 2026-10-02/03 规则：四条策略都用 MACD 能量柱方向做闸门，无 K 极值。"""
 import json
 import pathlib
 import unittest
@@ -52,10 +52,14 @@ class CrossOnlyTests(unittest.TestCase):
         self.assertEqual(cfg['runtime_key'], 'kdj15')
         self.assertIn('GTX', cfg['execution_style']['description'])
 
-    def test_5m_strategy_card_keeps_k_thresholds(self):
+    def test_5m_strategy_card_matches_actual_rules(self):
         cfg = json.loads((ROOT / 'config/strategies/deployed_kdj_5m_extreme_v1.json').read_text(encoding='utf-8'))
-        self.assertIn('K<30', cfg['entry']['long'])
-        self.assertIn('K>70', cfg['entry']['short'])
+        self.assertIn('MACD 能量柱为正', cfg['entry']['long'])
+        self.assertIn('MACD 能量柱为负', cfg['entry']['short'])
+        self.assertNotIn('K<30', cfg['entry']['long'])
+        self.assertNotIn('K>70', cfg['entry']['short'])
+        self.assertIn('背离', cfg['entry']['divergence'])
+        self.assertIn('MACD', cfg['indicators'])
         self.assertEqual(cfg['runtime_key'], 'kdj5')
         self.assertEqual(cfg['execution_style']['tag'], 'kd5')
         self.assertEqual(cfg['position_sizing']['r'], 0.03)
@@ -72,8 +76,10 @@ class CrossOnlyTests(unittest.TestCase):
         self.assertEqual(eth15['position_sizing']['r'], 0.03)
         self.assertEqual(eth5['runtime_key'], 'eth5')
         self.assertEqual(eth5['symbol'], 'ETHUSDT')
-        self.assertIn('K<30', eth5['entry']['long'])
-        self.assertIn('K>70', eth5['entry']['short'])
+        self.assertIn('MACD 能量柱为正', eth5['entry']['long'])
+        self.assertIn('MACD 能量柱为负', eth5['entry']['short'])
+        self.assertNotIn('K<30', eth5['entry']['long'])
+        self.assertNotIn('K>70', eth5['entry']['short'])
         self.assertEqual(eth5['execution_style']['tag'], 'e5')
         self.assertEqual(eth5['position_sizing']['r'], 0.03)
 

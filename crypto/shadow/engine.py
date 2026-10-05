@@ -1,7 +1,7 @@
 """影子回测引擎：与测试网执行器共用已收盘 KDJ 交叉信号。
 
 规格要点 (全部硬编码为常量, 不对外暴露为可调项):
-    信号周期 15m, 风险参数周期 1H; 只用已收盘 K 线。
+    信号周期由 IntervalSpec 指定（15m / 5m），风险参数周期恒为 1H；只用已收盘 K 线。
     做多 = 金叉且 MACD 能量柱为正；做空 = 死叉且能量柱为负。
     方向背离的交叉丢弃（不平仓、不反手）；不要求 K 值进入极值区。
     出场 A: 对侧交叉平仓并反手；B: 对侧交叉只平仓。
@@ -27,7 +27,7 @@ import numpy as np
 
 from shadow.indicators import atr_wilder, boll, kdj
 from shadow.indicators import atr_wilder, boll, kdj, macd
-from shadow.signals import crossing, macd_gate
+from shadow.signals import crossing, entry_signal, macd_gate
 
 # --------------------------------------------------------------------------- 规格常量 (禁止修改)
 KDJ_N, KDJ_M1, KDJ_M2 = 9, 3, 3
@@ -79,6 +79,54 @@ MIN_QTY = 0.001          # LOT_SIZE.minQty
 MIN_NOTIONAL = 50.0      # MIN_NOTIONAL.notional
 
 
+@dataclass(frozen=True)
+class IntervalSpec:
+    """一次回放使用的周期规格；15m 与 5m 共用同一套引擎。
+
+    entry_mode:
+        "macd_gate"   —— 15m 与 5m：KD 交叉 + MACD 能量柱同向，背离丢弃
+        "k_threshold" —— 仅保留兼容：金叉且 K<k_long_max 做多；死叉且 K>k_short_min 做空
+    stop_atr_mult:
+        正常止损距离（× ATR_1H）。None = 不设正常止损（历史行为）。
+    break_even_trigger_atr_mult:
+        浮盈达到该倍数（× 开仓时 ATR_1H）后，将价格止损移至入场价。
+        同根 OHLC 无法确定先后顺序，故仅从下一根 K 线起生效；None = 不启用。
+    disaster_atr_mult:
+        灾难止损距离（× ATR_1H），始终生效，作为跳空/插针/断网的兜底。
+    """
+
+    name: str
+    interval_ms: int
+    entry_mode: str = "macd_gate"
+    k_long_max: Optional[float] = None
+    k_short_min: Optional[float] = None
+    stop_atr_mult: Optional[float] = None
+    break_even_trigger_atr_mult: Optional[float] = None
+    disaster_atr_mult: float = DISASTER_ATR
+    # False = 不因累计回撤锁死（仅供标定/研究使用，生产规格保持 True）
+    halt_on_drawdown: bool = True
+    # None = 跟随模块级 MACD_GATE_ENABLED（保留整体关闸做对比的能力）
+    macd_gate_enabled: Optional[bool] = None
+
+
+# 2026-10-03 研究定案：1.5×ATR_1H 止损 + 浮盈 1.5×ATR 后下根起保本。
+SPEC_15M = IntervalSpec(
+    name="15m", interval_ms=15 * 60 * 1000,
+    stop_atr_mult=1.5, break_even_trigger_atr_mult=1.5,
+)
+
+# 2026-10-03：5m 回放规格与线上 5m 规格对齐 —— 入场 = KD 交叉且 MACD 能量柱同向，
+# 不使用 K 极值过滤。背离丢弃。
+SPEC_5M = IntervalSpec(
+    name="5m", interval_ms=5 * 60 * 1000, entry_mode="macd_gate",
+    k_long_max=None, k_short_min=None,
+    # None = 跟随模块级 MACD_GATE_ENABLED，与 15m 回放同一套闸门开关。
+    macd_gate_enabled=None,
+    # 仅影子研究规格：浮盈 1.5×ATR 后，下根 K 线起移至开仓价。
+    break_even_trigger_atr_mult=1.5,
+)
+
+
 def floor_step(qty: float) -> float:
     """按交易所最小变动单位向下取整。"""
     if qty <= 0:
@@ -89,6 +137,17 @@ def floor_step(qty: float) -> float:
 @dataclass
 class ShadowConfig:
     equity0: float = 1000.0
+    # 研究用：每次开仓都按这一固定权益计算风险金额，切断复利路径。
+    # None 保持历史的按实时盯市权益复利仓位逻辑。
+    fixed_risk_equity: Optional[float] = None
+    # 研究用：在固定风险基础上缩放数量（1.0 / 0.5 / 0.25 等）。
+    position_scale: float = 1.0
+    # 研究用：解除日亏与累计回撤对“是否继续取样”的机械截断；
+    # 默认 False，15m 与既有生产回放行为不变。
+    research_ignore_risk_gates: bool = False
+    # 批量标定无需逐根输出时可关闭，避免为每个参数组合保留数十万条日志。
+    # 默认 True，既有报告和 run_shadow 行为不变。
+    record_bars: bool = True
 
 
 @dataclass
@@ -104,6 +163,8 @@ class OpenPosition:
     bandwidth_at_entry: float
     multiple_at_entry: float
     fee_points_at_entry: float
+    # 价格达到保本触发位后置 True；止损从下一根 K 线开始生效。
+    break_even_armed: bool = False
 
 
 @dataclass
@@ -171,37 +232,104 @@ class ShadowResult:
     peak_b: float = 0.0
 
 
-def align_atr_1h(bars15_ms: np.ndarray, bars1h_ms: np.ndarray,
-                 atr1h: np.ndarray) -> np.ndarray:
-    """把 1H 的 ATR 对齐到每根 15m K 线: 取【已收盘】的最后一根 1H。
+def align_atr_1h(bars_ms: np.ndarray, bars1h_ms: np.ndarray,
+                 atr1h: np.ndarray,
+                 interval_ms: int = 15 * 60 * 1000) -> np.ndarray:
+    """把 1H 的 ATR 对齐到每根信号 K 线: 取【已收盘】的最后一根 1H。
 
-    15m K 线 t 收盘于 bars15_ms[t] + 15min; 1H K 线收盘于 bars1h_ms[j] + 60min。
-    使用 bars1h_ms[j] + 60min ≤ bars15_ms[t] + 15min 的最后一根。
+    信号 K 线 t 收盘于 bars_ms[t] + interval_ms; 1H 收盘于 bars1h_ms[j] + 60min。
+    使用 bars1h_ms[j] + 60min ≤ bars_ms[t] + interval_ms 的最后一根。
+
+    interval_ms 默认 15 分钟（保持既有调用行为），5m 回放传 5 分钟。
     """
-    close15 = bars15_ms + 15 * 60 * 1000
+    close_sig = bars_ms + interval_ms
     close1h = bars1h_ms + 60 * 60 * 1000
-    idx = np.searchsorted(close1h, close15, side="right") - 1
-    out = np.full(len(bars15_ms), np.nan, dtype=np.float64)
+    idx = np.searchsorted(close1h, close_sig, side="right") - 1
+    out = np.full(len(bars_ms), np.nan, dtype=np.float64)
     ok = idx >= 0
     out[ok] = atr1h[idx[ok]]
     return out
 
 
-def run_shadow(bars15: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
-               cfg: Optional[ShadowConfig] = None) -> ShadowResult:
+def _stop_hit(pos: OpenPosition, high: float, low: float,
+              spec: IntervalSpec) -> Optional[tuple]:
+    """本根 K 线是否触发止损。返回 (触发价, 原因)；未触发返回 None。
+
+    已激活的保本止损位于入场价，优先于亏损方向的正常/灾难止损。
+    正常止损（spec.stop_atr_mult）距离更近，同一根内必然先被穿过，
+    因此再判正常止损、最后判灾难止损；三者都不设则永不触发。
+    """
+    levels = []
+    if pos.break_even_armed:
+        levels.append((0.0, "保本止损"))
+    if spec.stop_atr_mult:
+        levels.append((float(spec.stop_atr_mult), "止损"))
+    if spec.disaster_atr_mult:
+        levels.append((float(spec.disaster_atr_mult), "灾难止损"))
+    for mult, why in levels:
+        dist = mult * pos.atr_at_entry
+        # 保本止损的距离恰为 0；正常/灾难止损不会把 0 加入 levels。
+        if not math.isfinite(dist) or dist < 0:
+            continue
+        if pos.side == 1 and low <= pos.entry_px - dist:
+            return pos.entry_px - dist, why
+        if pos.side == -1 and high >= pos.entry_px + dist:
+            return pos.entry_px + dist, why
+    return None
+
+
+def _arm_break_even(pos: OpenPosition, high: float, low: float,
+                    spec: IntervalSpec) -> bool:
+    """在本根达到浮盈阈值后为下一根 K 线激活价格保本止损。
+
+    单根 OHLC 不提供高低点的先后顺序。为避免把同根内“先冲高、后回落”
+    误写成确定可成交的保本退出，激活只作用于后续 K 线。
+    """
+    if pos.break_even_armed or not spec.break_even_trigger_atr_mult:
+        return False
+    dist = float(spec.break_even_trigger_atr_mult) * pos.atr_at_entry
+    if not math.isfinite(dist) or dist <= 0:
+        return False
+    reached = ((pos.side == 1 and high >= pos.entry_px + dist)
+               or (pos.side == -1 and low <= pos.entry_px - dist))
+    if reached:
+        pos.break_even_armed = True
+    return reached
+
+
+def run_shadow_spec(bars: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
+                    spec: Optional[IntervalSpec] = None,
+                    cfg: Optional[ShadowConfig] = None) -> ShadowResult:
+    """按 spec 回放任意周期的已收盘 K 线（15m 与 5m 共用同一套逻辑）。"""
+    spec = spec or SPEC_15M
     cfg = cfg or ShadowConfig()
-    n = len(bars15["close"])
-    o, h, l, c, v = (bars15[x] for x in ("open", "high", "low", "close", "volume"))
-    ts = bars15["ts"]
+    if cfg.fixed_risk_equity is not None and (
+            not math.isfinite(cfg.fixed_risk_equity) or cfg.fixed_risk_equity <= 0):
+        raise ValueError("fixed_risk_equity 必须是正的有限数")
+    if not math.isfinite(cfg.position_scale) or cfg.position_scale <= 0:
+        raise ValueError("position_scale 必须是正的有限数")
+    n = len(bars["close"])
+    o, h, l, c, v = (bars[x] for x in ("open", "high", "low", "close", "volume"))
+    ts = bars["ts"]
 
     k, d, j = kdj(h, l, c, KDJ_N, KDJ_M1, KDJ_M2)
     _dif, _dea, hist = macd(c, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     mb, up, lb, _sd = boll(c, BOLL_N, BOLL_K)
     atr1h_aligned = align_atr_1h(ts, bars1h["ts"],
                                  atr_wilder(bars1h["high"], bars1h["low"],
-                                            bars1h["close"], ATR_PERIOD))
+                                            bars1h["close"], ATR_PERIOD),
+                                 spec.interval_ms)
 
     res = ShadowResult()
+
+    def sizing_equity(mtm: float) -> float:
+        """返回仓位公式使用的权益；研究模式可固定风险预算而不复利。"""
+        return (float(cfg.fixed_risk_equity)
+                if cfg.fixed_risk_equity is not None else mtm)
+
+    def sized_qty(mtm: float, r_eff: float, atr: float) -> float:
+        raw = sizing_equity(mtm) * r_eff / (ATR_MULT_K * atr)
+        return floor_step(raw * cfg.position_scale)
 
     # ---- 模式 A (执行) 状态
     pos_a: Optional[OpenPosition] = None
@@ -232,34 +360,35 @@ def run_shadow(bars15: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
             fee_points_at_entry=pos.fee_points_at_entry, exit_reason=reason,
         )
         (res.trades_a if mode == "A" else res.trades_b).append(t)
-        return net
+        # 返回的是**现金变动**：入场费已在开仓时从权益里扣掉，这里只能补
+        # 「毛盈亏 − 出场费」。若返回 net（已含入场费）会把入场费扣两次，
+        # 导致权益、收益率与最大回撤系统性偏悲观。Trade.net 仍保留完整口径。
+        return gross - exit_fee
 
     for i in range(n - 1):
         day = ts[i] // 86_400_000
+        stopped_a_this_bar = False
+        stopped_b_this_bar = False
 
-        # ---------- 1. 灾难止损 (用本根的 high/low 触发) ----------
+        # ---------- 1. 价格止损 (用本根的 high/low 触发) ----------
         if pos_a is not None:
-            stop_dist = DISASTER_ATR * pos_a.atr_at_entry
-            trig = None
-            if pos_a.side == 1 and l[i] <= pos_a.entry_px - stop_dist:
-                trig = pos_a.entry_px - stop_dist
-            elif pos_a.side == -1 and h[i] >= pos_a.entry_px + stop_dist:
-                trig = pos_a.entry_px + stop_dist
-            if trig is not None:
-                equity_a += close_pos(pos_a, ts[i], trig, "灾难止损", "A")
+            hit = _stop_hit(pos_a, float(h[i]), float(l[i]), spec)
+            if hit is not None:
+                equity_a += close_pos(pos_a, ts[i], hit[0], hit[1], "A")
                 pos_a = None
                 peak_a = max(peak_a, equity_a)
+                stopped_a_this_bar = True
+            elif pos_a is not None:
+                _arm_break_even(pos_a, float(h[i]), float(l[i]), spec)
         if pos_b is not None:
-            stop_dist = DISASTER_ATR * pos_b.atr_at_entry
-            trig = None
-            if pos_b.side == 1 and l[i] <= pos_b.entry_px - stop_dist:
-                trig = pos_b.entry_px - stop_dist
-            elif pos_b.side == -1 and h[i] >= pos_b.entry_px + stop_dist:
-                trig = pos_b.entry_px + stop_dist
-            if trig is not None:
-                equity_b += close_pos(pos_b, ts[i], trig, "灾难止损", "B")
+            hit = _stop_hit(pos_b, float(h[i]), float(l[i]), spec)
+            if hit is not None:
+                equity_b += close_pos(pos_b, ts[i], hit[0], hit[1], "B")
                 pos_b = None
                 peak_b = max(peak_b, equity_b)
+                stopped_b_this_bar = True
+            elif pos_b is not None:
+                _arm_break_even(pos_b, float(h[i]), float(l[i]), spec)
 
         # ---------- 2. 盯市权益 ----------
         mtm_a = equity_a + ((c[i] - pos_a.entry_px) * pos_a.qty * pos_a.side
@@ -276,23 +405,37 @@ def run_shadow(bars15: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
             day_key_b, day_start_eq_b = day, mtm_b
         daily_loss_a = (day_start_eq_a - mtm_a) / day_start_eq_a if day_start_eq_a else 0.0
         dd_a = (peak_a - mtm_a) / peak_a if peak_a else 0.0
-        if dd_a >= MAX_DRAWDOWN and not halted_a:
+        if (not cfg.research_ignore_risk_gates and spec.halt_on_drawdown
+                and dd_a >= MAX_DRAWDOWN and not halted_a):
             halted_a = True
             res.halts.append({"ts": int(ts[i]), "reason": "累计回撤 ≥ 10%",
                               "drawdown": dd_a, "equity": mtm_a})
-        block_new_a = halted_a or daily_loss_a >= DAILY_LOSS_LIMIT
+        block_new_a = (False if cfg.research_ignore_risk_gates
+                       else halted_a or daily_loss_a >= DAILY_LOSS_LIMIT)
 
         daily_loss_b = (day_start_eq_b - mtm_b) / day_start_eq_b if day_start_eq_b else 0.0
         dd_b = (peak_b - mtm_b) / peak_b if peak_b else 0.0
-        block_new_b = dd_b >= MAX_DRAWDOWN or daily_loss_b >= DAILY_LOSS_LIMIT
+        block_new_b = (False if cfg.research_ignore_risk_gates else
+                       ((spec.halt_on_drawdown and dd_b >= MAX_DRAWDOWN)
+                        or daily_loss_b >= DAILY_LOSS_LIMIT))
 
         # ---------- 4. 信号判定 (t 收盘) ----------
-        gold, dead = crossing(k[i - 1], d[i - 1], k[i], d[i])
+        if spec.entry_mode == "k_threshold":
+            # 旧 5m 分支，已无规格使用：交叉 + K 极值。2026-10-03 起四条规格
+            # 都走下面的 macd_gate；entry_mode="k_threshold" 仅留作研究对比。
+            sig_long, sig_short, gold, dead = entry_signal(
+                k[i - 1], d[i - 1], k[i], d[i],
+                k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
+            )
+        else:
+            gold, dead = crossing(k[i - 1], d[i - 1], k[i], d[i])
+            gate_on = (MACD_GATE_ENABLED if spec.macd_gate_enabled is None
+                       else bool(spec.macd_gate_enabled))
+            sig_long, sig_short, _macd_note = macd_gate(
+                gold, dead, float(hist[i]), enabled=gate_on,
+            )
         # 「宽松」列 = 未经方向闸门的裸交叉, 保留用于对比闸门挡掉了多少。
         loose_long, loose_short = gold, dead
-        sig_long, sig_short, _macd_note = macd_gate(
-            gold, dead, float(hist[i]), enabled=MACD_GATE_ENABLED,
-        )
 
         # 布林闸门
         if np.isnan(up[i]) or np.isnan(lb[i]):
@@ -321,18 +464,19 @@ def run_shadow(bars15: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
         if pos_a is None:
             want = 1 if sig_long else (-1 if sig_short else 0)
             if want != 0:
-                reason = None
-                if block_new_a:
+                reason = "止损后等待下一完整信号" if stopped_a_this_bar else None
+                if reason is None and block_new_a:
                     reason = "风控闸门: 当日亏损或回撤超限"
-                elif r_eff is None:
+                elif reason is None and r_eff is None:
                     reason = "布林闸门: 倍数 < 2"
-                elif np.isnan(atr1h_aligned[i]) or atr1h_aligned[i] <= 0:
+                elif reason is None and (np.isnan(atr1h_aligned[i])
+                                         or atr1h_aligned[i] <= 0):
                     reason = "ATR_1H 不可用"
                 if reason:
                     res.skips.append({"ts": ms_next, "side": want, "reason": reason,
                                       "multiple": mult})
                 else:
-                    qty = floor_step(mtm_a * r_eff / (ATR_MULT_K * atr1h_aligned[i]))
+                    qty = sized_qty(mtm_a, r_eff, atr1h_aligned[i])
                     if qty < MIN_QTY or qty * px_next < MIN_NOTIONAL:
                         res.skips.append({"ts": ms_next, "side": want,
                                           "reason": f"数量不足 (qty={qty:.4f}, "
@@ -356,7 +500,7 @@ def run_shadow(bars15: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
                 pos_a = None
                 want = 1 if sig_long else -1
                 if not block_new_a and r_eff is not None and not np.isnan(atr1h_aligned[i]):
-                    qty = floor_step(mtm_a * r_eff / (ATR_MULT_K * atr1h_aligned[i]))
+                    qty = sized_qty(mtm_a, r_eff, atr1h_aligned[i])
                     if qty >= MIN_QTY and qty * px_next >= MIN_NOTIONAL:
                         fee = px_next * qty * FEE_PER_SIDE
                         equity_a -= fee
@@ -372,9 +516,9 @@ def run_shadow(bars15: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
         # --- 模式 B (并行记录, 不执行): 对侧裸交叉即平仓 ---
         if pos_b is None:
             want = 1 if sig_long else (-1 if sig_short else 0)
-            if want != 0 and not block_new_b and r_eff is not None \
+            if want != 0 and not stopped_b_this_bar and not block_new_b and r_eff is not None \
                     and not np.isnan(atr1h_aligned[i]):
-                qty = floor_step(mtm_b * r_eff / (ATR_MULT_K * atr1h_aligned[i]))
+                qty = sized_qty(mtm_b, r_eff, atr1h_aligned[i])
                 if qty >= MIN_QTY and qty * px_next >= MIN_NOTIONAL:
                     fee = px_next * qty * FEE_PER_SIDE
                     equity_b -= fee
@@ -392,22 +536,29 @@ def run_shadow(bars15: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
                 pos_b = None
 
         # ---------- 6. 逐根日志 ----------
-        res.bars.append(BarRow(
-            ts=int(ts[i]), o=float(o[i]), h=float(h[i]), l=float(l[i]), c=float(c[i]),
-            v=float(v[i]), k=float(k[i]), d=float(d[i]), j=float(j[i]),
-            atr_1h=float(atr1h_aligned[i]), up=float(up[i]), mb=float(mb[i]),
-            lb=float(lb[i]), bandwidth=float(bandwidth) if not np.isnan(bandwidth) else 0.0,
-            target_dist=float(target) if not np.isnan(target) else 0.0,
-            multiple=float(mult) if not np.isnan(mult) else 0.0,
-            macd_hist=float(hist[i]),
-            gold_cross=gold, dead_cross=dead, sig_long=sig_long, sig_short=sig_short,
-            loose_long=loose_long, loose_short=loose_short,
-            pos_side=pos_a.side if pos_a else 0,
-            pos_qty=pos_a.qty if pos_a else 0.0,
-        ))
+        if cfg.record_bars:
+            res.bars.append(BarRow(
+                ts=int(ts[i]), o=float(o[i]), h=float(h[i]), l=float(l[i]), c=float(c[i]),
+                v=float(v[i]), k=float(k[i]), d=float(d[i]), j=float(j[i]),
+                atr_1h=float(atr1h_aligned[i]), up=float(up[i]), mb=float(mb[i]),
+                lb=float(lb[i]), bandwidth=float(bandwidth) if not np.isnan(bandwidth) else 0.0,
+                target_dist=float(target) if not np.isnan(target) else 0.0,
+                multiple=float(mult) if not np.isnan(mult) else 0.0,
+                macd_hist=float(hist[i]),
+                gold_cross=gold, dead_cross=dead, sig_long=sig_long, sig_short=sig_short,
+                loose_long=loose_long, loose_short=loose_short,
+                pos_side=pos_a.side if pos_a else 0,
+                pos_qty=pos_a.qty if pos_a else 0.0,
+            ))
 
     res.final_equity_a = equity_a
     res.final_equity_b = equity_b
     res.peak_a = peak_a
     res.peak_b = peak_b
     return res
+
+
+def run_shadow(bars15: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
+               cfg: Optional[ShadowConfig] = None) -> ShadowResult:
+    """15m 回放：保持原签名与行为（shadow/run.py、shadow/__init__.py 与测试依赖它）。"""
+    return run_shadow_spec(bars15, bars1h, SPEC_15M, cfg)

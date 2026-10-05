@@ -54,12 +54,16 @@ SPEC_5M = StrategySpec(
     interval="5m",
     interval_ms=5 * 60 * 1000,
     tag="kd5",
-    k_long_max=30.0,
-    k_short_min=70.0,
+    k_long_max=None,
+    k_short_min=None,
     lookback=288,
-    signal_rule="金叉且 K<30 做多 / 死叉且 K>70 做空",
+    signal_rule="当根收盘金叉且 MACD 能量柱为正 → 做多；死叉且能量柱为负 → 做空；"
+                "方向背离的交叉丢弃不操作；不使用 K 极值过滤",
     cold_start=True,
     label="BTC 5m",
+    confirm_next=False,
+    require_break=False,
+    require_macd=True,
 )
 SPEC_ETH_15M = StrategySpec(
     id="eth15",
@@ -84,14 +88,20 @@ SPEC_ETH_5M = StrategySpec(
     interval="5m",
     interval_ms=5 * 60 * 1000,
     tag="e5",
-    k_long_max=30.0,
-    k_short_min=70.0,
+    k_long_max=None,
+    k_short_min=None,
     lookback=288,
-    signal_rule="金叉且 K<30 做多 / 死叉且 K>70 做空",
+    signal_rule="当根收盘金叉且 MACD 能量柱为正 → 做多；死叉且能量柱为负 → 做空；"
+                "方向背离的交叉丢弃不操作；不使用 K 极值过滤",
     cold_start=True,
     label="ETH 5m",
+    confirm_next=False,
+    require_break=False,
+    require_macd=True,
 )
-SPECS = (SPEC_15M, SPEC_5M, SPEC_ETH_15M, SPEC_ETH_5M)
+# 2026-10-03 用户决定：停用 5m 实盘账本（研究建议停用），只保留两条 15m。
+# SPEC_5M / SPEC_ETH_5M 保留定义供回测与研究使用，但不参与实盘净仓。
+SPECS = (SPEC_15M, SPEC_ETH_15M)
 SPEC_BY_ID = {spec.id: spec for spec in SPECS}
 TRADE_SYMBOLS = ("BTCUSDT", "ETHUSDT")
 
@@ -400,3 +410,23 @@ def reduce_only_for_delta(exchange_signed: float, desired: float, min_qty: float
     if desired * exchange_signed < 0:
         return False
     return abs(desired) < abs(exchange_signed) - 1e-12
+
+
+def next_net_leg(exchange_signed: float, desired: float, min_qty: float):
+    """仅规划一腿：(side, qty, reduceOnly)；反手的扩仓必须等待已确认空仓。
+
+    小于交易所最小数量的残差不四舍五入、也不借反向单偷跨零点。
+    """
+    if not all(math.isfinite(x) for x in (exchange_signed, desired, min_qty)) or min_qty <= 0:
+        raise ValueError("净仓或最小数量无效")
+    if abs(desired - exchange_signed) + 1e-12 < min_qty:
+        return None
+    if exchange_signed * desired < 0:
+        delta = -exchange_signed  # 第一步只平旧仓
+        reducing = True
+    else:
+        delta = desired - exchange_signed
+        reducing = (abs(exchange_signed + delta) < abs(exchange_signed) - 1e-12)
+    if abs(delta) + 1e-12 < min_qty:
+        return None
+    return ("LONG" if delta > 0 else "SHORT", abs(delta), reducing)

@@ -1,9 +1,9 @@
 """KDJ 交叉策略的币安合约测试网运行器。
 
 BTCUSDT 与 ETHUSDT 各跑两条策略，按标的各记虚拟仓、只下该标的净额：
-    15m: 当根收盘交叉且 MACD 能量柱方向一致（金叉+红柱做多 / 死叉+绿柱做空），
+    15m: 当根收盘交叉且 MACD 能量柱方向一致（金叉+绿柱做多 / 死叉+红柱做空），
          下一根开盘下限价单，无 K 阈值；背离的交叉丢弃，不平仓也不反手
-    5m:  金叉且 K<30 做多 / 死叉且 K>70 做空，当根收盘即可
+    5m:  金叉且 MACD 能量柱为正做多 / 死叉且能量柱为负做空，当根收盘即可
     5m 仓位：与同标的 15m 同向满仓，对着干则减半
     仓位 = 权益 × r ÷ (2 × ATR_1H), r=RISK_R, 向下取整 0.001
     开仓/平仓一律限价: post-only 贴盘口挂单争取 maker, 窗口耗尽才穿盘口兜底
@@ -27,6 +27,7 @@ import numpy as np
 
 from shadow.engine import (ATR_MULT_K, DISASTER_ATR, GATE_FEE_RATE,
                            LEVERAGE, MIN_QTY, RISK_R, floor_step)
+from shadow.execution_safety import ExpansionBlocked, check_expansion
 from shadow.indicators import atr_wilder, boll, kdj, macd
 from shadow.signals import (confirmed_signal, entry_signal, macd_gate,
                             macd_side, price_breaks)
@@ -34,13 +35,14 @@ from shadow.live import ENDPOINTS, MARKET, fetch
 from shadow.strategy_books import (SPEC_15M, SPEC_5M, SPECS, TRADE_SYMBOLS,
                                    apply_virtual_signal, clear_symbol_books,
                                    contra_5m_qty, desired_net, migrate_state,
-                                   reduce_only_for_delta, signal_reason,
+                                   next_net_leg, signal_reason,
                                    specs_for_symbol, symbol_short, trend_side)
 from shadow.external_watch import (apply_external, classify_external,
                                    clear_hold_on_new_signal,
                                    consume_resume_requests, external_fills,
                                    watch_for)
-from trading.binance_client import BinanceTestnetClient
+from trading.binance_client import BinanceTestnetClient, _new_client_order_id
+from trading.models import OrderState
 from trading.runtime_mode import current_mode, validate_exchange_target
 from config.market_endpoints import (MARKET_MAINNET, MarketMismatchError,
                                      assert_market_consistency,
@@ -118,9 +120,16 @@ def _chase_note(r) -> str:
     meta = (r.raw or {}).get("chase") if isinstance(r.raw, dict) else None
     if not meta:
         return ""
-    tag = "maker" if meta.get("likely_maker") else "taker"
-    return (f"{tag} 被动{meta.get('passive_attempts', 0)}次 "
+    no_fill = (not getattr(r, "ok", False)
+               and float(getattr(r, "cum_filled_qty", 0.0) or 0.0) <= 0)
+    tag = "未成交" if no_fill else ("maker" if meta.get("likely_maker") else "taker")
+    note = (f"{tag} 被动{meta.get('passive_attempts', 0)}次 "
             f"成交价={r.avg_price:.2f} 总单数={meta.get('steps_used', 0)}")
+    # 失败时附上真实原因；2026-10-03 备注曾把「保证金不足 -2019」挡在外面。
+    err = getattr(r, "error", "") or ""
+    if not getattr(r, "ok", True) and err and err not in note:
+        note = f"{note}; {err}"
+    return note
 
 
 def log_row(row: list) -> None:
@@ -141,11 +150,12 @@ def record_order(r, *, action: str) -> None:
     记录失败不影响交易, 但会让该笔单退化为「未判定」来源 —— 绝不猜测。
     """
     oid = str(getattr(r, "order_id", "") or "").strip()
-    if not oid:
+    cid = str(getattr(r, "client_order_id", "") or "").strip()
+    if not oid and not cid:
         return
     rec = {
         "order_id": oid,
-        "client_order_id": str(getattr(r, "client_order_id", "") or ""),
+        "client_order_id": cid,
         "action": action,
         "ok": bool(getattr(r, "ok", False)),
         "filled": float(getattr(r, "cum_filled_qty", 0.0) or 0.0),
@@ -416,31 +426,174 @@ def _virtual_side_label(book: dict) -> str:
     return "LONG" if float(side) > 0 else "SHORT"
 
 
+def _guard(st: dict) -> dict:
+    return st.setdefault("execution_guard", {"status": "clear", "reason": "", "pending": None})
+
+
+def _trip(st: dict, status: str, reason: str) -> None:
+    guard = _guard(st)
+    if guard.get("status") == "halted":
+        return
+    guard.update(status=status, reason=reason, at_ms=int(time.time() * 1000))
+    save_state(st)  # 持久化失败必须向上抛，绝不放行下一单
+    print(f"[执行熄火 {status}] {reason}")
+
+
+async def _recover_pending(client: BinanceTestnetClient, st: dict) -> bool:
+    """服务重启后只查询旧 CID，不以 -2013 或仓位变化猜测本单不存在。"""
+    guard = _guard(st)
+    pending = guard.get("pending")
+    if not pending:
+        return True
+    cid, symbol = pending["client_order_id"], pending["symbol"]
+    try:
+        old = await client.query_order(client_order_id=cid, symbol=symbol)
+        opens = await client.get_open_orders(symbol)
+    except Exception as exc:  # noqa: BLE001
+        _trip(st, "halted", f"重启恢复查询失败 {symbol} {cid}: {exc}")
+        return False
+    if old.state not in (OrderState.FILLED, OrderState.CANCELED, OrderState.REJECTED) or opens:
+        _trip(st, "halted", f"委托未确认终态/仍有挂单 {symbol} {cid}: {old.state.value} {old.error}")
+        return False
+    filled = float(old.cum_filled_qty or old.filled_qty or 0)
+    before = pending.get("exchange_signed")
+    if before is None or (old.state == OrderState.FILLED and filled <= 0):
+        _trip(st, "halted", f"旧委托成交量/下单前净仓缺失 {symbol} {cid}")
+        return False
+    try:
+        current = _signed_qty(await client.get_position(symbol))
+    except Exception as exc:  # noqa: BLE001
+        _trip(st, "halted", f"旧委托后净仓查询失败 {symbol} {cid}: {exc}")
+        return False
+    signed_fill = filled if pending["side"] == "LONG" else -filled
+    expected = float(before) + signed_fill
+    if abs(current - expected) >= MIN_QTY / 2:
+        _trip(st, "halted", f"旧委托成交/净仓不符 {symbol} {cid}: {expected:.6f} != {current:.6f}")
+        return False
+    guard["pending"] = None
+    save_state(st)
+    return True
+
+
+async def _submit_guarded(client: BinanceTestnetClient, st: dict, *, symbol: str,
+                          side: str, quantity: float, reduce_only: bool,
+                          tag: str, force_cross: bool = False,
+                          expected_ex: float = 0.0):
+    """每个新 CID 在 POST 前原子落盘；未知结果保留 CID 并阻止再次提交。"""
+    guard = _guard(st)
+    base = _new_client_order_id(tag)
+
+    def before_submit(cid: str) -> None:
+        guard["pending"] = {"client_order_id": cid, "symbol": symbol,
+                            "side": side, "quantity": quantity,
+                            "reduce_only": reduce_only,
+                            "exchange_signed": expected_ex,
+                            "at_ms": int(time.time() * 1000)}
+        save_state(st)
+
+    async def before_order(book: dict) -> None:
+        opens = (await client.get_open_orders(symbol) if reduce_only
+                 else await client.get_all_open_orders())
+        if opens:
+            raise RuntimeError("追价期间发现未完委托")
+        current = _signed_qty(await client.get_position(symbol))
+        if abs(current - expected_ex) >= MIN_QTY / 2:
+            raise RuntimeError(f"追价期间净仓改变 {expected_ex:.6f} → {current:.6f}")
+        if not reduce_only:
+            check_expansion(balance=await client.get_account_balance_snapshot(),
+                            risks=await client.get_position_risks(), symbol=symbol,
+                            exchange_signed=current, quantity=quantity,
+                            book=book, leverage=LEVERAGE, min_qty=MIN_QTY)
+
+    try:
+        result = await client.place_limit_chase(
+            side=side, quantity=quantity, reduce_only=reduce_only,
+            tag=tag, force_cross=force_cross, symbol=symbol,
+            client_order_base=base, before_submit=before_submit,
+            before_order=before_order,
+        )
+    except Exception as exc:  # noqa: BLE001
+        status = "halted" if reduce_only or guard.get("pending") else "close_only"
+        _trip(st, status, f"{symbol} 委托异常，需核对原 CID: {type(exc).__name__}: {exc}")
+        return None
+    state = getattr(result, "order_state", "" if not getattr(result, "ok", False) else "filled")
+    if state not in (OrderState.FILLED.value, OrderState.CANCELED.value,
+                     OrderState.REJECTED.value):
+        _trip(st, "halted", f"{symbol} UNKNOWN {getattr(result, 'client_order_id', '')}: {result.error}")
+        return result
+    if guard.get("pending"):
+        guard["pending"] = None
+        save_state(st)
+    if not getattr(result, "ok", False):
+        _trip(st, "halted" if reduce_only else "close_only",
+              f"{symbol} 委托失败 {getattr(result, 'client_order_id', '')}: {result.error or state}")
+    return result
+
+
 async def sync_net(client: BinanceTestnetClient, st: dict, execute: bool, *,
-                   symbol: str, tag: str, force_cross: bool = False):
-    """把同一标的两条策略的虚拟仓合成净仓，只下差额。"""
+                   symbol: str, tag: str, force_cross: bool = False,
+                   allow_expand: bool = True):
+    """仅下安全的一腿：先确认旧仓已平，再单独预检反手新仓。"""
+    guard = _guard(st)
+    if execute and not await _recover_pending(client, st):
+        return None
     pos = await client.get_position(symbol)
-    pos_side = (getattr(pos, "side", "FLAT") or "FLAT").upper()
-    ex = float(getattr(pos, "quantity", 0.0) or 0.0) * (
-        1.0 if pos_side == "LONG" else (-1.0 if pos_side == "SHORT" else 0.0))
-    desired = desired_net(st, symbol)
-    delta = desired - ex
-    if abs(delta) < MIN_QTY:
+    ex = _signed_qty(pos)
+    emergency_close = symbol in guard.get("emergency_close", {})
+    desired = 0.0 if emergency_close else desired_net(st, symbol)
+    if execute and emergency_close and abs(ex) <= 1e-9:
+        guard["emergency_close"].pop(symbol, None)
+        save_state(st)
+        return None
+    if execute and emergency_close and abs(ex) < MIN_QTY:
+        _trip(st, "halted", f"{symbol} 紧急平仓剩余不可交易残差 {ex:.6f}")
+        return None
+    # 小于交易所数量步长的旧方向残差不允许借反向扩仓跨零点。
+    if execute and ex * desired < 0 and abs(ex) < MIN_QTY:
+        _trip(st, "halted", f"{symbol} 存在不可交易反向残差 {ex:.6f}")
+        return None
+    leg = next_net_leg(ex, desired, MIN_QTY)
+    if not leg:
         return None
     if not execute:
-        print(f"[{symbol} 净仓观察] 应有 {desired:.4f} 实际 {ex:.4f} 差额 {delta:.4f}")
+        print(f"[{symbol} 净仓观察] 应有 {desired:.4f} 实际 {ex:.4f} 差额 {desired - ex:.4f}")
         return None
-    side = "LONG" if delta > 0 else "SHORT"
-    reduce_only = reduce_only_for_delta(ex, desired, MIN_QTY)
-    result = await client.place_limit_chase(
-        side=side, quantity=abs(delta), reduce_only=reduce_only,
-        tag=tag, force_cross=force_cross, symbol=symbol,
-    )
+    side, qty, reduce_only = leg
+    if not allow_expand and not reduce_only:
+        return None
+    if guard.get("status") == "halted" or (guard.get("status") == "close_only" and not reduce_only):
+        return None
+    try:
+        opens = (await client.get_open_orders(symbol) if reduce_only
+                 else await client.get_all_open_orders())
+        if opens:
+            raise RuntimeError("存在未完委托，拒绝叠加新单")
+        if not reduce_only:
+            check_expansion(balance=await client.get_account_balance_snapshot(),
+                            risks=await client.get_position_risks(), symbol=symbol,
+                            exchange_signed=ex, quantity=qty,
+                            book=await client.book_ticker(symbol),
+                            leverage=LEVERAGE, min_qty=MIN_QTY)
+    except Exception as exc:  # noqa: BLE001
+        _trip(st, "halted" if reduce_only else "close_only",
+              f"{symbol} 下单预检失败: {type(exc).__name__}: {exc}")
+        return None
+    result = await _submit_guarded(client, st, symbol=symbol, side=side, quantity=qty,
+                                   reduce_only=reduce_only, tag=tag,
+                                   force_cross=force_cross or emergency_close,
+                                   expected_ex=ex)
+    if result is None:
+        return None
     record_order(result, action=f"{symbol_short(symbol)}净仓{side}")
-    after = await client.get_position(symbol)
-    after_side = (getattr(after, "side", "FLAT") or "FLAT").upper()
-    after_qty = float(getattr(after, "quantity", 0.0) or 0.0) * (
-        1.0 if after_side == "LONG" else (-1.0 if after_side == "SHORT" else 0.0))
+    try:
+        after = await client.get_position(symbol)
+        after_qty = _signed_qty(after)
+    except Exception as exc:  # noqa: BLE001
+        _trip(st, "halted", f"{symbol} 下单后净仓无法确认: {exc}")
+        return result
+    if emergency_close and abs(after_qty) <= 1e-9:
+        guard["emergency_close"].pop(symbol, None)
+        save_state(st)
     print(f"[{symbol} 净仓] 目标 {desired:.4f} 原 {ex:.4f} → {after_qty:.4f} "
           f"{_chase_note(result) or result.error}")
     return result
@@ -644,15 +797,35 @@ async def disaster_limit_stop(client: BinanceTestnetClient, st: dict, *,
     if loss_points < stop_points:
         return None
 
+    # 未决委托不可被止损重发绕过；close_only 仍允许先平仓。
+    if _guard(st).get("status") == "halted" or _guard(st).get("pending"):
+        return None
     close_side = "SHORT" if ex_side > 0 else "LONG"
-    result = await client.place_limit_chase(
-        side=close_side, quantity=abs(ex_side), reduce_only=True,
-        tag=tag, force_cross=True, symbol=symbol,
+    result = await _submit_guarded(
+        client, st, symbol=symbol, side=close_side, quantity=abs(ex_side),
+        reduce_only=True, tag=tag, force_cross=True, expected_ex=ex_side,
     )
+    if result is None:
+        return None
     record_order(result, action=f"{symbol_short(symbol)}灾难止损平仓")
-    after = await client.get_position(symbol)
+    try:
+        after = await client.get_position(symbol)
+    except Exception as exc:  # noqa: BLE001
+        _trip(st, "halted", f"{symbol} 止损后仓位无法确认: {exc}")
+        return None
     remaining = abs(float(getattr(after, "quantity", 0.0) or 0.0))
-    flat = remaining < MIN_QTY
+    flat = remaining <= 1e-9  # 小于 minQty 仍是残余风险，不可虚报空仓
+    guard = _guard(st)
+    emergency = guard.setdefault("emergency_close", {})
+    if flat:
+        emergency.pop(symbol, None)
+    else:
+        emergency[symbol] = {"remaining": remaining, "at_ms": int(time.time() * 1000)}
+        if remaining < MIN_QTY:
+            _trip(st, "halted", f"{symbol} 止损剩余不可交易残差 {remaining:.6f}")
+    # 真订单有 CID；在下一次主循环 save_state 前先固化紧急目标，防重启回补。
+    if getattr(result, "client_order_id", ""):
+        save_state(st)
     if flat and symbol == "BTCUSDT":
         st["entry"] = None
     unit = symbol_short(symbol)
@@ -748,11 +921,19 @@ async def step(client: BinanceTestnetClient, st: dict, execute: bool) -> None:
     migrate_state(st)
     # 面板的「确认恢复」请求：一次性消费，只接受暂停之后发出的。
     for _sym in consume_resume_requests(st):
-        print(f"[{_sym} 人工恢复] 已解除暂停，恢复自动开仓与净仓同步")
-    bal = await client.get_balance()
+        status = _guard(st).get("status")
+        if status == "clear":
+            print(f"[{_sym} 人工恢复] 已解除人工干预暂停")
+        else:
+            print(f"[{_sym} 人工恢复] 人工干预暂停解除，但执行熄火 {status} 仍生效")
+    # 原 balance.crossUnPnl 不含逐仓浮亏；执行模式须用全账户权益。
+    bal = (await client.get_account_balance_snapshot() if execute
+           else await client.get_balance())
     now = int(time.time() * 1000)
     upnl = float(getattr(bal, "total_unrealized_pnl", 0.0) or 0.0)
     equity = float(bal.total_wallet_balance) + upnl
+    if execute:
+        await _recover_pending(client, st)
 
     day = now // 86_400_000
     mtm = equity
@@ -764,7 +945,8 @@ async def step(client: BinanceTestnetClient, st: dict, execute: bool) -> None:
     if dd >= 0.10 and not st.get("halted"):
         st["halted"] = True
         print(f"[熔断] 累计回撤 {dd:.1%} ≥ 10% —— 停止开新仓, 等待人工指令")
-    block = bool(st.get("halted")) or dl >= 0.03
+    block = (bool(st.get("halted")) or dl >= 0.03
+             or _guard(st).get("status") != "clear")
 
     for symbol in TRADE_SYMBOLS:
         pos = await client.get_position(symbol)
@@ -839,7 +1021,8 @@ async def step(client: BinanceTestnetClient, st: dict, execute: bool) -> None:
         allow_sync = not watch.get("paused") and not watch.get("hold")
         if allow_sync and (changed or
                            abs(desired_net(st, symbol) - ex_side) >= MIN_QTY):
-            await sync_net(client, st, execute, symbol=symbol, tag=tag)
+            await sync_net(client, st, execute, symbol=symbol, tag=tag,
+                           allow_expand=not block)
 
     # 旧面板仍读顶层 last_ts / entry，与 BTC 15m 账本对齐。
     s15 = st["strategies"]["kdj15"]

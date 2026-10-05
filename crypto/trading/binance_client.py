@@ -10,8 +10,10 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import math
 import time
-from typing import Any, Dict, List, Optional
+import uuid
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import urlencode
 
 try:
@@ -56,9 +58,16 @@ PASSIVE_ON_TIMEOUT = "cross"
 
 
 def _new_client_order_id(prefix: str = "btc") -> str:
-    """Binance clientOrderId ≤ 36 chars."""
-    import os
-    return f"{prefix}{int(time.time() * 1000) % 10_000_000_000_000}{os.getpid() % 1000:03d}"
+    """跨进程/同毫秒唯一；为档号预留空间，长度不超过 36。"""
+    return f"{prefix[:12]}{uuid.uuid4().hex[:20]}"
+
+
+def _definite_order_reject(error: str) -> bool:
+    """仅交易所明确拒单才能结束委托意图；查询 -2013 仍须单独判未决。"""
+    return any(code in error for code in (
+        "-2019", "-5022", "-4061", "-2015", "-1111", "-1102",
+        "-4014", "-2022", "-4164", "-2013",
+    ))
 
 
 class BinanceClientError(RuntimeError):
@@ -289,14 +298,31 @@ class BinanceTestnetClient:
             if item.get("asset") == "USDT":
                 bal.asset = "USDT"
                 bal.total_wallet_balance = float(item.get("balance") or 0)
-                bal.available_balance = float(
-                    item.get("availableBalance") or item.get("balance") or 0
-                )
+                # 0 是有效可用余额，不能通过 `or` 回退到钱包总额。
+                available = item.get("availableBalance")
+                bal.available_balance = float(available if available is not None else 0)
                 bal.total_unrealized_pnl = float(
                     item.get("crossUnPnl") or 0
                 )
                 break
         return bal
+
+    async def get_account_balance_snapshot(self) -> AccountBalance:
+        """账户级总浮盈含逐仓，供扩仓预算；字段缺失时不得回退至钱包余额。"""
+        data = await self._request("GET", "/fapi/v2/account", signed=True)
+        required = ("totalWalletBalance", "availableBalance", "totalUnrealizedProfit")
+        if not isinstance(data, dict) or any(data.get(key) is None for key in required):
+            raise BinanceClientError("账户余额快照字段不完整，拒绝扩仓")
+        return AccountBalance(total_wallet_balance=float(data["totalWalletBalance"]),
+                              available_balance=float(data["availableBalance"]),
+                              total_unrealized_pnl=float(data["totalUnrealizedProfit"]))
+
+    async def get_position_risks(self) -> list:
+        """只读账户全部合约持仓；组合敞口不能只统计 BTC/ETH。"""
+        data = await self._request("GET", "/fapi/v2/positionRisk", signed=True)
+        if not isinstance(data, list):
+            raise BinanceClientError("positionRisk 返回格式异常，拒绝扩仓")
+        return data
 
     async def get_position(self, symbol: Optional[str] = None) -> PositionInfo:
         symbol = symbol or self.symbol
@@ -378,6 +404,13 @@ class BinanceTestnetClient:
             {"symbol": symbol or self.symbol},
             signed=True,
         )
+
+    async def get_all_open_orders(self) -> list:
+        """不带 symbol 的全账户挂单；扩仓时不能遗漏其他标的待成交敞口。"""
+        data = await self._request("GET", "/fapi/v1/openOrders", signed=True)
+        if not isinstance(data, list):
+            raise BinanceClientError("全账户挂单快照异常，拒绝扩仓")
+        return data
 
     async def query_order(
         self,
@@ -481,8 +514,7 @@ class BinanceTestnetClient:
         try:
             raw = await self._request("DELETE", "/fapi/v1/order", params, signed=True)
             mo = self._raw_to_managed(raw, client_order_id=client_order_id or "")
-            if mo.state not in (OrderState.CANCELED, OrderState.FILLED):
-                mo.state = OrderState.CANCELED
+            # DELETE 的 HTTP 200 不证明撤单已处于终态。
             return mo
         except BinanceClientError as exc:
             return ManagedOrder(
@@ -641,7 +673,9 @@ class BinanceTestnetClient:
     def _qty_precision(self, qty: float, step: float = 0.001) -> float:
         if step <= 0:
             return round(qty, 3)
-        n = int(qty / step)
+        # 5.260 - 5.259 在二进制浮点可能略小于 0.001；只容忍远小于
+        # 交易所步长的表示误差，真实不足一步的数量仍向下取整为 0。
+        n = math.floor(qty / step + 1e-10)
         return round(n * step, 8)
 
     def _price_precision(self, price: float, tick: float = 0.1) -> float:
@@ -774,19 +808,21 @@ class BinanceTestnetClient:
                 order_state=mapped.value,
             )
         except (BinanceClientError, asyncio.TimeoutError, OSError) as exc:
-            # 超时/断线: 先查 clientOrderId；查询失败保持 UNKNOWN，不标 REJECTED
-            mo = await self.query_order(client_order_id=cid, symbol=symbol)
+            # 明确拒单不应被查询 -2013 覆盖，更不能因 -4061 擅自翻转模式重发。
+            if isinstance(exc, BinanceClientError) and _definite_order_reject(str(exc)):
+                return OrderResult(ok=False, error=str(exc), side=order_side,
+                                   symbol=symbol, client_order_id=cid,
+                                   order_state=OrderState.REJECTED.value,
+                                   requested_qty=quantity, submitted_qty=qty)
+            # 超时/断线: 只查同一个 CID；失败保持 UNKNOWN。
+            try:
+                mo = await self.query_order(client_order_id=cid, symbol=symbol)
+            except (BinanceClientError, asyncio.TimeoutError, OSError) as query_exc:
+                mo = ManagedOrder(client_order_id=cid, state=OrderState.UNKNOWN,
+                                  symbol=symbol, error=str(query_exc))
             filled = mo.cum_filled_qty or mo.filled_qty
             if mo.state in (OrderState.FILLED, OrderState.PARTIALLY_FILLED) or filled > 0:
                 return mo.to_order_result()
-            # 持仓模式不匹配（-4061）→ 翻转模式后重试。
-            # 必须放在"已提交未决"返回之前，否则该重试分支永远不可达。
-            if "-4061" in str(exc) and not getattr(self, "_mode_flipped", False):
-                self._mode_flipped = True  # type: ignore[attr-defined]
-                self._hedge_mode = not bool(self._hedge_mode)
-                return await self.market_open(
-                    side, quantity, symbol, reduce_only, client_order_id=cid
-                )
             if mo.state in (OrderState.ACKNOWLEDGED, OrderState.SUBMITTED, OrderState.UNKNOWN) or mo.error:
                 return OrderResult(
                     ok=False,
@@ -801,17 +837,14 @@ class BinanceTestnetClient:
                     cum_filled_qty=0.0,
                     quantity=0.0,
                 )
-            # 仅明确拒单（鉴权/参数）才 REJECTED；网络类保持 UNKNOWN
-            is_reject = isinstance(exc, BinanceClientError) and (
-                "-2015" in str(exc) or "-1111" in str(exc) or "Invalid" in str(exc)
-            )
+            # 网络类始终 UNKNOWN；上方只把交易所明确拒单分类为 REJECTED。
             return OrderResult(
                 ok=False,
                 error=str(exc),
                 side=order_side,
                 symbol=symbol,
                 client_order_id=cid,
-                order_state=(OrderState.REJECTED if is_reject else OrderState.UNKNOWN).value,
+                order_state=OrderState.UNKNOWN.value,
                 requested_qty=quantity,
                 submitted_qty=qty,
                 cum_filled_qty=0.0,
@@ -897,17 +930,6 @@ class BinanceTestnetClient:
             )
         except (BinanceClientError, asyncio.TimeoutError, OSError) as exc:
             submit_error = str(exc)
-            if "-4061" in submit_error and not getattr(self, "_mode_flipped", False):
-                self._mode_flipped = True  # type: ignore[attr-defined]
-                self._hedge_mode = not bool(self._hedge_mode)
-                return await self.place_limit_order(
-                    side, quantity, price, symbol,
-                    time_in_force=time_in_force, reduce_only=reduce_only,
-                    client_order_id=cid, fill_timeout_sec=fill_timeout_sec,
-                    poll_interval_sec=poll_interval_sec,
-                    cancel_if_unfilled=cancel_if_unfilled,
-                    post_only=post_only,
-                )
             if post_only and (
                 # 期货实测拒单码: -5022 "could not be executed as maker"
                 # 现货/旧版文案是 "would immediately match", 两个都认。
@@ -924,7 +946,7 @@ class BinanceTestnetClient:
                     requested_qty=quantity, submitted_qty=0.0,
                     cum_filled_qty=0.0, quantity=0.0,
                 )
-            if "-2013" in submit_error or "Order does not exist" in submit_error:
+            if _definite_order_reject(submit_error):
                 return OrderResult(
                     ok=False, error=submit_error, symbol=symbol, side=order_side,
                     client_order_id=cid, order_state=OrderState.REJECTED.value,
@@ -946,9 +968,14 @@ class BinanceTestnetClient:
 
         deadline = time.time() + max(0.0, fill_timeout_sec)
         last = entry
+        known_filled = float(entry.cum_filled_qty or 0)
+        known_avg = float(entry.avg_price or 0)
         while time.time() < deadline:
             await asyncio.sleep(poll_interval_sec)
             last = await self.query_order(client_order_id=cid, symbol=symbol)
+            known_filled = max(known_filled, float(last.cum_filled_qty or last.filled_qty or 0))
+            if last.avg_price > 0:
+                known_avg = last.avg_price
             if last.state == OrderState.FILLED:
                 return last.to_order_result()
             if last.state in (OrderState.CANCELED, OrderState.REJECTED):
@@ -956,7 +983,7 @@ class BinanceTestnetClient:
             if last.state == OrderState.UNKNOWN and last.error and not submit_error:
                 break  # 查询本身失败：保持 UNKNOWN，不冒充失败
 
-        filled = float(last.cum_filled_qty or last.filled_qty or 0)
+        filled = known_filled
 
         # 只要不是「完全成交」，就必须把剩余挂单撤掉。
         #
@@ -974,13 +1001,13 @@ class BinanceTestnetClient:
             canceled = await self.cancel_order(client_order_id=cid, symbol=symbol)
             # 撤单回执可能不带成交量（-2011 等），此时用轮询到的值兜底，
             # 绝不把已经成交的部分当成 0。
-            cum = float(canceled.cum_filled_qty or 0) or filled
+            cum = max(float(canceled.cum_filled_qty or 0), filled)
             canceled.cum_filled_qty = cum
             canceled.filled_qty = cum
-            if canceled.state == OrderState.UNKNOWN and not canceled.error:
-                canceled.state = OrderState.CANCELED
+            if not canceled.avg_price:
+                canceled.avg_price = known_avg
             result = canceled.to_order_result()
-            if cum > 0:
+            if cum > 0 and canceled.state in (OrderState.CANCELED, OrderState.FILLED):
                 # 有真实成交就是「成功的一部分」，与改动前
                 # （部分成交直接返回、ok=True）保持一致的语义；
                 # order_state 仍如实记为 CANCELED，不粉饰订单真实状态。
@@ -988,7 +1015,13 @@ class BinanceTestnetClient:
             return result
 
         if filled > 0:
-            return last.to_order_result()
+            last.cum_filled_qty = last.filled_qty = filled
+            if not last.avg_price:
+                last.avg_price = known_avg
+            result = last.to_order_result()
+            if last.state == OrderState.UNKNOWN:
+                result.ok = False
+            return result
 
         return OrderResult(
             ok=False,
@@ -1024,6 +1057,9 @@ class BinanceTestnetClient:
         window_sec: Optional[float] = None,
         tag: str = "ps",
         force_cross: bool = False,
+        client_order_base: Optional[str] = None,
+        before_submit: Optional[Callable[[str], None]] = None,
+        before_order: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> OrderResult:
         """被动限价挂单 (post-only) + 跟盘口重挂, 超时兜底.
 
@@ -1071,6 +1107,9 @@ class BinanceTestnetClient:
         )
         attempts: List[Dict[str, Any]] = []
         pad = 0
+        base = client_order_base or _new_client_order_id(tag)
+        if len(base) > 32:
+            raise ValueError("追价订单基准 clientOrderId 过长")
 
         while time.time() < deadline and len(attempts) < PASSIVE_MAX_REPRICE:
             book = await self.book_ticker(symbol)
@@ -1086,7 +1125,11 @@ class BinanceTestnetClient:
             px = self._price_precision(px, tick)
 
             idx = len(attempts)
-            cid = _new_client_order_id(f"{tag}{idx}")
+            if before_order:
+                await before_order(book)  # 盘口/权益/账户仓位随追价变化，逐单复核
+            cid = f"{base}p{idx}"
+            if before_submit:
+                before_submit(cid)  # 先持久化订单身份，再发送 POST
             res = await self.place_limit_order(
                 side,
                 qty,
@@ -1100,15 +1143,36 @@ class BinanceTestnetClient:
                 post_only=True,
             )
             filled = float(res.cum_filled_qty or 0)
+            # 未决（即使部分成交）或明确风控拒单绝不继续下一档/IOC。
+            if res.order_state not in (OrderState.FILLED.value,
+                                       OrderState.CANCELED.value,
+                                       OrderState.REJECTED.value):
+                return self._with_passive_meta(res, attempts, maker=True)
+            if res.order_state == OrderState.REJECTED.value and "POST_ONLY_REJECT" not in res.error:
+                return self._with_passive_meta(res, attempts, maker=True)
             if filled > 0:
                 attempts.append({"step": idx, "price": px, "filled": filled,
                                  "bid": bid, "ask": ask, "maker": True})
                 return self._finish_passive(res, attempts, maker=True,
                                             reduce_only=reduce_only)
 
+            if "POST_ONLY_REJECT" in res.error:
+                # 明确的交易所 -5022 根本没有建立订单；只允许此路径退档重试。
+                pad = min(pad + 1, PASSIVE_MAX_PAD)
+                attempts.append({"step": idx, "price": px, "filled": 0.0,
+                                 "bid": bid, "ask": ask, "reject": "post_only"})
+                continue
+
             # 撤单后复核: 撤单与成交可能竞态
             final = await self.query_order(client_order_id=cid, symbol=symbol)
             final_filled = float(final.cum_filled_qty or final.filled_qty or 0)
+            if final.state in (OrderState.UNKNOWN, OrderState.ACKNOWLEDGED,
+                               OrderState.PARTIALLY_FILLED):
+                unresolved = final.to_order_result()
+                unresolved.ok = False
+                unresolved.order_state = OrderState.UNKNOWN.value
+                unresolved.error = f"post_cancel_unresolved: {final.error or final.state.value}"
+                return self._with_passive_meta(unresolved, attempts, maker=True)
             if final.state == OrderState.FILLED or final_filled > 0:
                 attempts.append({"step": idx, "price": px, "filled": final_filled,
                                  "bid": bid, "ask": ask, "maker": True})
@@ -1117,12 +1181,6 @@ class BinanceTestnetClient:
                     reduce_only=reduce_only,
                 )
 
-            if res.error and "POST_ONLY_REJECT" in res.error:
-                # 盘口在读取与提交之间动了, 价格已经站到对手方: 让开一档
-                pad = min(pad + 1, PASSIVE_MAX_PAD)
-                attempts.append({"step": idx, "price": px, "filled": 0.0,
-                                 "bid": bid, "ask": ask, "reject": "post_only"})
-                continue
             pad = 0
             attempts.append({"step": idx, "price": px, "filled": 0.0,
                              "bid": bid, "ask": ask})
@@ -1147,7 +1205,11 @@ class BinanceTestnetClient:
             (ask + PASSIVE_CROSS_TICKS * tick) if is_long
             else (bid - PASSIVE_CROSS_TICKS * tick), tick
         )
-        cid = _new_client_order_id(f"{tag}x")
+        if before_order:
+            await before_order(book)
+        cid = f"{base}x"
+        if before_submit:
+            before_submit(cid)
         res = await self.place_limit_order(
             side, qty, cross_px, symbol,
             # IOC 仍然是 LIMIT：立即成交可成交部分，余量由交易所取消。
@@ -1159,18 +1221,21 @@ class BinanceTestnetClient:
         )
         filled = float(res.cum_filled_qty or 0)
         if filled > 0:
-            res.ok = True  # IOC 余量取消不抹掉已经确认的部分成交。
+            res.ok = res.order_state in (OrderState.FILLED.value, OrderState.CANCELED.value)
+            # 未知撤单/查询不等于已完成，即使之前查询见到部分成交。
             attempts.append({"step": len(attempts), "price": cross_px,
                              "filled": filled, "bid": bid, "ask": ask,
                              "maker": False, "cross": True})
-            return self._finish_passive(res, attempts, maker=False,
-                                        reduce_only=reduce_only)
+            if res.ok:
+                return self._finish_passive(res, attempts, maker=False,
+                                            reduce_only=reduce_only)
+            return self._with_passive_meta(res, attempts, maker=False)
         # 保留交易所实际订单状态/ID；网络未知不能伪称已经撤销。
         res.error = (f"passive_exhausted: 被动 {len(attempts)} 次 + IOC限价兜底未确认成交; "
                      f"{res.error or res.order_state}")
-        res.raw = {**(res.raw or {}),
-                   "chase": {"attempts": attempts, "likely_maker": False}}
-        return res
+        # 复用同一套 chase meta 键名；2026-10-03 手写 {"attempts","likely_maker"} 导致
+        # 日志把 steps/passive 读成 0（「taker 被动0次」），真实原因被挡住。
+        return self._with_passive_meta(res, attempts, maker=False)
 
     @staticmethod
     def _finish_passive(
