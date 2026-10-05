@@ -14,6 +14,10 @@
 <string>Background</string>
 <key>EnvironmentVariables</key>
 <dict>
+<key>TRADING_MODE</key>
+<string>live</string>
+<key>CONFIRM_MAINNET</key>
+<string>YES_I_UNDERSTAND</string>
 <key>PYTHONPATH</key>
 <string>/Users/zengyun/我的AI/crypto/.work/rt-dev/crypto</string>
 <key>PYTHONDONTWRITEBYTECODE</key>

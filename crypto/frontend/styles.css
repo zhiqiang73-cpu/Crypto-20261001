@@ -191,6 +191,12 @@ button:disabled { cursor: default; opacity: .5; }
 .hl.is-bad .hl-v { color: var(--danger); }
 .hl.is-warn { background: var(--warn-soft); }
 .hl.is-warn .hl-v { color: var(--warn); }
+
+/* 监控页顶部 · 系统自检横条：单行 6 项，复用 .hl 的外观，改为横向等分 */
+.sc-list { flex-direction: row; flex-wrap: wrap; align-items: stretch; }
+.sc-list .hl { flex: 1 1 0; min-width: 150px; min-height: 38px; gap: 6px; border-bottom: 0; border-right: 1px solid var(--line); }
+.sc-list .hl:last-child { border-right: 0; }
+.sc-list .hl-k { width: auto; flex: 0 0 auto; }
 .sig-card { padding: 11px 12px; border-bottom: 1px solid var(--line); }
 .sig-head, .sig-nums, .sig-foot { display: flex; align-items: center; gap: 8px; }
 .sig-head { margin-bottom: 8px; }

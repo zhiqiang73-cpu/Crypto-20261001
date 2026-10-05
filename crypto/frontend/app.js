@@ -340,6 +340,30 @@
     return { level, items, paused, holds, reconGaps: rc.gaps };
   }
 
+  // ------------------------------------------------------------------ 模式 / 市场文案
+  // 单一来源：模式徽标、页脚、设置页都用这两个函数，避免各处硬编码「测试网」。
+  // market 取自心跳的 market 字段（mainnet / testnet）；取不到时按「未知市场」显示，
+  // 绝不猜成测试网 —— 猜错会让人以为在跑测试网，实际在下真钱单。
+  const marketZh = (market) =>
+    market === "mainnet" ? "主网"
+    : market === "testnet" ? "测试网"
+    : "未知市场";
+
+  function modeZh(mode, market) {
+    const raw = String(mode == null ? "" : mode);
+    if (!raw) return "模式未上报";
+    if (raw === "testnet_orders" || raw === "execute") {
+      return `${marketZh(market)} · ${market === "mainnet" ? "真实下单" : "实盘下单"}`;
+    }
+    if (raw === "observe" || raw === "observation_only") return `${marketZh(market)} · 只观察`;
+    if (raw === "paper") return "纸面 · Paper";
+    return raw;
+  }
+
+  const isObserveMode = (mode) => mode === "observe" || mode === "observation_only";
+
+  const isExecMode = (mode) => mode === "testnet_orders" || mode === "execute";
+
   // ------------------------------------------------------------------ 顶栏 / 行情条
   function renderTopbar() {
     const r = runnerInfo();
@@ -347,20 +371,17 @@
     const mk = marketState();
     const rk = runnerRisk();
 
-    // 模式
+    // 模式（市场取自运行器心跳：主网/测试网由运行器上报，前端不猜）
     const mode = r && r.mode;
-    const modeZh =
-      mode === "testnet_orders" ? "测试网 · 实盘下单"
-      : mode === "observe" || mode === "observation_only" ? "测试网 · 只观察"
-      : mode === "paper" ? "纸面 · Paper"
-      : mode || "模式未上报";
+    const market = r && r.market;
+    const modeText = modeZh(mode, market);
     const modeEl = $("modePill");
     if (modeEl) {
-      const isObserve = mode === "observe" || mode === "observation_only";
+      const isObserve = isObserveMode(mode);
       const dotCls = hb.level === "ok" ? (isObserve ? "amber" : "green") : hb.level === "warn" ? "amber" : "red";
       modeEl.className = "pill " + (hb.level === "ok" ? (isObserve ? "is-warn" : "is-live") : hb.level === "warn" ? "is-warn" : "is-danger");
-      modeEl.innerHTML = `<i class="dot ${dotCls}"></i><b>${esc(modeZh)}</b>`;
-      modeEl.title = r ? `心跳 ${fmtTime(r.updated_ms)} · pid ${r.pid || "—"}` : "未收到运行器心跳";
+      modeEl.innerHTML = `<i class="dot ${dotCls}"></i><b>${esc(modeText)}</b>`;
+      modeEl.title = r ? `心跳 ${fmtTime(r.updated_ms)} · pid ${r.pid || "—"} · ${modeText}` : "未收到运行器心跳";
     }
 
     const tsE = $("tsEngine");
@@ -407,6 +428,16 @@
         const age = Math.floor((Date.now() - lastSyncAt) / 1000);
         foot.textContent = `数据更新 ${fmtHMS(lastSyncAt)}${age <= 1 ? "（刚刚）" : `（${age}s 前）`}${apiFailStreak >= 2 ? " · 接口异常" : ""}`;
       }
+    }
+
+    // 页脚市场（由 /api/market 下发，取不到时保留 HTML 里的原文案）
+    const fm = $("footMarket");
+    if (fm) {
+      const mc = marketCache || {};
+      const label = mc.market_label
+        || (mc.market === "mainnet" ? "主网 (mainnet)"
+          : mc.market === "testnet" ? "测试网 (testnet)" : "");
+      if (label) fm.textContent = "币安" + label;
     }
   }
 
@@ -978,7 +1009,90 @@
     ).join("");
   }
 
+  // 监控页顶部 · 系统自检横条：一行回答用户的 6 个问题。
+  // 只读现有状态缓存，不额外发请求；任何字段缺失都降级显示，不抛错。
+  function renderSelfCheck() {
+    const box = $("selfCheckList");
+    if (!box) return;
+    const st = statusCache || {};
+    const g = st.guardian || {};
+    const s = summaryCache || {};
+    const cov = s.coverage || {};
+
+    const hb = heartbeatState();
+    const mkState = marketState();
+    const risk = runnerRisk();
+    const pr = protectionState();
+    const rc = reconState();
+    const rInfo = runnerInfo();
+
+    // ① 运行器
+    const rows = [{
+      lv: hb.level, k: "运行器",
+      v: hb.age == null ? "无心跳" : hb.text,
+      title: hb.age == null ? "未收到运行器心跳" : `心跳 ${ageText(rInfo && rInfo.updated_ms)} 前`,
+    }];
+
+    // ② 行情数据（含市场一致性哨兵：面板采集器 vs 运行器）
+    const panelMarket = (marketCache || {}).market || null;
+    const runnerMarket = (monitorCache && monitorCache.heartbeat && monitorCache.heartbeat.market)
+      || (rInfo && rInfo.market) || null;
+    const diverge = Boolean(panelMarket && runnerMarket && panelMarket !== runnerMarket);
+    rows.push({
+      lv: diverge ? "bad" : mkState.level, k: "行情数据",
+      v: diverge ? "市场不一致" : (mkState.ageSec == null ? "无行情" : mkState.text),
+      title: diverge
+        ? `面板采集器 ${panelMarket} ≠ 运行器 ${runnerMarket}：页面价格不是下单用的价格`
+        : "行情流与运行器同市场",
+    });
+
+    // ③ 风控
+    const riskBad = risk.ctx.halted
+      || (risk.dayLoss != null && risk.dayLoss >= 0.03)
+      || (risk.dd != null && risk.dd >= 0.10);
+    const riskWarn = !riskBad && ((risk.dayLoss != null && risk.dayLoss >= 0.02)
+      || (risk.dd != null && risk.dd >= 0.05));
+    rows.push({
+      lv: riskBad ? "bad" : riskWarn ? "warn" : "ok", k: "风控",
+      v: riskBad ? (risk.ctx.halted ? "已熔断" : "接近上限") : riskWarn ? "注意" : "正常",
+      title: `日亏 ${pct(risk.dayLoss)} / 回撤 ${pct(risk.dd)} / halted ${risk.ctx.halted ? "true" : "false"}`,
+    });
+
+    // ④ 执行与保护
+    const nProt = (st.open_orders || []).filter((o) => o.reduceOnly).length;
+    let lv4 = pr.level, v4 = pr.text;
+    if (lv4 !== "bad" && g.allow_new_entries === false) { lv4 = "warn"; v4 = "禁止开新仓"; }
+    rows.push({
+      lv: lv4, k: "执行与保护", v: v4,
+      title: `保护单 ${nProt} 张 · ${g.allow_new_entries === false ? "禁止开新仓" : "允许开新仓"}`,
+    });
+
+    // ⑤ 账本
+    rows.push({
+      lv: rc.ok ? "ok" : "bad", k: "账本", v: rc.ok ? "一致" : "不一致",
+      title: rc.ok ? "策略账本与交易所净仓一致"
+        : rc.gaps.map((x) => `${coin(x.sym)} 差 ${num(x.gap, 4)}`).join(" · "),
+    });
+
+    // ⑥ 数据核对（接口覆盖 / 是否截断）
+    const fills = cov.fills;
+    rows.push({
+      lv: cov.truncated || fills == null ? "warn" : "ok", k: "数据核对",
+      v: fills == null ? "无成交数据" : `覆盖 ${fills} 笔`,
+      title: cov.truncated ? "接口返回被截断，统计窗口可能不完整" : "接口覆盖完整（未截断）",
+    });
+
+    box.innerHTML = rows.map((r2) => {
+      const cls = r2.lv === "bad" ? "is-bad" : r2.lv === "warn" ? "is-warn" : "";
+      const dot = r2.lv === "ok" ? "green" : r2.lv === "warn" ? "amber" : "red";
+      return `<div class="hl ${cls}" title="${esc(r2.title || "")}">` +
+        `<span class="dot ${dot}"></span><span class="hl-k">${esc(r2.k)}</span>` +
+        `<span class="hl-v">${esc(r2.v)}</span></div>`;
+    }).join("");
+  }
+
   function renderMonitorView() {
+    renderSelfCheck();
     const st = statusCache || {};
     const s = summaryCache || {};
     const reading = readingCache || {};
@@ -998,7 +1112,7 @@
     const uptime = r && r.started_ms ? ((Date.now() - Number(r.started_ms)) / 3600000).toFixed(1) + " h" : "—";
     kvRows($("mrKv"), [
       { k: "状态", v: `<span class="${hb.level === "ok" ? "up" : hb.level === "warn" ? "warn" : "down"}">${esc(hb.text)}</span>`, x: r ? esc(r.status || "") : "" },
-      { k: "模式", v: esc(r && r.mode || "—"), x: "testnet_orders = 实盘下单" },
+      { k: "模式", v: `<span class="${hb.level === "ok" ? (isObserveMode(r && r.mode) ? "warn" : "up") : "down"}">${esc(modeZh(r && r.mode, r && r.market))}</span>`, x: isExecMode(r && r.mode) ? "execute：按信号真实下单" : isObserveMode(r && r.mode) ? "只记账不下单" : "" },
       { k: "进程", v: r && r.pid ? `pid ${r.pid}` : "—", x: lock && lock.pid ? `锁文件 pid ${lock.pid}` : "无锁文件" },
       { k: "启动时间", v: r && r.started_ms ? fmtTime(r.started_ms) : "—", x: `运行 ${uptime}` },
       { k: "心跳时间", v: r && r.updated_ms ? fmtTime(r.updated_ms) : "—", x: hb.age == null ? "" : `${Math.round(hb.age)}s 前` },
@@ -1013,8 +1127,33 @@
     const markAge = sh && sh.mark_age_sec || {};
     setText("mfMeta", mk.event_time_ms ? `行情 ${fmtTime(mk.event_time_ms)}` : "—", "ph-meta mono");
     const rd = (reading.readings || []).find((x) => x && x.symbol === "BTCUSDT" && x.interval === "15m") || reading;
+
+    // 行情通道来源：按 K 线地址的 host 判断，不再硬编码「测试网」。
+    // 这正是 2026-10-02 事故的观测点 —— 行情腿跟错市场时这里必须看得见。
+    const klineUrl = String((rd && rd.kline_url) || "");
+    const klineSrcText = /testnet\.binancefuture\.com|demo-fapi/.test(klineUrl)
+      ? "测试网 K 线"
+      : /fapi\.binance\.com/.test(klineUrl) ? "主网 K 线" : "来源未知";
+
+    // 行情一致性：面板采集器市场 vs 运行器市场。
+    // 两者分叉 = 页面价格不是运行器下单用的价格（本次故障的核心症状）。
+    const panelMarket = mk.market || null;
+    const runnerMarket = (mon.heartbeat && mon.heartbeat.market) || (r && r.market) || null;
+    const mkConsistent = panelMarket && runnerMarket
+      ? { ok: panelMarket === runnerMarket }
+      : null;
+
     kvRows($("mfKv"), [
       { k: "市场", v: esc(mk.market_label || mk.market || "—"), x: esc(mk.source || "") },
+      {
+        k: "行情一致性",
+        v: !mkConsistent ? "—"
+          : mkConsistent.ok ? `<span class="up">一致</span>` : `<span class="down">不一致</span>`,
+        x: !mkConsistent ? ""
+          : mkConsistent.ok ? "面板采集器 = 运行器"
+            : `面板 ${esc(panelMarket)} ≠ 运行器 ${esc(runnerMarket)}`,
+        cls: mkConsistent && !mkConsistent.ok ? "is-bad" : "",
+      },
       { k: "标记价 BTC", v: mk.mark_price ? num(mk.mark_price, 2) : "—", x: mk.event_time_ms ? `${Math.round((Date.now() - mk.event_time_ms) / 1000)}s 前` : "" },
       { k: "指数价", v: mk.index_price ? num(mk.index_price, 2) : "—" },
       { k: "资金费年化", v: mk.funding_rate_annualized == null ? "—" : signedPct(mk.funding_rate_annualized) },
@@ -1024,7 +1163,7 @@
       { k: "标记价年龄", v: `BTC ${markAge["BTCUSDT"] ?? "—"}s · ETH ${markAge["ETHUSDT"] ?? "—"}s` },
       { k: "运行器K线", v: rd && rd.bar_utc ? `${rd.bar_utc} UTC` : "—", x: rd && rd.close ? `收 ${num(rd.close, 2)}` : "" },
       { k: "错过 K 线", v: `${risk.ctx.missed_bars ?? 0} 根 / ${risk.ctx.missed_signals ?? 0} 信号`, x: "停机只记账不补单" },
-      { k: "行情通道", v: esc(String(rd && rd.kline_url || "—").replace("https://", "")), x: "测试网 K 线" },
+      { k: "行情通道", v: esc(String(klineUrl || "—").replace("https://", "")), x: klineSrcText },
     ]);
 
     // ---- 风控闸门
@@ -1041,8 +1180,6 @@
       { k: "冷却", v: (Number((st.cooldown_until || {}).short_term || 0) || Number((st.cooldown_until || {}).long_term || 0)) ? `短期 ${num((st.cooldown_until || {}).short_term, 0)} · 长期 ${num((st.cooldown_until || {}).long_term, 0)}` : "无", x: "冷却期内不开新仓" },
       { k: "日初权益", v: num(risk.dayStart, 2), x: "运行器记录" },
       { k: "权益峰值", v: num(risk.peakEq, 2), x: `记录回撤 ${pct(s.quality && s.quality.recorded_max_drawdown)}` },
-      { k: "5m 策略", v: risk.ctx.five_minute_disabled ? "已停用" : "运行中", x: "避免无正常出口" },
-      { k: "记录起点", v: esc(s.record_start || "—"), x: "委托/成交/成本过滤线" },
     ]);
 
     // ---- 执行与保护
@@ -1091,9 +1228,6 @@
         cls: ok ? "" : "is-bad",
       });
     });
-    reconRows.push({
-      k: "旧对账标记", v: st.reconciliation_needed ? "旧 V7 模块标记需对账（该模块不参与交易）" : "无", x: "仅附注", cls: "",
-    });
     kvRows($("mrcKv"), reconRows);
 
     const ext = st.external_interventions || {};
@@ -1109,7 +1243,7 @@
       })));
     }
 
-    // ---- 数据覆盖与成本
+    // ---- 数据与成本核对（只留「数据是否可信」相关，统计成绩类行已移除）
     const cov = s.coverage || {};
     const costs = (s.quality && s.quality.costs) || {};
     const effFills = (tradesCache || []).filter(isHistoryRow).length;
@@ -1119,23 +1253,11 @@
       { k: "统计窗口", v: `${effFills} 笔 <span class="sub">起点后有效成交</span>`, x: `自 ${esc(s.record_start || "—")}` },
       { k: "起点裁剪", v: cov.clipped_at_start ? "已按记录起点裁剪" : "未裁剪", x: cov.truncated ? "接口截断" : "未截断" },
       { k: "孤儿平仓", v: String(cov.orphan_closes ?? "—"), x: "起点前开仓的平仓腿" },
-      { k: "窗口净额", v: signed(s.net_pnl, 2), x: `已实现 ${signed(s.realized_pnl, 2)} − 费用`, cls: pnlCls(s.net_pnl) === "up" ? "is-good" : "" },
-      { k: "开仓名义", v: num(s.open_notional, 2), x: "不依赖复利" },
-      { k: "单笔边际", v: s.unit_edge_bps == null ? "—" : `${num(s.unit_edge_bps, 1)} bps`, x: "净额 ÷ 名义 × 10000" },
-      { k: "胜率 / 盈亏比", v: `${pct(s.win_rate, 1)} / ${s.profit_factor == null ? "—" : num(s.profit_factor, 2)}`, x: `盈 ${s.wins ?? 0} / 亏 ${s.losses ?? 0} 笔` },
-      { k: "平均盈亏", v: `+${num(s.avg_win, 2)} / -${num(Math.abs(Number(s.avg_loss || 0)), 2)}`, x: "USDT" },
       { k: "费用 · Maker", v: num(costs.maker_fee, 4), x: "逐笔成交" },
       { k: "费用 · Taker", v: num(costs.taker_fee, 4) },
       { k: "资金费", v: num(costs.funding_fee, 4), x: costs.funding_orphan ? `未归属 ${num(costs.funding_orphan, 4)}` : "" },
       { k: "滑点估算", v: costs.slippage_est == null ? "—" : num(costs.slippage_est, 2), x: "开仓价 − 参考价" },
-      { k: "权益记录点", v: String((risk.ctx.recorded_equity_points ?? "—")), x: "运行记录口径" },
     ]);
-
-    // ---- 巡检快照
-    const tail = mon.monitor_tail || [];
-    const snapBox = $("msnapBox");
-    if (snapBox) snapBox.textContent = tail.length ? tail.join("\n") : "无巡检记录";
-    setText("msnapMeta", tail.length ? `${tail.length} 行 · 每小时一行` : "—", "ph-meta mono");
 
     // ---- 事件日志
     const all = alertsCache || [];
@@ -1222,6 +1344,10 @@
           : "未检测到需要确认的人工干预；出现时运行器会暂停该标的自动开仓并在此处提供确认。");
       }
     }
+
+    // 主网执行状态依赖运行器心跳，而心跳随每轮刷新变化 —— 用缓存重绘一次，
+    // 否则要等用户手动切到设置页才会更新（首屏时心跳往往还没到）。
+    if (mainnetCfgCache) renderMainnetConfig(mainnetCfgCache);
   }
 
   // ------------------------------------------------------------------ 数据加载
@@ -1365,26 +1491,86 @@
     return data;
   }
 
+  // 主网执行是否启用：**以运行器心跳为准**。
+  // 面板进程自己的 TRADING_MODE 可能与运行器不同（两个 launchd 配置各自独立），
+  // 所以能拿到心跳时一律用心跳；老后端没有这些字段时才回退 /api/config。
+  // 返回 { enabled: bool|null, known: bool, v: html, x: text }
+  function mainnetExecState(cfg) {
+    const c = cfg || {};
+    const hb = (monitorCache && monitorCache.heartbeat) || null;
+    const hasHb = Boolean(hb && hb.updated_ms);
+    const fresh = hasHb && (Date.now() - Number(hb.updated_ms)) < 90000;
+
+    if (hasHb && hb.market) {
+      if (!fresh) {
+        return { known: true, enabled: false, running: false,
+          v: "未运行", x: "运行器未运行，不产生下单" };
+      }
+      const on = hb.market === "mainnet" && !isObserveMode(hb.mode);
+      return {
+        known: true, enabled: on, running: true,
+        v: on ? `<span class="up">已启用（双重确认）</span>`
+              : `<span class="warn">已禁用（安全闸门）</span>`,
+        x: on ? "TRADING_MODE=live + CONFIRM_MAINNET · 真实资金" : "缺任一确认即阻断",
+      };
+    }
+
+    // 心跳缺失，或心跳里没有 market 字段（旧后端）→ 回退面板后端判定
+    const runtime = c.runtime || {};
+    if (c.mainnet_execution_enabled === undefined && !c.runtime) {
+      return { known: false, enabled: null, running: false,
+        v: "未运行", x: "运行器未运行，不产生下单" };
+    }
+    const on = c.mainnet_execution_enabled === true
+      || (runtime.mode === "live" && runtime.live_allowed === true);
+    return {
+      known: true, enabled: on, running: true,
+      v: on ? `<span class="up">已启用（双重确认）</span>`
+            : `<span class="warn">已禁用（安全闸门）</span>`,
+      x: c.mainnet_execution_note
+        || (on ? "TRADING_MODE=live + CONFIRM_MAINNET · 真实资金" : "缺任一确认即阻断"),
+    };
+  }
+
   function renderMainnetConfig(cfg) {
     const c = cfg || {};
     const ok = Boolean(c.mainnet_configured);
+    const exec = mainnetExecState(c);
+
     const conn = $("mainnetConnection");
     if (conn) {
-      conn.textContent = ok ? "已保存（执行仍禁用）" : "未配置";
-      conn.className = "mn-big " + (ok ? "ok" : "blocked");
+      conn.textContent = !ok ? "未配置"
+        : exec.enabled ? "已保存 · 执行已启用"
+        : "已保存 · 执行未启用";
+      conn.className = "mn-big " + (ok && exec.enabled ? "ok" : "blocked");
     }
+
+    const tag = $("mainnetExecTag");
+    if (tag) {
+      tag.textContent = !ok ? "真实资金 · 未配置凭据"
+        : exec.enabled ? "真实资金 · 执行已启用"
+        : "真实资金 · 执行未启用";
+      tag.className = "tag " + (ok && exec.enabled ? "up" : "warn");
+    }
+
+    const verifyRow = { k: "只读预检", v: mnVerifyState, x: "GET /fapi/v1/time + /fapi/v2/account" };
+    const execRow = { k: "主网执行", v: exec.v, x: exec.x,
+      cls: exec.enabled ? "" : exec.running ? "is-warn" : "" };
     kvRows($("mnKv"), [
       { k: "已保存 Key", v: esc(c.mainnet_key_masked || "—"), x: "掩码显示" },
       // 地址一律由后端下发，前端不硬编码交易所域名（防止行情腿/下单腿分叉）。
       { k: "目标地址", v: esc(c.mainnet_base_url || "—"), x: "由后端下发" },
-      { k: "只读预检", v: mnVerifyState, x: "GET /fapi/v1/time + /fapi/v2/account" },
-      { k: "主网执行", v: `<span class="down">已禁用</span>`, x: "runtime_mode 硬阻断" },
+      verifyRow,
+      execRow,
     ]);
   }
 
+  let mainnetCfgCache = null;
+
   async function loadMainnetConfig() {
     try {
-      renderMainnetConfig(await api("/api/config"));
+      mainnetCfgCache = await api("/api/config");
+      renderMainnetConfig(mainnetCfgCache);
     } catch (e) { /* 保持原样 */ }
   }
 
@@ -1462,7 +1648,7 @@
 
     if (forgetBtn)
       forgetBtn.addEventListener("click", async () => {
-        if (!window.confirm("确认删除本机保存的主网凭据？测试网凭据与运行器不受影响。")) return;
+        if (!window.confirm("确认删除本机保存的主网凭据？\n仅删除本机 runtime/secrets.json 里的主网 Key；正在运行的运行器不受影响，但重启后将因缺少凭据拒绝启动。")) return;
         forgetBtn.disabled = true;
         try {
           const d = await apiJson("/api/mainnet/forget", {

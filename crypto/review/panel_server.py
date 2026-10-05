@@ -417,6 +417,81 @@ async def _rows_for_symbols(client, method: str, limit: int) -> list:
     return rows
 
 
+def _runner_heartbeat() -> Dict[str, Any]:
+    """读取运行器心跳并给出「主网执行是否真的启用」的判定。
+
+    面板进程自己的 TRADING_MODE 可能与运行器不同（launchd 配置各自独立），
+    所以这里一律以**运行器写下的心跳**为准，而不是面板的进程环境。
+    返回结构固定，读不到文件时也不抛错：
+
+        {"available": bool, "fresh": bool, "age_sec": float|None,
+         "market": str|None, "mode": str|None,
+         "execution_enabled": bool, "note": str}
+
+    新鲜度阈值 90s：运行器轮询间隔 15s，连续 6 轮没写心跳即视为已停止。
+    """
+    out: Dict[str, Any] = {
+        "available": False, "fresh": False, "age_sec": None,
+        "market": None, "mode": None,
+        "execution_enabled": False,
+        "note": "运行器未运行或非主网模式",
+    }
+    path = os.path.join(ROOT, "runtime", "shadow", "runner_heartbeat.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            hb = json.load(fh)
+    except Exception:  # noqa: BLE001  文件缺失 / 半写 / 非 JSON 一律按「无心跳」
+        return out
+    if not isinstance(hb, dict):
+        return out
+
+    out["available"] = True
+    out["market"] = hb.get("market")
+    out["mode"] = hb.get("mode")
+    try:
+        age = (time.time() * 1000.0 - float(hb.get("updated_ms"))) / 1000.0
+    except (TypeError, ValueError):
+        return out
+    out["age_sec"] = age
+    out["fresh"] = 0 <= age < 90
+    if not out["fresh"]:
+        return out
+
+    enabled = (
+        out["market"] == "mainnet"
+        and out["mode"] not in ("observe", "observation_only")
+    )
+    out["execution_enabled"] = bool(enabled)
+    out["note"] = (
+        "运行器心跳确认：主网真实资金下单已启用（双重确认）"
+        if enabled else "运行器未运行或非主网模式"
+    )
+    return out
+
+
+def _testnet_only_gate(client):
+    """`/api/testnet/*` 端点的市场闸门。
+
+    这两个端点名字里带 testnet，但**会真实下单**。面板一旦切到 live，
+    `review.executor.client` 就是主网客户端 —— 必须按客户端实际市场拦截，
+    否则一次误点就是真实资金成交。
+
+    返回 None 表示放行；否则返回 400 响应。
+    """
+    from config.market_endpoints import market_of_url
+
+    market = market_of_url(str(getattr(client, "base_url", "") or ""))
+    if market == "testnet":
+        return None
+    return web.json_response({
+        "ok": False,
+        "error": "testnet_only_endpoint",
+        "detail": (
+            f"该端点仅限测试网；当前客户端市场={market}，已拒绝执行"
+        ),
+    }, status=400)
+
+
 def _with_reading_series(rec: Dict[str, Any]) -> Dict[str, Any]:
     """读数图需要 K/D 序列。快照里没有时，用与运行器相同的测试网 K 线补上。"""
     series = rec.get("series") or {}
@@ -685,6 +760,9 @@ def create_app(
         mn_configured = bool(
             mn_key and secrets.get("binance_mainnet_api_secret")
         )
+        # 「主网执行是否启用」以**运行器心跳**为准：面板进程可能以 paper 模式
+        # 启动（两个 launchd 配置各自独立），面板环境变量不代表真实运行状态。
+        hb = _runner_heartbeat()
         return web.json_response({
             "review_engine": review_loop.ENGINE_NAME,
             "valid_sample_target": VALID_SAMPLE_TARGET,
@@ -694,11 +772,19 @@ def create_app(
             "binance_key_masked": mask_secret(bn_key) if bn_key else "",
             "binance_base_url": secrets.get("binance_testnet_base_url")
                 or "https://testnet.binancefuture.com",
-            # 主网凭据状态：只读验收用。主网执行仍由 runtime_mode 硬阻断。
+            # 主网凭据状态：只读验收用。凭据「已保存」不等于「已启用」——
+            # 是否真的在真实资金下单，由运行器心跳判定（见下）。
             "mainnet_configured": mn_configured,
             "mainnet_key_masked": mask_secret(mn_key) if mn_key else "",
             "mainnet_base_url": MAINNET_USDM_BASE,
-            "mainnet_execution_enabled": False,
+            "mainnet_execution_enabled": hb["execution_enabled"],
+            "mainnet_execution_note": hb["note"],
+            "mainnet_execution_source": {
+                "heartbeat_fresh": hb["fresh"],
+                "age_sec": hb["age_sec"],
+                "market": hb["market"],
+                "mode": hb["mode"],
+            },
             "predict_fun_configured": bool(pf_key),
             "predict_fun_key_masked": mask_secret(pf_key) if pf_key else "",
             "runtime": startup_status(),
@@ -888,6 +974,9 @@ def create_app(
                 {"ok": False, "stage": "preflight", "error": "binance_keys_missing"},
                 status=400,
             )
+        gate = _testnet_only_gate(client)
+        if gate is not None:
+            return gate
         try:
             body = await request.json()
         except Exception:
@@ -979,6 +1068,9 @@ def create_app(
                 {"ok": False, "stage": "preflight", "error": "binance_keys_missing"},
                 status=400,
             )
+        gate = _testnet_only_gate(client)
+        if gate is not None:
+            return gate
         try:
             pos = await client.get_position()
             qty = float(getattr(pos, "quantity", 0) or 0)
@@ -1828,9 +1920,10 @@ def create_app(
             })
 
     async def api_chart(request):
-        """图片显示确认模块：K 线 + KDJ + MACD + B/S 信号（只读，仅测试网）。
+        """图片显示确认模块：K 线 + KDJ + MACD + B/S 信号（只读）。
 
-        行情地址由 config.market_endpoints 从账户地址反推，与运行器同一条序列；
+        行情地址由 config.market_endpoints 从账户地址反推，与运行器同一条序列：
+        随运行模式走主网或测试网，不由本模块指定。
         KDJ/MACD 直接复用 shadow/indicators.py 的同一份函数，不另立口径。
         """
         symbol = (request.query.get("symbol") or "BTCUSDT").upper()

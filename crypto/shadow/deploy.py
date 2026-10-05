@@ -641,6 +641,10 @@ def save_heartbeat(*, status: str, execute: bool, detail: str = "") -> None:
     rec = {
         "status": status,
         "mode": "testnet_orders" if execute else "observation_only",
+        # 真实运行模式与主网确认状态：面板据此判断「执行是否已启用」，
+        # 不再依赖面板自身进程的环境变量（面板可能以 paper 模式启动）。
+        "trading_mode": current_mode().value,
+        "mainnet_confirmed": mainnet_confirmed(),
         "updated_ms": int(time.time() * 1000),
         "detail": detail,
         "market": MARKET,
