@@ -55,6 +55,12 @@ UID_NUM="$(id -u)"
 LAUNCH_DIR="$HOME/Library/LaunchAgents"
 LOG_DIR="$ROOT/runtime/logs"
 mkdir -p "$LAUNCH_DIR" "$LOG_DIR"
+# 2026-10-03：先把本机已存在的手动实例停掉，否则 launchd 托管会和它们并存：
+# 同一标的出现两份运行器会重复下单，面板/前端则会在 8787/8788 上抢端口。
+for pat in "shadow.deploy --execute" "review.panel_server" "http.server 8788"; do
+  pkill -f "$pat" >/dev/null 2>&1 || true
+done
+sleep 2
 
 # 生成 plist。plistlib 会处理包含中文和空格的本机路径，不依赖手写 XML 转义。
 "$PYTHON_BIN" - "$LAUNCH_DIR" "$ROOT" "$PYTHON_BIN" "$LOG_DIR" <<'PY'
@@ -110,13 +116,19 @@ LABELS=(
   "com.crypto.btcusdt.testnet.monitor"
 )
 
+FAILED=()
 for label in "${LABELS[@]}"; do
   plist="$LAUNCH_DIR/$label.plist"
   plutil -lint "$plist" >/dev/null
   # 旧服务可能来自前一次安装；先平稳卸载再加载同名服务。
   launchctl bootout "gui/$UID_NUM/$label" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$UID_NUM" "$plist"
-  launchctl kickstart -k "gui/$UID_NUM/$label"
+  # 服务已加载时 bootstrap 会返回 EIO/EALREADY，不能直接判为失败，以 print 为准。
+  launchctl bootstrap "gui/$UID_NUM" "$plist" >/dev/null 2>&1 || true
+  if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
+    launchctl kickstart -k "gui/$UID_NUM/$label" >/dev/null 2>&1 || true
+  else
+    FAILED+=("$label")
+  fi
 done
 
 sleep 3
@@ -129,6 +141,21 @@ for label in "${LABELS[@]}"; do
     echo "未确认（查看 $LOG_DIR/$label.err.log）"
   fi
 done
+
+if (( ${#FAILED[@]} )); then
+  echo "" >&2
+  echo "有服务未能加载，已自动回退为手动运行，避免系统停机。" >&2
+  cd "$ROOT"
+  PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -m scripts.restart_testnet_runner \
+    >/dev/null 2>&1 || true
+  nohup "$PYTHON_BIN" -m review.panel_server \
+    >> "$LOG_DIR/panel.out" 2>&1 &
+  nohup "$PYTHON_BIN" -m http.server 8788 --bind 127.0.0.1 \
+    --directory "$ROOT/frontend" >> "$LOG_DIR/frontend.out" 2>&1 &
+  echo "  已启动手动 交易器 / 面板 / 前端。" >&2
+  echo "  未加载的服务：${FAILED[*]}" >&2
+  exit 1
+fi
 
 cat <<MSG
 

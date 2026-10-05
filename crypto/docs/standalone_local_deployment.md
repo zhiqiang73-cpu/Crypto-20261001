@@ -14,7 +14,7 @@
 ## 启动
 
 ```bash
-cd "/Users/zengyun/Downloads/我的AI/crypto"
+cd "/Users/zengyun/我的AI/crypto"
 python3 -m pip install -r requirements.txt
 TRADING_MODE=paper sh scripts/run_local_console.sh
 ```

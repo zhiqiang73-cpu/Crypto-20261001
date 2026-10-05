@@ -76,7 +76,41 @@ class TestSignalReadingSnapshot(unittest.TestCase):
         self.assertEqual(out["detail"], "unit test")
         self.assertEqual(out["symbol"], "BTCUSDT")
         self.assertEqual(out["symbols"], ["BTCUSDT", "ETHUSDT"])
-        self.assertEqual(out["strategies"], ["kdj15", "kdj5", "eth15", "eth5"])
+        # 2026-10-03 停用 5m 后心跳只报两条 15m。
+        self.assertEqual(out["strategies"], ["kdj15", "eth15"])
+
+
+class _FakeChaseResult:
+    def __init__(self, *, ok, error="", maker=False, avg_price=0.0, steps=0,
+                 passive=0):
+        self.ok = ok
+        self.error = error
+        self.avg_price = avg_price
+        self.raw = {"chase": {"attempts": [], "steps_used": steps,
+                              "final_step": steps - 1,
+                              "passive_attempts": passive,
+                              "likely_maker": maker}}
+
+
+class TestChaseNote(unittest.TestCase):
+    def test_failed_chase_note_keeps_the_real_reason(self):
+        # 2026-10-03: 追价备注曾挡住真实错误 —— 净仓日志显示「taker 被动0次」
+        # 而实际是 -2019 保证金不足。失败原因必须出现在同一行。
+        r = _FakeChaseResult(
+            ok=False, steps=3, passive=3,
+            error="passive_exhausted: 被动 3 次 + IOC限价兜底未确认成交; "
+                  "Order would immediately match and take: -2019 Margin is insufficient.",
+        )
+        note = deploy._chase_note(r)
+        self.assertIn("被动3次", note)
+        self.assertIn("-2019", note)
+
+    def test_ok_chase_note_has_no_error_noise(self):
+        # 与真实健康日志同形: maker 被动1次 成交价=84626.00 总单数=15
+        r = _FakeChaseResult(ok=True, maker=True, avg_price=84626.0, steps=15,
+                             passive=1)
+        self.assertEqual(deploy._chase_note(r),
+                         "maker 被动1次 成交价=84626.00 总单数=15")
 
 
 if __name__ == "__main__":

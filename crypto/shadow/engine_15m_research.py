@@ -1,4 +1,7 @@
-"""影子回测引擎：与测试网执行器共用已收盘 KDJ 交叉信号。
+"""仅供离线 15m 验证的影子引擎副本；绝不可导入线上运行器。
+
+复制自冻结的 shadow/engine.py。原引擎与线上文件均保持原样；新增可选
+预热、费用/滑点、期末强制结算及逐根权益诊断，默认参数保留历史回放口径。
 
 规格要点 (全部硬编码为常量, 不对外暴露为可调项):
     信号周期由 IntervalSpec 指定（15m / 5m），风险参数周期恒为 1H；只用已收盘 K 线。
@@ -148,6 +151,13 @@ class ShadowConfig:
     # 批量标定无需逐根输出时可关闭，避免为每个参数组合保留数十万条日志。
     # 默认 True，既有报告和 run_shadow 行为不变。
     record_bars: bool = True
+    # 以下参数只存在于隔离研究副本；生产策略与原 engine.py 不读取它们。
+    trade_start_ms: Optional[int] = None
+    fee_per_side: float = FEE_PER_SIDE
+    slippage_bps: float = 0.0
+    gap_aware_stop: bool = False
+    close_at_end: bool = False
+    record_equity: bool = False
 
 
 @dataclass
@@ -226,6 +236,8 @@ class ShadowResult:
     trades_b: List[Trade] = field(default_factory=list)
     skips: List[dict] = field(default_factory=list)
     halts: List[dict] = field(default_factory=list)
+    equity_curve_a: List[tuple] = field(default_factory=list)
+    equity_curve_b: List[tuple] = field(default_factory=list)
     final_equity_a: float = 0.0
     final_equity_b: float = 0.0
     peak_a: float = 0.0
@@ -308,7 +320,13 @@ def run_shadow_spec(bars: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
         raise ValueError("fixed_risk_equity 必须是正的有限数")
     if not math.isfinite(cfg.position_scale) or cfg.position_scale <= 0:
         raise ValueError("position_scale 必须是正的有限数")
+    if not math.isfinite(cfg.fee_per_side) or not 0 <= cfg.fee_per_side <= 0.01:
+        raise ValueError("fee_per_side 超出离线研究范围")
+    if not math.isfinite(cfg.slippage_bps) or not 0 <= cfg.slippage_bps <= 500:
+        raise ValueError("slippage_bps 超出离线研究范围")
     n = len(bars["close"])
+    if n < 2:
+        raise ValueError("至少需要两根已收盘 K 线")
     o, h, l, c, v = (bars[x] for x in ("open", "high", "low", "close", "volume"))
     ts = bars["ts"]
 
@@ -344,11 +362,16 @@ def run_shadow_spec(bars: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
     peak_b = cfg.equity0
     day_key_b = None
     day_start_eq_b = cfg.equity0
+    halted_b = False
 
     def close_pos(pos: OpenPosition, ms: int, px: float, reason: str,
-                  mode: str) -> float:
+                  mode: str, stop_open: Optional[float] = None) -> float:
+        if stop_open is not None and cfg.gap_aware_stop:
+            px = min(px, stop_open) if pos.side == 1 else max(px, stop_open)
+        # 多仓退出卖得更低，空仓退出买得更高。
+        px *= 1.0 - pos.side * cfg.slippage_bps / 10_000.0
         gross = (px - pos.entry_px) * pos.qty * pos.side
-        exit_fee = px * pos.qty * FEE_PER_SIDE
+        exit_fee = px * pos.qty * cfg.fee_per_side
         net = gross - pos.fee - exit_fee
         t = Trade(
             mode=mode, side=pos.side, entry_ms=pos.entry_ms, entry_px=pos.entry_px,
@@ -374,7 +397,8 @@ def run_shadow_spec(bars: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
         if pos_a is not None:
             hit = _stop_hit(pos_a, float(h[i]), float(l[i]), spec)
             if hit is not None:
-                equity_a += close_pos(pos_a, ts[i], hit[0], hit[1], "A")
+                equity_a += close_pos(pos_a, ts[i], hit[0], hit[1], "A",
+                                      stop_open=float(o[i]))
                 pos_a = None
                 peak_a = max(peak_a, equity_a)
                 stopped_a_this_bar = True
@@ -383,7 +407,8 @@ def run_shadow_spec(bars: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
         if pos_b is not None:
             hit = _stop_hit(pos_b, float(h[i]), float(l[i]), spec)
             if hit is not None:
-                equity_b += close_pos(pos_b, ts[i], hit[0], hit[1], "B")
+                equity_b += close_pos(pos_b, ts[i], hit[0], hit[1], "B",
+                                      stop_open=float(o[i]))
                 pos_b = None
                 peak_b = max(peak_b, equity_b)
                 stopped_b_this_bar = True
@@ -397,6 +422,10 @@ def run_shadow_spec(bars: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
                             if pos_b else 0.0)
         peak_a = max(peak_a, mtm_a)
         peak_b = max(peak_b, mtm_b)
+        if cfg.record_equity and (cfg.trade_start_ms is None or
+                                  int(ts[i]) + spec.interval_ms >= cfg.trade_start_ms):
+            res.equity_curve_a.append((int(ts[i]) + spec.interval_ms, mtm_a))
+            res.equity_curve_b.append((int(ts[i]) + spec.interval_ms, mtm_b))
 
         # ---------- 3. 风控闸门 ----------
         if day_key_a != day:
@@ -415,9 +444,13 @@ def run_shadow_spec(bars: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
 
         daily_loss_b = (day_start_eq_b - mtm_b) / day_start_eq_b if day_start_eq_b else 0.0
         dd_b = (peak_b - mtm_b) / peak_b if peak_b else 0.0
+        if (not cfg.research_ignore_risk_gates and spec.halt_on_drawdown
+                and dd_b >= MAX_DRAWDOWN and not halted_b):
+            halted_b = True
+            res.halts.append({"ts": int(ts[i]), "reason": "B 累计回撤 ≥ 10%",
+                              "drawdown": dd_b, "equity": mtm_b, "mode": "B"})
         block_new_b = (False if cfg.research_ignore_risk_gates else
-                       ((spec.halt_on_drawdown and dd_b >= MAX_DRAWDOWN)
-                        or daily_loss_b >= DAILY_LOSS_LIMIT))
+                       halted_b or daily_loss_b >= DAILY_LOSS_LIMIT)
 
         # ---------- 4. 信号判定 (t 收盘) ----------
         if spec.entry_mode == "k_threshold":
@@ -428,7 +461,9 @@ def run_shadow_spec(bars: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
                 k_long_max=spec.k_long_max, k_short_min=spec.k_short_min,
             )
         else:
-            gold, dead = crossing(k[i - 1], d[i - 1], k[i], d[i])
+            # 第一根没有历史 K/D；Python 的 [-1] 会偷看整个窗口的最后一根。
+            gold, dead = (crossing(k[i - 1], d[i - 1], k[i], d[i])
+                          if i > 0 else (False, False))
             gate_on = (MACD_GATE_ENABLED if spec.macd_gate_enabled is None
                        else bool(spec.macd_gate_enabled))
             sig_long, sig_short, _macd_note = macd_gate(
@@ -459,6 +494,9 @@ def run_shadow_spec(bars: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
         # ---------- 5. 执行 (t+1 开盘) ----------
         px_next = float(o[i + 1])
         ms_next = int(ts[i + 1])
+        if cfg.trade_start_ms is not None and ms_next < cfg.trade_start_ms:
+            # 允许 KDJ/MACD/ATR 预热，不允许预热段交易污染窗口权益。
+            continue
 
         # --- 模式 A ---
         if pos_a is None:
@@ -483,10 +521,11 @@ def run_shadow_spec(bars: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
                                                     f"名义={qty*px_next:.2f})",
                                           "multiple": mult})
                     else:
-                        fee = px_next * qty * FEE_PER_SIDE
+                        entry_fill = px_next * (1.0 + want * cfg.slippage_bps / 10_000.0)
+                        fee = entry_fill * qty * cfg.fee_per_side
                         equity_a -= fee
                         pos_a = OpenPosition(
-                            side=want, entry_ms=ms_next, entry_px=px_next, qty=qty,
+                            side=want, entry_ms=ms_next, entry_px=entry_fill, qty=qty,
                             fee=fee, k_at_entry=float(k[i]), d_at_entry=float(d[i]),
                             atr_at_entry=float(atr1h_aligned[i]),
                             bandwidth_at_entry=float(bandwidth) if not np.isnan(bandwidth) else 0.0,
@@ -502,10 +541,11 @@ def run_shadow_spec(bars: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
                 if not block_new_a and r_eff is not None and not np.isnan(atr1h_aligned[i]):
                     qty = sized_qty(mtm_a, r_eff, atr1h_aligned[i])
                     if qty >= MIN_QTY and qty * px_next >= MIN_NOTIONAL:
-                        fee = px_next * qty * FEE_PER_SIDE
+                        entry_fill = px_next * (1.0 + want * cfg.slippage_bps / 10_000.0)
+                        fee = entry_fill * qty * cfg.fee_per_side
                         equity_a -= fee
                         pos_a = OpenPosition(
-                            side=want, entry_ms=ms_next, entry_px=px_next, qty=qty,
+                            side=want, entry_ms=ms_next, entry_px=entry_fill, qty=qty,
                             fee=fee, k_at_entry=float(k[i]), d_at_entry=float(d[i]),
                             atr_at_entry=float(atr1h_aligned[i]),
                             bandwidth_at_entry=float(bandwidth) if not np.isnan(bandwidth) else 0.0,
@@ -520,10 +560,11 @@ def run_shadow_spec(bars: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
                     and not np.isnan(atr1h_aligned[i]):
                 qty = sized_qty(mtm_b, r_eff, atr1h_aligned[i])
                 if qty >= MIN_QTY and qty * px_next >= MIN_NOTIONAL:
-                    fee = px_next * qty * FEE_PER_SIDE
+                    entry_fill = px_next * (1.0 + want * cfg.slippage_bps / 10_000.0)
+                    fee = entry_fill * qty * cfg.fee_per_side
                     equity_b -= fee
                     pos_b = OpenPosition(
-                        side=want, entry_ms=ms_next, entry_px=px_next, qty=qty,
+                        side=want, entry_ms=ms_next, entry_px=entry_fill, qty=qty,
                         fee=fee, k_at_entry=float(k[i]), d_at_entry=float(d[i]),
                         atr_at_entry=float(atr1h_aligned[i]),
                         bandwidth_at_entry=float(bandwidth) if not np.isnan(bandwidth) else 0.0,
@@ -551,6 +592,20 @@ def run_shadow_spec(bars: Dict[str, np.ndarray], bars1h: Dict[str, np.ndarray],
                 pos_qty=pos_a.qty if pos_a else 0.0,
             ))
 
+    if cfg.close_at_end:
+        terminal_ms = int(ts[-1]) + spec.interval_ms
+        terminal_px = float(c[-1])
+        if pos_a is not None:
+            equity_a += close_pos(pos_a, terminal_ms, terminal_px,
+                                  "窗口末强制结算", "A")
+        if pos_b is not None:
+            equity_b += close_pos(pos_b, terminal_ms, terminal_px,
+                                  "窗口末强制结算", "B")
+        if cfg.record_equity:
+            res.equity_curve_a.append((terminal_ms, equity_a))
+            res.equity_curve_b.append((terminal_ms, equity_b))
+        peak_a = max(peak_a, equity_a)
+        peak_b = max(peak_b, equity_b)
     res.final_equity_a = equity_a
     res.final_equity_b = equity_b
     res.peak_a = peak_a

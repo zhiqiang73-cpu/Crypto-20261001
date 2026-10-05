@@ -1,9 +1,9 @@
 """KDJ 交叉策略的币安合约测试网运行器。
 
 BTCUSDT 与 ETHUSDT 各跑两条策略，按标的各记虚拟仓、只下该标的净额：
-    15m: 当根收盘交叉且 MACD 能量柱方向一致（金叉+红柱做多 / 死叉+绿柱做空），
+    15m: 当根收盘交叉且 MACD 能量柱方向一致（金叉+绿柱做多 / 死叉+红柱做空），
          下一根开盘下限价单，无 K 阈值；背离的交叉丢弃，不平仓也不反手
-    5m:  金叉且 K<30 做多 / 死叉且 K>70 做空，当根收盘即可
+    5m:  金叉且 MACD 能量柱为正做多 / 死叉且能量柱为负做空，当根收盘即可
     5m 仓位：与同标的 15m 同向满仓，对着干则减半
     仓位 = 权益 × r ÷ (2 × ATR_1H), r=RISK_R, 向下取整 0.001
     开仓/平仓一律限价: post-only 贴盘口挂单争取 maker, 窗口耗尽才穿盘口兜底
@@ -119,8 +119,13 @@ def _chase_note(r) -> str:
     if not meta:
         return ""
     tag = "maker" if meta.get("likely_maker") else "taker"
-    return (f"{tag} 被动{meta.get('passive_attempts', 0)}次 "
+    note = (f"{tag} 被动{meta.get('passive_attempts', 0)}次 "
             f"成交价={r.avg_price:.2f} 总单数={meta.get('steps_used', 0)}")
+    # 失败时附上真实原因；2026-10-03 备注曾把「保证金不足 -2019」挡在外面。
+    err = getattr(r, "error", "") or ""
+    if not getattr(r, "ok", True) and err and err not in note:
+        note = f"{note}; {err}"
+    return note
 
 
 def log_row(row: list) -> None:

@@ -1,15 +1,15 @@
-"""2026-10-02 用户新规则：15m = KDJ 交叉 + MACD 能量柱方向闸门。
+"""2026-10-02/03 用户规则：KDJ 交叉 + MACD 能量柱方向闸门。
 
 规则原文（用户口头确认）：
     MACD 方向按红绿柱（能量柱）的正负为准；做双向；
-    背离类信号直接丢弃不操作；周期固定 15m；
-    只改 BTCUSDT 与 ETHUSDT 两条 15m 策略，5m 两条不动。
+    背离类信号直接丢弃不操作。
+    2026-10-02：15m 两条先切换；2026-10-03：5m 两条改为与 15m 完全相同。
 
 本文件守住四件事：
     1. MACD(12,26,9) 的计算口径与 TradingView / 币安一致；
     2. 闸门判定矩阵（同向放行 / 背离丢弃 / 柱为 0 丢弃）；
     3. 回测引擎产出的每一个信号都真的与能量柱同向；
-    4. 两条 15m 规格与策略卡都已切到新规则，5m 两条没被误改。
+    4. 四条规格与四张策略卡都已切到新规则，不再有任何 K 极值过滤。
 """
 from __future__ import annotations
 
@@ -168,47 +168,45 @@ class TestEngineRespectsGate(unittest.TestCase):
 
 
 class TestSpecsAndCards(unittest.TestCase):
-    def test_only_15m_specs_use_the_gate(self):
-        self.assertTrue(SPEC_15M.require_macd)
-        self.assertTrue(SPEC_ETH_15M.require_macd)
-        self.assertFalse(SPEC_5M.require_macd)
-        self.assertFalse(SPEC_ETH_5M.require_macd)
+    def test_all_four_specs_use_the_gate(self):
+        for spec in (SPEC_15M, SPEC_5M, SPEC_ETH_15M, SPEC_ETH_5M):
+            self.assertTrue(spec.require_macd, spec.id)
 
-    def test_15m_specs_are_both_directional_and_15m(self):
-        for spec in (SPEC_15M, SPEC_ETH_15M):
-            self.assertEqual(spec.interval, "15m")
-            self.assertIsNone(spec.k_long_max)
-            self.assertIsNone(spec.k_short_min)
-            self.assertIn("MACD", spec.signal_rule)
-            self.assertIn("背离", spec.signal_rule)
+    def test_all_specs_directional_without_k_thresholds(self):
+        for spec in (SPEC_15M, SPEC_5M, SPEC_ETH_15M, SPEC_ETH_5M):
+            self.assertIn(spec.interval, ("15m", "5m"), spec.id)
+            self.assertIsNone(spec.k_long_max, spec.id)
+            self.assertIsNone(spec.k_short_min, spec.id)
+            self.assertIn("MACD", spec.signal_rule, spec.id)
+            self.assertIn("背离", spec.signal_rule, spec.id)
 
-    def test_5m_specs_keep_k_thresholds(self):
-        for spec in (SPEC_5M, SPEC_ETH_5M):
-            self.assertEqual(spec.k_long_max, 30.0)
-            self.assertEqual(spec.k_short_min, 70.0)
-            self.assertIn("K<30", spec.signal_rule)
-
-    def test_both_15m_cards_describe_the_gate(self):
-        for name in ("deployed_kdj_extreme_v1.json",
-                     "deployed_kdj_eth_extreme_v1.json"):
+    def test_all_cards_describe_the_gate(self):
+        for name, timeframe in (
+                ("deployed_kdj_extreme_v1.json", "15m"),
+                ("deployed_kdj_eth_extreme_v1.json", "15m"),
+                ("deployed_kdj_5m_extreme_v1.json", "5m"),
+                ("deployed_kdj_eth_5m_extreme_v1.json", "5m")):
             cfg = json.loads((ROOT / "config/strategies" / name)
                              .read_text(encoding="utf-8"))
-            self.assertEqual(cfg["timeframe"], "15m")
-            self.assertEqual(cfg["side"], "both")
-            self.assertIn("MACD", cfg["indicators"])
-            self.assertIn("12,26,9", cfg["indicators"]["MACD"])
-            self.assertIn("背离", cfg["entry"]["divergence"])
-            self.assertIn("MACD", cfg["entry"]["long"])
-            self.assertIn("MACD", cfg["entry"]["short"])
+            self.assertEqual(cfg["timeframe"], timeframe, name)
+            self.assertEqual(cfg["side"], "both", name)
+            self.assertIn("MACD", cfg["indicators"], name)
+            self.assertIn("12,26,9", cfg["indicators"]["MACD"], name)
+            self.assertIn("背离", cfg["entry"]["divergence"], name)
+            self.assertIn("MACD", cfg["entry"]["long"], name)
+            self.assertIn("正（绿柱）", cfg["entry"]["long"], name)
+            self.assertIn("MACD", cfg["entry"]["short"], name)
+            self.assertIn("负（红柱）", cfg["entry"]["short"], name)
+            self.assertIn("金叉遇红柱 / 死叉遇绿柱", cfg["entry"]["divergence"], name)
 
-    def test_5m_cards_untouched(self):
+    def test_5m_cards_have_no_k_threshold_text(self):
         for name, key in (("deployed_kdj_5m_extreme_v1.json", "kdj5"),
                           ("deployed_kdj_eth_5m_extreme_v1.json", "eth5")):
             cfg = json.loads((ROOT / "config/strategies" / name)
                              .read_text(encoding="utf-8"))
             self.assertEqual(cfg["runtime_key"], key)
-            self.assertIn("K<30", cfg["entry"]["long"])
-            self.assertIn("K>70", cfg["entry"]["short"])
+            self.assertNotIn("K<30", cfg["entry"]["long"])
+            self.assertNotIn("K>70", cfg["entry"]["short"])
 
 
 if __name__ == "__main__":

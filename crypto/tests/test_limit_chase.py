@@ -329,6 +329,12 @@ class TestTimeoutFallback(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertIn("passive_exhausted", res.error)
         self.assertEqual(res.cum_filled_qty, 0.0)
+        # 2026-10-03: 失败路径也必须写全 chase meta 键, 否则日志把
+        # 「被动N次」读成「被动0次」, 真实失败原因 (如保证金不足) 无从判断。
+        meta = res.raw["chase"]
+        for key in ("attempts", "steps_used", "final_step", "likely_maker",
+                    "passive_attempts"):
+            self.assertIn(key, meta)
 
     def test_fallback_cannot_leave_a_resting_gtc_order(self):
         c = _PassiveStub(fill_crossing=False)
