@@ -673,7 +673,13 @@ class BinanceTestnetClient:
             text = str(exc)
             is_reject = any(
                 code in text
-                for code in ("-2015", "-1111", "-1102", "-4014", "-2021", "Invalid")
+                for code in ("-2015", "-1111", "-1102", "-4014", "-2021",
+                             # -4130: 已有同向 closePosition 保护单 —— 交易所
+                             # **明确拒绝**了新单，必须归为 REJECTED。2026-10-05
+                             # 实测它被降级成 UNKNOWN，导致「先立后破」的收紧
+                             # 永远确认不了、两个标的被永久禁止开仓。
+                             "-4130",
+                             "Invalid")
             )
             return ManagedOrder(
                 client_order_id=cid,

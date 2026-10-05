@@ -195,8 +195,10 @@ class TestTypeDisambiguation(unittest.TestCase):
         挂单带上它，任何「是否已覆盖全仓」的判定都会直接返回 True。币安不
         允许普通单带这个字段，所以归一化时显式写成 "false"，不留歧义。
 
-        注：covers_full_position 目前在生产代码里**没有调用点**（只有测试在
-        用），所以这里守的是「归一化不留危险快捷通道」，而不是某条现存路径。
+        注：covers_full_position **已有生产调用点** ——
+        `manage_exchange_stop` 用它判断显式数量的止损是否覆盖当前净仓
+        （数量不足即重挂）。所以这里守的既是「归一化不留危险快捷通道」，
+        也是一条真实生效的安全路径。
         """
         tp = normalize_regular_order(
             {"orderId": "77", "type": "LIMIT", "side": "SELL",
@@ -251,8 +253,19 @@ class TestTpDoesNotBlockStop(unittest.TestCase):
         stop = list(ex.algo.values())[0]
         self.assertEqual(stop["orderType"], "STOP_MARKET",
                          "止损必须保持市价：确定性比 2bp 值钱")
-        self.assertEqual(stop["closePosition"], "true",
-                         "止损应覆盖全仓，加层后自动跟随")
+        # 2026-10-05 改：止损必须用**显式数量**，不能再用 closePosition。
+        #
+        # closePosition=true 的条件单每标的每方向只允许一张，旧单还在时
+        # 新单被交易所 **-4130** 明确拒绝 —— 「先立后破」的收紧根本走不通。
+        # 实测后果：两个标的永久禁止开新仓、日志刷屏 1224 条。
+        #
+        # 原先由 closePosition 提供的「加层后自动跟随」改由
+        # manage_exchange_stop 的**覆盖度检查**承担：数量不足即重挂。
+        # 代价是最多一个 tick（约 15 秒）的覆盖缺口，远小于永久卡死。
+        self.assertEqual(stop["closePosition"], "false",
+                         "止损必须用显式数量，否则先立后破被 -4130 拒")
+        self.assertAlmostEqual(float(stop["quantity"]), 0.296, places=4,
+                               msg="止损数量必须等于当前净仓，否则仓位裸奔")
 
     def test_merged_view_sees_both_legs(self):
         """统一视图必须同时看到止损与限价止盈 —— 只看一边必然漏。"""

@@ -628,9 +628,13 @@ async def place_protective_stop(
         out.client_algo_id = out.client_algo_id or algo_client_ident(found)
         out.error = ""
         return out
-    # 下单可能已被接受，只是查询这一下没看到 —— 保持 UNKNOWN，绝不谎报已保护
+    # 下单可能已被接受，只是查询这一下没看到 —— 保持 UNKNOWN，绝不谎报已保护。
+    # ⚠ 但**交易所返回的原始错误必须带出来**：2026-10-05 实测，下单被 -4130
+    # 明确拒绝时，这里只留下「查不到」的通用文案，真实原因整个丢掉 ——
+    # 日志里 -4130 出现 0 次，诊断方向被误导了一整天。
+    mo_error = str(getattr(mo, "error", "") or "")
     out.state = ProtectionState.UNKNOWN
-    out.error = why
+    out.error = (f"{why}；交易所返回: {mo_error}" if mo_error else why)
     return out
 
 

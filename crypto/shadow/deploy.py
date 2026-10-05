@@ -52,6 +52,7 @@ from trading.protective_orders import (ProtectionState,
                                        algo_alive, algo_ident, algo_side,
                                        algo_trigger,
                                        cancel_algo_by_id,
+                                       covers_full_position,
                                        find_take_profit,
                                        is_take_profit_type,
                                        place_take_profit,
@@ -899,6 +900,15 @@ async def sync_net(client: BinanceTestnetClient, st: dict, execute: bool, *,
                 mark = 0.0
             if mark > 0:
                 need = abs(delta) * mark / float(LEVERAGE)
+                # 反手时 delta = 平旧仓 + 开新仓，但**旧仓的保证金在平仓成交后
+                # 就会释放**。2026-10-05 实测：BTC 反手（平 0.1710 空、开
+                # 0.1700 多，净增只有 0.1700）被算成「需 2908.71」，而可用只有
+                # 2482.26 —— 系统用自己的旧仓把自己挡住了，反手永远做不成。
+                # 正确口径是**净增名义**：减掉即将释放的那部分。
+                cur_side = "LONG" if ex > 0 else ("SHORT" if ex < 0 else "")
+                if cur_side and side.upper() != cur_side:
+                    released = abs(ex) * mark / float(LEVERAGE)
+                    need = max(0.0, need - released)
                 if need > float(available_balance):
                     msg = (f"保证金不足，跳过开仓：需 {need:.2f} > 可用 "
                            f"{float(available_balance):.2f}"
@@ -1259,6 +1269,16 @@ async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
     dead = 0.25 * float(atr_1h)
     existing = find_protective_stop(
         orders, side=side, required_trigger=max(target - side * dead, 0.0))
+    # 显式数量的止损**不会自动跟随仓位**（closePosition 才会）。加仓后数量
+    # 不足 = 仓位没被完全保护，必须重挂；分批止盈后数量偏大是安全的
+    # （reduceOnly 触发时按实际仓位平），不触发重挂。
+    if (existing is not None
+            and not covers_full_position(existing, quantity=abs(ex_side))):
+        print(f"[{symbol} 保护单补量] 现有止损数量 "
+              f"{float(existing.get('quantity') or 0):.4f} < 仓位 "
+              f"{abs(ex_side):.4f}，重挂以覆盖全仓")
+        prev_id = algo_ident(existing)
+        existing = None
     if existing is not None:
         aid = algo_ident(existing)
         trig = algo_trigger(existing)
@@ -1285,13 +1305,18 @@ async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
     if prev_id:
         res = await tighten_protective_stop(
             client, symbol=symbol, side=side, new_trigger=target,
-            old_algo_id=prev_id, quantity=abs(ex_side), close_position=True,
+            old_algo_id=prev_id, quantity=abs(ex_side),
+            # ⚠ 必须 False：closePosition=true 的条件单每标的每方向只允许
+            # 一张，旧单还在时新单会被交易所 -4130 明确拒绝，「先立后破」
+            # 在 closePosition 上根本不可行（2026-10-05 实测证实）。
+            # 显式数量 + reduceOnly 可与旧单并存，先立后破才成立。
+            close_position=False,
             client_algo_id=pending_cid or None)
         verb = "收紧"
     else:
         res = await place_protective_stop(
             client, symbol=symbol, side=side, trigger_price=target,
-            quantity=abs(ex_side), close_position=True,
+            quantity=abs(ex_side), close_position=False,
             client_algo_id=pending_cid or None)
         verb = "建立"
 
@@ -1308,6 +1333,7 @@ async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
         rec = st.setdefault("protection", {}).setdefault(symbol, {})
         rec.pop("pending_client_algo_id", None)
         rec.pop("pending_trigger", None)
+        rec.pop("unconfirmed_streak", None)
         detail = (f"{symbol} {verb}交易所保护单：{('多' if side > 0 else '空')} "
                   f"触发价 {res.trigger_price:.2f}（{abs(ex_side):.4f}）"
                   f"{'，已由交易所接管止损' if not res.error else ''}")
@@ -1322,17 +1348,29 @@ async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
     # 未确认：按未保护处理，并禁止开新仓
     set_protection_state(st, symbol, state=res.state.value,
                          note=f"{verb}未确认: {res.error}")
-    notify("CRITICAL", f"protection_unconfirmed_{symbol}",
-           f"{symbol} 保护单{verb}未确认，该标的已禁止开新仓",
-           f"仓位仍由软件止损兜底；原因: {res.error}")
+    # 连续失败计数：状态本身保持 UNKNOWN（fail-safe 不变），但**日志与告警
+    # 必须退避**。2026-10-05 实测：同一个失败每 tick 重打一次，刷了 1224 条、
+    # 占满最后 200 行日志的 100%，把真实业务事件全淹没了。
+    rec0 = st.setdefault("protection", {}).setdefault(symbol, {})
+    streak = int(rec0.get("unconfirmed_streak") or 0) + 1
+    rec0["unconfirmed_streak"] = streak
+    # 第 1 次必报（状态变化点），之后每 20 次（约 10 分钟）报一次
+    should_report = (streak == 1 or streak % 20 == 0)
+    if should_report:
+        notify("CRITICAL", f"protection_unconfirmed_{symbol}",
+               f"{symbol} 保护单{verb}未确认，该标的已禁止开新仓",
+               f"仓位仍由软件止损兜底；原因: {res.error}"
+               + (f"（连续第 {streak} 次）" if streak > 1 else ""))
     # UNKNOWN 不是失败：请求可能已落地但确认查询遇到 429/网络问题。
     # 持久化同一 clientAlgoId，下一轮按 ID 回查/重试，禁止重复下单。
     rec = st.setdefault("protection", {}).setdefault(symbol, {})
     if res.client_algo_id:
         rec["pending_client_algo_id"] = res.client_algo_id
         rec["pending_trigger"] = float(target)
-    print(f"[{symbol} ⚠️ 保护单{verb}未确认] {res.error}；"
-          f"该标的暂停开新仓，软件止损继续兜底")
+    if should_report:
+        print(f"[{symbol} ⚠️ 保护单{verb}未确认] {res.error}；"
+              f"该标的暂停开新仓，软件止损继续兜底"
+              + (f"（连续第 {streak} 次）" if streak > 1 else ""))
     return {"action": f"保护单{verb}未确认", "note": res.error,
             "state": res.state.value}
 
