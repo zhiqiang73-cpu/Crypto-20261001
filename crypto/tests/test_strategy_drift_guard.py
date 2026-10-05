@@ -17,9 +17,13 @@ class TestStrategyDriftGuard(unittest.TestCase):
     def test_only_btc_eth_15m_are_runtime_active(self):
         runtime = self.report["checks"]["runtime"]
         self.assertEqual(runtime["runtime_specs"], ["kdj15", "eth15"])
+        self.assertTrue(runtime["five_minute_not_in_runtime_specs"])
+        # 运行事实（心跳/状态账本）只在运行器真正跑过之后才存在；
+        # 未运行过的环境（如全新克隆）跳过，启动后自动恢复校验。
+        if not runtime["heartbeat_strategies"] and not runtime["state_strategy_books"]:
+            self.skipTest("运行器尚未运行过（无心跳/状态文件），运行事实待启动后审计")
         self.assertEqual(runtime["heartbeat_strategies"], ["kdj15", "eth15"])
         self.assertEqual(runtime["state_strategy_books"], ["eth15", "kdj15"])
-        self.assertTrue(runtime["five_minute_not_in_runtime_specs"])
 
     def test_five_minute_cards_remain_research_only(self):
         runtime = self.report["checks"]["runtime"]
@@ -45,8 +49,15 @@ class TestStrategyDriftGuard(unittest.TestCase):
         self.assertTrue(risk["cards_uniform_leverage"])
         self.assertEqual(risk["risk_r"], 0.01)
         self.assertEqual(risk["leverage"], 10)
-        self.assertTrue(market["heartbeat_is_testnet"])
-        self.assertTrue(market["state_is_testnet"])
+        # 2026-10-05 起系统同时支持测试网与主网（主网需双重确认），
+        # 市场事实不再写死 testnet，而是校验：心跳 == 状态 == 已知市场。
+        hb_market = market["heartbeat_market"]
+        st_market = market["state_market"]
+        if not hb_market and not st_market:
+            self.skipTest("运行器尚未运行过（无心跳/状态文件），市场事实待启动后审计")
+        self.assertIn(hb_market, ("testnet", "mainnet"))
+        self.assertIn(st_market, ("testnet", "mainnet"))
+        self.assertEqual(hb_market, st_market)
         self.assertTrue(market["symbols_are_btc_eth"])
 
     def test_contract_has_schema_and_implementation_fingerprint(self):

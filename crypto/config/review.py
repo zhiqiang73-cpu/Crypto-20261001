@@ -166,6 +166,8 @@ META_STATE_PATH = PROJECT_ROOT / "runtime" / "review" / "meta_state.json"
 # 八、模拟盘交易
 # ---------------------------------------------------------------------------
 BINANCE_TESTNET_DEFAULT_BASE = "https://testnet.binancefuture.com"
+# 主网 USDⓈ-M 默认地址 —— 仅当 TRADING_MODE=live 且双重确认齐备时才会被采用
+BINANCE_MAINNET_DEFAULT_BASE = "https://fapi.binance.com"
 TRADING_SYMBOL = "BTCUSDT"
 LEVERAGE_SHORT_TERM = 2
 LEVERAGE_LONG_TERM = 3  # V8: 从 5x 降到 3x, 敞口上限由风险预算约束

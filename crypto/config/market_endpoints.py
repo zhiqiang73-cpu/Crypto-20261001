@@ -117,13 +117,27 @@ def sentiment_rest() -> str:
 
 
 def _configured_account_base_url() -> Optional[str]:
-    """读取账户（下单）地址。
+    """读取账户（下单）地址。按运行模式取对应市场的来源:
+
+      * live → 主网: BINANCE_MAINNET_BASE_URL / secrets binance_mainnet_base_url,
+        都没有时用主网默认地址（主网执行仍由 runtime_mode 双重确认把关）;
+      * 其余 → 测试网: BINANCE_TESTNET_BASE_URL / secrets binance_testnet_base_url,
+        都没有时用测试网默认地址。
 
     刻意不 import `config.secrets` / `config.review`, 以避免循环依赖,
     并保证在最小环境下也能解析。优先级与 `config.secrets` 一致:
     环境变量 > runtime/secrets.json。
     """
-    env = (os.environ.get("BINANCE_TESTNET_BASE_URL") or "").strip()
+    mode = current_trading_mode()
+    if mode == "live":
+        env_name = "BINANCE_MAINNET_BASE_URL"
+        secret_key = "binance_mainnet_base_url"
+        fallback = MAINNET_REST
+    else:
+        env_name = "BINANCE_TESTNET_BASE_URL"
+        secret_key = "binance_testnet_base_url"
+        fallback = TESTNET_REST
+    env = (os.environ.get(env_name) or "").strip()
     if env:
         return env
 
@@ -132,10 +146,12 @@ def _configured_account_base_url() -> Optional[str]:
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-        val = (data.get("binance_testnet_base_url") or "").strip()
-        return val or None
+        val = (data.get(secret_key) or "").strip()
+        if val:
+            return val
     except Exception:
-        return None
+        pass
+    return fallback
 
 
 def current_trading_mode() -> str:

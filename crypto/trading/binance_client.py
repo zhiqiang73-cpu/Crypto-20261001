@@ -1,6 +1,8 @@
-"""Binance USDⓈ-M Futures Testnet REST 客户端.
+"""Binance USDⓈ-M Futures REST 客户端（按运行模式自动选择测试网/主网）.
 
-默认 base: https://testnet.binancefuture.com
+默认 base: paper/testnet → https://testnet.binancefuture.com
+           live（双重确认齐备）→ https://fapi.binance.com
+凭据：live 读 binance_mainnet_*，其余读 binance_testnet_*；显式参数优先。
 签名: HMAC-SHA256(query_string, secret)
 """
 
@@ -19,9 +21,11 @@ try:
 except ImportError:  # pragma: no cover
     aiohttp = None  # type: ignore
 
-from config.review import BINANCE_TESTNET_DEFAULT_BASE, TRADING_SYMBOL
+from config.review import (BINANCE_MAINNET_DEFAULT_BASE,
+                           BINANCE_TESTNET_DEFAULT_BASE, TRADING_SYMBOL)
 from config.secrets import get_secret, mask_secret
-from trading.runtime_mode import validate_exchange_target
+from trading.runtime_mode import (TradingMode, current_mode,
+                                  validate_exchange_target)
 from trading.models import AccountBalance, ManagedOrder, OrderResult, OrderState, PositionInfo
 
 logger = logging.getLogger(__name__)
@@ -92,14 +96,23 @@ class BinanceTestnetClient:
     ) -> None:
         if aiohttp is None:
             raise BinanceClientError("需要 aiohttp")
-        self.api_key = (api_key or get_secret("binance_testnet_api_key") or "").strip()
+        # 按运行模式选默认凭据/地址：live（需双重确认）→ 主网；其余 → 测试网。
+        # 显式传入的参数永远优先；默认行为与旧版完全一致。
+        live = current_mode() is TradingMode.LIVE
+        default_key_name = ("binance_mainnet_api_key" if live
+                            else "binance_testnet_api_key")
+        default_secret_name = ("binance_mainnet_api_secret" if live
+                               else "binance_testnet_api_secret")
+        default_url_name = ("binance_mainnet_base_url" if live
+                            else "binance_testnet_base_url")
+        default_base = (BINANCE_MAINNET_DEFAULT_BASE if live
+                        else BINANCE_TESTNET_DEFAULT_BASE)
+        self.api_key = (api_key or get_secret(default_key_name) or "").strip()
         self.api_secret = (
-            api_secret or get_secret("binance_testnet_api_secret") or ""
+            api_secret or get_secret(default_secret_name) or ""
         ).strip()
         self.base_url = (
-            base_url
-            or get_secret("binance_testnet_base_url")
-            or BINANCE_TESTNET_DEFAULT_BASE
+            base_url or get_secret(default_url_name) or default_base
         ).rstrip("/")
         validate_exchange_target(self.base_url)
         self.symbol = symbol

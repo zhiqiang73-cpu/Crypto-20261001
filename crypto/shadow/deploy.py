@@ -9,7 +9,8 @@ BTCUSDT 与 ETHUSDT 各跑两条策略，按标的各记虚拟仓、只下该标
     开仓/平仓一律限价: post-only 贴盘口挂单争取 maker, 窗口耗尽才穿盘口兜底
     布林带仅记录 / 日亏与回撤门控可配置 / 10x 逐仓
 
-只允许 Testnet; live 被 runtime_mode 闸门硬阻断。
+默认仅 Testnet；主网（真实资金）需双重显式确认才放行:
+TRADING_MODE=live 且 CONFIRM_MAINNET=YES_I_UNDERSTAND（见 trading/runtime_mode.py）。
 """
 
 from __future__ import annotations
@@ -70,7 +71,8 @@ from shadow.external_watch import (apply_external, classify_external,
                                    watch_for)
 from trading.binance_client import BinanceTestnetClient
 from trading.models import OrderResult
-from trading.runtime_mode import current_mode, validate_exchange_target
+from trading.runtime_mode import (current_mode, mainnet_confirmed,
+                                  validate_exchange_target)
 from config.market_endpoints import (MARKET_MAINNET, MarketMismatchError,
                                      assert_market_consistency,
                                      resolve_for_account)
@@ -2386,13 +2388,26 @@ async def main() -> int:
     if args.execute and not acquire_single_instance_lock():
         return 2
 
-    client = BinanceTestnetClient()
-    if not client.configured:
-        print("未配置 Testnet 密钥"); return 1
+    try:
+        client = BinanceTestnetClient()
+    except RuntimeError as exc:
+        print(f"[拒绝启动] {exc}"); return 1
     mode = current_mode()
-    validate_exchange_target(client.base_url)
+    if not client.configured:
+        print("未配置主网密钥（请先在面板「账户页 → 主网 API 凭据部署」保存）"
+              if mode.value == "live" else "未配置 Testnet 密钥")
+        return 1
+    try:
+        validate_exchange_target(client.base_url)
+    except RuntimeError as exc:
+        print(f"[拒绝启动] {exc}"); return 1
     if mode.value == "live":
-        print("拒绝启动: TRADING_MODE=live 被安全闸门阻断"); return 1
+        if not mainnet_confirmed():
+            print("拒绝启动: 主网模式需要第二道确认（CONFIRM_MAINNET）"); return 1
+        print("=" * 68)
+        print("!!! 主网真实资金模式已启用（双重确认齐备）—— 所有下单使用真实资金 !!!")
+        print(f"    下单地址: {client.base_url}")
+        print("=" * 68)
     print(f"运行模式: {mode.value}")
     notify("INFO", "runner_started", "交易运行器已启动",
            f"pid={os.getpid()} mode={mode.value} "
@@ -2412,8 +2427,8 @@ async def main() -> int:
     except MarketMismatchError as exc:
         print(f"[拒绝启动] {exc}")
         return 1
-    if ep.market == MARKET_MAINNET:
-        print("[拒绝启动] 行情腿指向主网, 但本框架只允许测试网验证")
+    if ep.market == MARKET_MAINNET and mode.value != "live":
+        print("[拒绝启动] 行情腿指向主网, 但未启用主网模式（TRADING_MODE=live）")
         return 1
 
     await client.sync_time()
