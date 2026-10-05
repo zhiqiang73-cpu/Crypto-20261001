@@ -335,6 +335,58 @@
             <div class="account-line"><span>运行模式</span><b id="accountMode">—</b></div>
           </div>
         </div>
+
+        <!-- ---------------- 主网凭据（只读验收，默认禁用执行） ---------------- -->
+        <div class="panel mainnet-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Binance USDⓈ-M 主网 · 只读</p>
+              <h2>主网 API 凭据部署（只读验收）</h2>
+              <p class="subline">
+                凭据只保存在本机 <code>runtime/secrets.json</code>（权限 600，已排除在 Git 之外）。
+                测试连接只发送两个 GET 请求：<code>/fapi/v1/time</code> 与签名 <code>/fapi/v2/account</code>，
+                <b>不下单、不撤单、不改杠杆、不划转</b>。保存或测试成功都不会启用主网交易。
+              </p>
+            </div>
+            <span class="tag paused">默认禁用执行</span>
+          </div>
+
+          <div class="mainnet-warning">
+            <b>上线前必读</b>
+            <span>
+              请新建一把专用主网 Key：仅勾选「读取」+「USDⓈ-M 合约交易」，<b>禁止提现、禁止资金划转</b>，
+              并绑定固定 IP 白名单。任何曾出现在聊天、截图或剪贴板历史的 Key 都必须先撤销再重建。
+            </span>
+          </div>
+
+          <div class="account-grid">
+            <form class="account-form" id="mainnetForm">
+              <label>主网 API Key<input id="mainnetKeyInput" type="text" autocomplete="off" spellcheck="false" placeholder="粘贴 binance.com 主网 Futures API Key"></label>
+              <label>主网 API Secret<input id="mainnetSecretInput" type="password" autocomplete="new-password" placeholder="粘贴主网 API Secret"></label>
+              <label>Base URL（固定，不可改）<input id="mainnetBaseUrlInput" type="url" value="https://fapi.binance.com" readonly></label>
+              <button class="primary-btn" type="button" id="mainnetSaveBtn">保存到本机（不启用主网交易）</button>
+              <button class="secondary-btn" type="button" id="mainnetVerifyBtn">测试连接（仅签名只读，不下单）</button>
+              <button class="secondary-btn danger" type="button" id="mainnetForgetBtn">删除本机保存的主网凭据</button>
+              <p class="form-note" id="mainnetResult">尚未保存主网凭据。</p>
+            </form>
+
+            <div class="account-state">
+              <div class="card-kicker">主网凭据状态</div>
+              <div class="connection-big blocked" id="mainnetConnection">未配置</div>
+              <div class="account-line"><span>已保存 Key</span><b id="mainnetKeyMasked">—</b></div>
+              <div class="account-line"><span>目标地址</span><b id="mainnetBaseUrl">—</b></div>
+              <div class="account-line"><span>只读预检</span><b id="mainnetVerifyState">—</b></div>
+              <div class="account-line"><span>主网执行</span><b class="blocked">已禁用</b></div>
+            </div>
+          </div>
+
+          <div class="mainnet-steps">
+            <div class="mainnet-step"><span>1</span><div><b>你本人保存并测试</b><small>只读预检通过，只证明这把 Key 能读取主网合约账户。</small></div></div>
+            <div class="mainnet-step"><span>2</span><div><b>你本人执行部署前验收</b><small>核对持仓模式 / 逐仓 / 杠杆 / 精度 / 最低下单量 / 保护单可挂。</small></div></div>
+            <div class="mainnet-step"><span>3</span><div><b>你本人显式启用主网执行</b><small>需要修改运行模式并重启运行器——这一步只能由你操作。</small></div></div>
+            <div class="mainnet-step"><span>4</span><div><b>回滚入口</b><small>停止运行器 → 恢复 <code>TRADING_MODE=testnet</code> → 重启；或删除主网凭据。</small></div></div>
+          </div>
+        </div>
       </section>
       <!-- ================= 第 3 页 · 图片显示确认模块 ================= -->
       <section class="view" id="view-chart">

@@ -371,6 +371,11 @@ from config.review import (
     VALID_SAMPLE_TARGET,
 )
 from config.secrets import load_secrets, save_secrets, mask_secret
+from trading.mainnet_readonly import (
+    MAINNET_USDM_BASE,
+    MainnetReadOnlyError,
+    verify_usdm_credentials_readonly,
+)
 from config.strategy_registry import load_registry, upsert_strategy
 from engine.scorer import FactorScoringEngine
 from models.review import SettleStatus, TradeRecord, now_ms
@@ -676,6 +681,10 @@ def create_app(
         secrets = load_secrets()
         bn_key = secrets.get("binance_testnet_api_key") or ""
         pf_key = secrets.get("predict_fun_api_key") or ""
+        mn_key = secrets.get("binance_mainnet_api_key") or ""
+        mn_configured = bool(
+            mn_key and secrets.get("binance_mainnet_api_secret")
+        )
         return web.json_response({
             "review_engine": review_loop.ENGINE_NAME,
             "valid_sample_target": VALID_SAMPLE_TARGET,
@@ -685,6 +694,11 @@ def create_app(
             "binance_key_masked": mask_secret(bn_key) if bn_key else "",
             "binance_base_url": secrets.get("binance_testnet_base_url")
                 or "https://testnet.binancefuture.com",
+            # 主网凭据状态：只读验收用。主网执行仍由 runtime_mode 硬阻断。
+            "mainnet_configured": mn_configured,
+            "mainnet_key_masked": mask_secret(mn_key) if mn_key else "",
+            "mainnet_base_url": MAINNET_USDM_BASE,
+            "mainnet_execution_enabled": False,
             "predict_fun_configured": bool(pf_key),
             "predict_fun_key_masked": mask_secret(pf_key) if pf_key else "",
             "runtime": startup_status(),
@@ -1168,6 +1182,83 @@ def create_app(
             return web.json_response({"ok": True, **info, "reconciliation": recon})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+    # ------------------------------------------------------------ 主网凭据（只读）
+    #
+    # 安全约定（2026-10-05 用户要求，务必遵守）：
+    #   * 主网凭据只落 runtime/secrets.json（已 gitignore，权限 0600）；
+    #   * 本组接口只做「保存 / 删除 / 只读测试」，绝不下单、不重绑测试网客户端；
+    #   * 保存主网凭据不会改变运行器模式，主网执行仍由 runtime_mode 硬阻断；
+    #   * 任何响应都不得回显 API Key/Secret 明文。
+    async def api_mainnet_keys(request):
+        body = await request.json()
+        api_key = (body.get("api_key") or "").strip()
+        api_secret = (body.get("api_secret") or "").strip()
+        if not api_key or not api_secret:
+            return web.json_response(
+                {"ok": False, "error": "api_key and api_secret required"},
+                status=400,
+            )
+        try:
+            save_secrets({
+                "binance_mainnet_api_key": api_key,
+                "binance_mainnet_api_secret": api_secret,
+                "binance_mainnet_base_url": MAINNET_USDM_BASE,
+            })
+        except OSError as exc:
+            return web.json_response(
+                {"ok": False, "error": f"写入本地凭据文件失败: {exc}"}, status=500
+            )
+        return web.json_response({
+            "ok": True,
+            "saved": True,
+            "mainnet_key_masked": mask_secret(api_key),
+            "base_url": MAINNET_USDM_BASE,
+            "execution_enabled": False,
+            "note": "已保存到本机 secrets 文件；未启用主网交易，也未改动运行器。",
+        })
+
+    async def api_mainnet_forget(_request):
+        """删除本机保存的主网凭据。测试网凭据与运行器不受影响。"""
+        save_secrets({
+            "binance_mainnet_api_key": None,
+            "binance_mainnet_api_secret": None,
+            "binance_mainnet_base_url": None,
+        })
+        return web.json_response({"ok": True, "forgotten": True})
+
+    async def api_mainnet_verify(request):
+        """签名只读测试：GET /fapi/v1/time + GET /fapi/v2/account。"""
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - 允许空 body，回落到已保存凭据
+            body = {}
+        secrets = load_secrets()
+        api_key = (body.get("api_key") or "").strip() or (
+            secrets.get("binance_mainnet_api_key") or ""
+        )
+        api_secret = (body.get("api_secret") or "").strip() or (
+            secrets.get("binance_mainnet_api_secret") or ""
+        )
+        if not api_key or not api_secret:
+            return web.json_response(
+                {"ok": False, "error": "尚未保存主网凭据，请先保存再测试"},
+                status=400,
+            )
+        try:
+            info = await verify_usdm_credentials_readonly(api_key, api_secret)
+        except MainnetReadOnlyError as exc:
+            return web.json_response(
+                {"ok": False, "error": str(exc), "execution_enabled": False},
+                status=400,
+            )
+        return web.json_response({
+            **info,
+            "key_masked": mask_secret(api_key),
+            "note": "只读预检通过。这不代表可以安全启动真实交易，"
+                    "主网执行仍需人工审查与显式启用。",
+        })
 
     async def api_predict_fun_key(request):
         body = await request.json()
@@ -1716,6 +1807,9 @@ def create_app(
     app.router.add_post("/api/paper/test-close", api_paper_test_close)
     app.router.add_post("/api/trading/verify", api_trading_verify)
     app.router.add_post("/api/trading/keys", api_binance_keys)
+    app.router.add_post("/api/mainnet/keys", api_mainnet_keys)
+    app.router.add_post("/api/mainnet/forget", api_mainnet_forget)
+    app.router.add_post("/api/mainnet/verify", api_mainnet_verify)
     app.router.add_post("/api/predict_fun/key", api_predict_fun_key)
     app.router.add_get("/api/review/convergence", api_convergence)
     app.router.add_post("/api/scheduler/run", api_scheduler_run)

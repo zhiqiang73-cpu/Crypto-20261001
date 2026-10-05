@@ -92,6 +92,9 @@ class FakeEx:
             "algoStatus": "NEW",
             "closePosition": "true" if close_position else "false",
             "quantity": f"{quantity:.6f}",
+            # 2026-10-05 起止损改用显式数量 + reduceOnly；假交易所必须如实回显，
+            # 否则测试无法守住「止损只能减仓」这条契约。
+            "reduceOnly": "false" if close_position else "true",
         }
         self.algo[aid] = o
         return ManagedOrder(client_order_id=client_order_id or "",
@@ -251,8 +254,15 @@ class TestTpDoesNotBlockStop(unittest.TestCase):
         stop = list(ex.algo.values())[0]
         self.assertEqual(stop["orderType"], "STOP_MARKET",
                          "止损必须保持市价：确定性比 2bp 值钱")
-        self.assertEqual(stop["closePosition"], "true",
-                         "止损应覆盖全仓，加层后自动跟随")
+        # 2026-10-05 起止损改用「显式数量 + reduceOnly」，不再用 closePosition：
+        # closePosition=true 的条件单每标的每方向只允许一张，收紧时「先立后破」
+        # 必然被 -4130 拒绝，导致保护单永久卡死、开仓被永久禁止。
+        self.assertEqual(stop["closePosition"], "false",
+                         "不得再用 closePosition=true，否则收紧会被 -4130 卡死")
+        self.assertEqual(stop["reduceOnly"], "true",
+                         "止损必须 reduceOnly，只能减仓不能反向开仓")
+        self.assertAlmostEqual(float(stop["quantity"]), 0.296, places=6,
+                               msg="止损数量必须等于当前持仓，加层后由系统重新覆盖")
 
     def test_merged_view_sees_both_legs(self):
         """统一视图必须同时看到止损与限价止盈 —— 只看一边必然漏。"""

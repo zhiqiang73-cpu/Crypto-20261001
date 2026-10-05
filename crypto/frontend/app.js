@@ -1370,6 +1370,134 @@
     await loadStatus();
   }
 
+  // -------------------------------------------------------- 主网凭据（只读）
+  //
+  // 约束：保存/测试都不会启用主网交易。测试按钮只调用后端只读预检接口，
+  // 后端只发 GET /fapi/v1/time 与签名 GET /fapi/v2/account。
+  function renderMainnetConfig(cfg) {
+    const c = cfg || {};
+    if ($("mainnetConnection")) {
+      const ok = Boolean(c.mainnet_configured);
+      $("mainnetConnection").textContent = ok ? "已保存（执行仍禁用）" : "未配置";
+      $("mainnetConnection").className = "connection-big " + (ok ? "positive" : "blocked");
+    }
+    if ($("mainnetKeyMasked"))
+      $("mainnetKeyMasked").textContent = c.mainnet_key_masked || "—";
+    // 地址一律由后端下发，前端不硬编码任何交易所域名：
+    // 硬编码会让「行情腿」与「下单腿」有机会分叉（2026-10-02 事故根因）。
+    if ($("mainnetBaseUrl"))
+      $("mainnetBaseUrl").textContent = c.mainnet_base_url || "—";
+  }
+
+  async function loadMainnetConfig() {
+    try {
+      renderMainnetConfig(await api("/api/config"));
+    } catch (e) { /* 保持原样 */ }
+  }
+
+  function bindMainnetForm() {
+    const saveBtn = $("mainnetSaveBtn");
+    const verifyBtn = $("mainnetVerifyBtn");
+    const forgetBtn = $("mainnetForgetBtn");
+    if (!saveBtn && !verifyBtn && !forgetBtn) return;
+    const note = () => $("mainnetResult");
+
+    if (saveBtn)
+      saveBtn.addEventListener("click", async () => {
+        const key = ($("mainnetKeyInput").value || "").trim();
+        const secret = ($("mainnetSecretInput").value || "").trim();
+        if (!key || !secret) {
+          note().textContent = "请先填写主网 API Key 与 Secret。";
+          return;
+        }
+        saveBtn.disabled = true;
+        note().textContent = "正在保存到本机…";
+        try {
+          const d = await api("/api/mainnet/keys", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ api_key: key, api_secret: secret }),
+          });
+          if (d.ok) {
+            note().textContent =
+              `已保存（${d.mainnet_key_masked}）。未启用主网交易，运行器未改动。`;
+            $("mainnetKeyInput").value = "";
+            $("mainnetSecretInput").value = "";
+          } else {
+            note().textContent = "保存失败：" + (d.error || "未知错误");
+          }
+          await loadMainnetConfig();
+        } catch (e) {
+          note().textContent = "保存失败：" + (e.message || e);
+        } finally {
+          saveBtn.disabled = false;
+        }
+      });
+
+    if (verifyBtn)
+      verifyBtn.addEventListener("click", async () => {
+        verifyBtn.disabled = true;
+        note().textContent = "正在执行只读预检（GET /fapi/v1/time + /fapi/v2/account）…";
+        if ($("mainnetVerifyState")) $("mainnetVerifyState").textContent = "检测中…";
+        try {
+          const typedKey = ($("mainnetKeyInput").value || "").trim();
+          const typedSecret = ($("mainnetSecretInput").value || "").trim();
+          const d = await api("/api/mainnet/verify", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ api_key: typedKey, api_secret: typedSecret }),
+          });
+          if (d.ok) {
+            note().textContent =
+              `只读预检通过 · 延迟 ${d.latency_ms}ms · 可用余额 ${num(d.available_balance_usdt, 2)} USDT · ` +
+              `canTrade=${d.can_trade} · canWithdraw=${d.can_withdraw}。` +
+              `注意：这不代表可以安全启动真实交易。`;
+            if ($("mainnetVerifyState")) {
+              $("mainnetVerifyState").textContent = "只读通过";
+              $("mainnetVerifyState").className = "positive";
+            }
+          } else {
+            note().textContent = "只读预检失败：" + (d.error || "未知错误");
+            if ($("mainnetVerifyState")) {
+              $("mainnetVerifyState").textContent = "失败";
+              $("mainnetVerifyState").className = "blocked";
+            }
+          }
+        } catch (e) {
+          note().textContent = "只读预检失败：" + (e.message || e);
+          if ($("mainnetVerifyState")) {
+            $("mainnetVerifyState").textContent = "失败";
+            $("mainnetVerifyState").className = "blocked";
+          }
+        } finally {
+          verifyBtn.disabled = false;
+        }
+      });
+
+    if (forgetBtn)
+      forgetBtn.addEventListener("click", async () => {
+        if (!window.confirm("确认删除本机保存的主网凭据？测试网凭据与运行器不受影响。")) return;
+        forgetBtn.disabled = true;
+        try {
+          const d = await api("/api/mainnet/forget", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}",
+          });
+          note().textContent = d.ok ? "已删除本机保存的主网凭据。" : "删除失败。";
+          if ($("mainnetVerifyState")) {
+            $("mainnetVerifyState").textContent = "—";
+            $("mainnetVerifyState").className = "";
+          }
+          await loadMainnetConfig();
+        } catch (e) {
+          note().textContent = "删除失败：" + (e.message || e);
+        } finally {
+          forgetBtn.disabled = false;
+        }
+      });
+  }
+
   // ------------------------------------------------------------------ 表单
   function bindAccountForm() {
     const form = $("accountForm");
@@ -1536,6 +1664,8 @@
       const v = location.hash.slice(1);
       if (VIEW_TITLES[v]) currentView = v;
     }
+    bindMainnetForm();
+    loadMainnetConfig();
     switchView(currentView);
     connectMarkPrice();
     startTimer();

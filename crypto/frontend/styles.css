@@ -600,6 +600,55 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 }
 .account-line b { color: var(--ink); font: 550 14px var(--mono); }
 
+/* ------------------------------------------------- 主网凭据（只读验收） */
+.mainnet-panel { margin-top: 16px; }
+.mainnet-warning {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid #5a3030;
+  border-radius: var(--radius-sm);
+  background: var(--red-soft);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.65;
+}
+.mainnet-warning b { flex: 0 0 auto; color: var(--red); font-weight: 620; }
+.mainnet-panel code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--line-soft);
+  background: var(--canvas);
+  font: 12px var(--mono);
+}
+.mainnet-panel input[readonly] { opacity: .72; }
+.secondary-btn.danger { color: var(--red); border-color: #5a3030; }
+.secondary-btn.danger:hover { background: var(--red-soft); }
+.mainnet-steps {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-soft);
+}
+.mainnet-step { display: flex; gap: 11px; align-items: flex-start; }
+.mainnet-step > span {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--surface-soft);
+  color: var(--faint);
+  font: 11.5px var(--mono);
+}
+.mainnet-step b { display: block; color: var(--ink); font-size: 13.5px; }
+.mainnet-step small { display: block; margin-top: 2px; color: var(--faint); font-size: 12.5px; line-height: 1.6; }
+
 /* ------------------------------------------------------------------ 响应式 */
 @media (max-width: 1250px) {
   .hero-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }

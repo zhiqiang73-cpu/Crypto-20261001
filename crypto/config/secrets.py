@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -23,6 +24,10 @@ ALLOWED_KEYS = frozenset({
     "binance_testnet_api_key",
     "binance_testnet_api_secret",
     "binance_testnet_base_url",
+    # 主网凭据只供面板的「只读验收」保存和测试使用；交易运行器不会读取它们。
+    "binance_mainnet_api_key",
+    "binance_mainnet_api_secret",
+    "binance_mainnet_base_url",
     "predict_fun_api_key",
     "cryptopanic_api_key",
 })
@@ -31,6 +36,9 @@ ENV_MAP = {
     "binance_testnet_api_key": "BINANCE_TESTNET_API_KEY",
     "binance_testnet_api_secret": "BINANCE_TESTNET_API_SECRET",
     "binance_testnet_base_url": "BINANCE_TESTNET_BASE_URL",
+    "binance_mainnet_api_key": "BINANCE_MAINNET_API_KEY",
+    "binance_mainnet_api_secret": "BINANCE_MAINNET_API_SECRET",
+    "binance_mainnet_base_url": "BINANCE_MAINNET_BASE_URL",
     "predict_fun_api_key": "PREDICT_FUN_API_KEY",
     "cryptopanic_api_key": "CRYPTOPANIC_API_KEY",
 }
@@ -73,15 +81,36 @@ def save_secrets(updates: Dict[str, Any], merge: bool = True) -> Dict[str, str]:
             current.pop(k, None)
         else:
             current[k] = str(v).strip()
+    # 凭据落盘必须原子化：面板崩溃或断电时，宁可保留旧文件，不能留下半截 JSON。
     SECRETS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SECRETS_FILE.write_text(
-        json.dumps(current, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    temp_name = ""
     try:
-        os.chmod(SECRETS_FILE, 0o600)
-    except OSError:
-        pass
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=SECRETS_FILE.parent,
+            prefix=".secrets.", suffix=".tmp", delete=False,
+        ) as fh:
+            temp_name = fh.name
+            json.dump(current, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, SECRETS_FILE)
+        # 尽力同步目录项；不支持的文件系统不影响已完成的原子替换。
+        try:
+            dir_fd = os.open(str(SECRETS_FILE.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
     return load_secrets()
 
 
