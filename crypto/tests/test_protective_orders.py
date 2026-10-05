@@ -284,10 +284,19 @@ class TestTightenStop(unittest.TestCase):
         res = _run(tighten_protective_stop(
             ex, symbol="BTCUSDT", side=1, new_trigger=84800.0,
             old_algo_id=old["algoId"]))
-        self.assertFalse(res.protects)
         self.assertIn(old["algoId"], ex.algo, "旧保护单必须还在")
         self.assertFalse(any(c[0] == "cancel" for c in ex.calls),
                          "不得发出任何撤单")
+        # 2026-10-05 改：**新单没挂上 ≠ 仓位没保护** —— 旧单仍在交易所生效。
+        # 原先这里断言 protects=False，把「旧单还活着」的仓位标成未保护，
+        # 系统随即永久禁止该标的开新仓（实测刷屏 1224 条）。
+        # 现在如实返回 PROTECTED 并用旧单的触发价，同时把失败原因留在 error。
+        self.assertTrue(res.protects, "旧保护单还活着，仓位就是受保护的")
+        self.assertEqual(res.algo_id, old["algoId"],
+                         "必须如实回报旧单的 algoId")
+        self.assertAlmostEqual(res.trigger_price, 84000.0, places=2,
+                               msg="触发价必须用旧单的，不能报新单的目标价")
+        self.assertIn("未确认", res.error, "收紧失败的原因仍须暴露")
 
     def test_reports_when_old_cancel_fails(self):
         """新单已生效、旧单撤不掉 —— 仍算已保护，但必须暴露问题。"""

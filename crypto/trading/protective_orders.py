@@ -689,10 +689,37 @@ async def tighten_protective_stop(
         client_algo_id=client_algo_id,
     )
     if not placed.protects:
-        # 新单没确认 —— 绝不能撤旧单，旧保护必须留着
+        # 新单没确认 —— 绝不能撤旧单，旧保护必须留着。
         placed.error = (f"新保护单未确认，保留旧保护单不动；{placed.error}")
         placed.superseded_algo_id = ""
         placed.old_cancel_ok = None
+        # ⚠ 关键语义：**新单没挂上 ≠ 仓位没保护**。旧单仍在交易所生效，
+        # 仓位是受保护的。2026-10-05 实测：这里直接返回 placed（状态为
+        # UNPROTECTED/UNKNOWN），把「旧单还活着」的仓位标成未保护 ——
+        # 系统随即永久禁止该标的开新仓，且状态与真实风险不符。
+        # 必须回查旧单：还活着就如实返回 PROTECTED（触发价用旧单的），
+        # 只在旧单确实没了时才报未保护。
+        old_id = old_algo_id or old_client_algo_id
+        if old_id:
+            try:
+                still = await fetch_open_algo_orders(client, symbol)
+            except Exception:  # noqa: BLE001 查不到 ≠ 没有，保持保守
+                still = None
+            if still is not None:
+                alive = next(
+                    (o for o in still
+                     if algo_ident(o) == old_algo_id
+                     or (old_client_algo_id
+                         and algo_client_ident(o) == old_client_algo_id)),
+                    None)
+                if alive is not None:
+                    out.verified = True
+                    out.state = ProtectionState.PROTECTED
+                    out.algo_id = algo_ident(alive)
+                    out.client_algo_id = algo_client_ident(alive)
+                    out.trigger_price = algo_trigger(alive)
+                    out.error = placed.error
+                    return out
         return placed
 
     out.verified = True

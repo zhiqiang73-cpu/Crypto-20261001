@@ -1149,6 +1149,37 @@ def book_for_symbol(st: dict, symbol: str) -> Optional[dict]:
     return None
 
 
+def _clamp_trigger_side(target: float, *, side: int, symbol: str,
+                        atr_1h: float, tick: float) -> float:
+    """把触发价钳制到市价的**正确一侧**。
+
+    为什么必须有这一层
+    ------------------
+    交易所对「一挂出就可立即成交」的条件单直接返回 **-2021**
+    （"Order would immediately trigger"）。
+
+    2026-10-05 实测：追踪止损按 `best_price − 1.5×ATR` 算出 86505.5，
+    而现价已回落到 86420.40 —— 目标价跑到市价**上方**，SELL 止损变成
+    「可立即成交」，下单被拒。后果是收紧永远失败、标的被永久禁止开仓。
+
+    这不是偶发：只要价格从最高点回撤超过 TRAIL_ATR×ATR，追踪止损就会
+    算出越界价。**回撤越大越必然发生**，恰恰是追踪止损最该起作用的时刻。
+
+    钳制方向：多仓止损必须低于市价、空仓止损必须高于市价，各留一个
+    缓冲（0.25×ATR，且不小于 2 个 tick），避免贴着市价被噪声瞬间打掉。
+
+    注意：钳制只会让触发价**更靠近市价**（更紧），不会放宽既有保护；
+    上层 find_protective_stop 的死区判断仍会拦住「无改进空间」的重挂。
+    """
+    mark = float(latest_mark_price(symbol) or 0.0)
+    if mark <= 0 or target <= 0:
+        return target
+    buf = max(2.0 * float(tick), 0.25 * float(atr_1h))
+    if side > 0:
+        return min(target, mark - buf)
+    return max(target, mark + buf)
+
+
 async def _protective_target(client: BinanceTestnetClient, st: dict, *,
                             symbol: str, ex_side: float, entry_px: float,
                             atr_1h: float):
@@ -1188,12 +1219,15 @@ async def _protective_target(client: BinanceTestnetClient, st: dict, *,
                     else:
                         target = min(target, trail) if target > 0 else trail
         if target > 0:
-            return target, True, tick
+            return _clamp_trigger_side(
+                target, side=side, symbol=symbol, atr_1h=atr_1h,
+                tick=tick), True, tick
     px = stop_price_from_avg(
         avg_price=float(entry_px), side=side, atr_1h=float(atr_1h),
         multiple=NORMAL_STOP_ATR, tick=tick,
     )
-    return px, False, tick
+    return _clamp_trigger_side(
+        px, side=side, symbol=symbol, atr_1h=atr_1h, tick=tick), False, tick
 
 
 async def manage_exchange_stop(client: BinanceTestnetClient, st: dict, *,
