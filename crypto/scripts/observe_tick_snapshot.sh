@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Read-only snapshot for 48h observe. Does not change trading state.
 set -euo pipefail
-ROOT="/Users/zengyun/Downloads/我的AI/crypto"
+ROOT="/Users/zengyun/我的AI/crypto"
 LOG="$ROOT/docs/observe_48h_raw.jsonl"
 STAMP=$(date '+%Y-%m-%d %H:%M:%S %z')
 mkdir -p "$ROOT/docs"
@@ -26,15 +26,15 @@ hist = get("/api/trading/history")
 items = hist if isinstance(hist, list) else (hist.get("items") or hist.get("history") or hist.get("trades") or [])
 if not isinstance(items, list):
     items = []
-pos_path = pathlib.Path("/Users/zengyun/Downloads/我的AI/crypto/runtime/review/positions.json")
+pos_path = pathlib.Path("/Users/zengyun/我的AI/crypto/runtime/review/positions.json")
 pos = {}
 if pos_path.exists():
     try:
         pos = json.loads(pos_path.read_text())
     except Exception as e:
         pos = {"_error": str(e)}
-ledger = pathlib.Path("/Users/zengyun/Downloads/我的AI/crypto/runtime/review/trade_ledger.jsonl")
-hist_file = pathlib.Path("/Users/zengyun/Downloads/我的AI/crypto/runtime/review/trading_history.jsonl")
+ledger = pathlib.Path("/Users/zengyun/我的AI/crypto/runtime/review/trade_ledger.jsonl")
+hist_file = pathlib.Path("/Users/zengyun/我的AI/crypto/runtime/review/trading_history.jsonl")
 rec = {
     "ts_local": now,
     "unix": time.time(),

@@ -25,7 +25,7 @@
 **基线验证命令**（改动后必须重跑）：
 
 ```bash
-cd /Users/zengyun/Downloads/我的AI/crypto
+cd /Users/zengyun/我的AI/crypto
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'
 ```
 
@@ -900,9 +900,9 @@ post-only 拒单退档、竞态成交、兜底穿盘口、滑点上限、重挂�
 
 | | 替换前 | 替换后 |
 | --- | --- | --- |
-| 做多 | 金叉 + 收盘涨破上一根最高（≥0.15×ATR_1H） | 金叉 + MACD 能量柱为正（红柱） |
-| 做空 | 死叉 + 收盘跌破上一根最低（≥0.15×ATR_1H） | 死叉 + MACD 能量柱为负（绿柱） |
-| 背离 | 不适用 | 金叉遇绿柱 / 死叉遇红柱 → **丢弃**：不开仓、不平仓、不反手 |
+| 做多 | 金叉 + 收盘涨破上一根最高（≥0.15×ATR_1H） | 金叉 + MACD 能量柱为正（绿柱） |
+| 做空 | 死叉 + 收盘跌破上一根最低（≥0.15×ATR_1H） | 死叉 + MACD 能量柱为负（红柱） |
+| 背离 | 不适用 | 金叉遇红柱 / 死叉遇绿柱 → **丢弃**：不开仓、不平仓、不反手 |
 
 **已完成**
 
@@ -922,8 +922,8 @@ post-only 拒单退档、竞态成交、兜底穿盘口、滑点上限、重挂�
    `shadow/live.py`（阶段 1 影子运行器）同步。
 6. 策略卡 `config/strategies/deployed_kdj_extreme_v1.json` 与
    `deployed_kdj_eth_extreme_v1.json` 改写 entry/exit/indicators/note；5m 两张卡未动。
-7. 前端 `frontend/app.js::signalView` 增加闸门文案（「金叉且 MACD 红柱」/
-   「MACD 不是红柱」等）。
+7. 前端 `frontend/app.js::signalView` 增加闸门文案（「金叉且 MACD 绿柱」/
+   「MACD 不是绿柱」等）。
 8. 测试：新增 `tests/test_macd_gate_strategy.py`（20 项：EMA 口径、闸门矩阵、引擎信号
    必须与能量柱同向、规格与策略卡一致性）；改写 `tests/test_dual_strategy_books.py`
    的 15m 用例（改用 `patch(shadow.deploy.macd)` 控制柱方向）与
@@ -969,3 +969,57 @@ if filled > 0:
 
 **验证**：新增 `tests/test_partial_fill_cancel.py`（4 项）；全量 **543 项通过**。
 **注意**：人工加仓检测逻辑本身没有问题 —— 本次并非人工下单，故未触发暂停。
+
+### 2026-10-03 06:45 · 凌晨两笔灾难止损复盘 + 项目迁出 Downloads
+
+**现象**：10-03 凌晨出现两笔大额亏损，账户权益从峰值 5253.74 降到 4475.20。
+
+**核对**（交易所口径）：钱包余额 4475.20，已实现 −455.26，手续费 −91.99，
+净盈亏 −547.25；胜率 71.7%（43 胜 17 负），但盈亏比仅 **0.364**（ETH 0.048）。
+
+**两笔亏损的真实来源 —— 都是 3×ATR_1H 灾难止损，不是正常反手**
+
+| 时间（北京） | 标的 | 动作 | 数量 | 入场 | 强平价 | 亏损 |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 02:37 | ETHUSDT | 灾难止损平仓 | 4.821 | 2725.34 | 2674.71 | ≈ −244 |
+| 02:43 | BTCUSDT | 灾难止损平仓 | 0.164 | 85580.00 | 83983.00 | ≈ −262 |
+
+日志原文：
+
+```
+ETHUSDT 浮亏 50.63 ≥ 3×ATR 50.58; LIMIT 强平 成交价=2674.71; 剩余 0.0000 ETH
+BTCUSDT 浮亏 1557.27 ≥ 3×ATR 1475.50; LIMIT 强平 成交价=83983.00; 剩余 0.0000 BTC
+```
+
+**为什么会亏这么多（结构性原因，不是故障）**
+
+1. 仓位是 `qty = 权益 × 0.03 ÷ (2 × ATR_1H)`，灾难止损在 `3 × ATR_1H`，
+   两者相除 ⇒ **每次灾难止损必然亏掉 3% × 3 ÷ 2 = 4.5% 权益**。两次≈9%。
+2. 这两笔都是 **5m 仓位**。5m 的出场只有「反向交叉 + K 极值」和灾难止损两条路；
+   **下跌途中 K 值一直很低，永远回不到 K>70**，所以反向平仓条件无法成立，
+   多仓没有任何正常出口，只能一路扛到 3×ATR。凌晨逐根日志里 ETH 5m / BTC 5m
+   全程都是 `观察`（K=13.75、20.25…），没有任何一次满足平仓阈值。
+3. 结果就是「赢很多次小钱、两笔大亏全部吃回」的低盈亏比结构。
+
+**衍生问题（已处理）**
+
+- 22:39 起本机同时存在两份运行器（手动 + launchd），02:29–02:32 触发交易所限频：
+  `{"code":-1003,"msg":"Way too many requests; IP banned until ..."}`；
+  另有多次 `拉 K 线失败: handshake/read timed out`。
+- `launchd` 服务放在 `~/Downloads` 下会被 macOS「下载文件夹」隐私保护拦截：
+  `[Errno 1] Operation not permitted: deployed_trades.csv`、
+  `run_testnet_monitor_loop.sh: Operation not permitted`、
+  `ModuleNotFoundError: No module named 'shadow'`。四个服务全部失效，已卸载。
+
+**熔断**：累计回撤 14.8% ≥ 10% ⇒ `halted=True`，停止开新仓，等待人工指令。
+
+**目录迁移（用户指令）**：整仓 `/Users/zengyun/Downloads/我的AI` →
+`/Users/zengyun/我的AI`，项目现位于 **`/Users/zengyun/我的AI/crypto`**。
+只搬 `crypto` 会掏空仓库（200 个跟踪文件全在 `crypto/` 下），故整仓搬迁，
+git 历史与 `backup` 远程保持完好。迁移后已批量更新 16 个文件里写死的旧绝对路径，
+并在新路径下复跑全量测试：**543 项通过**。
+
+**launchd 托管现状**：Manus 的执行沙箱无法注册 GUI LaunchAgent
+（`Bootstrap failed: 5: Input/output error`），需由用户在本机终端执行
+`ENABLE_TESTNET_EXECUTION=YES bash scripts/install_testnet_services.sh`。
+安装脚本已改为幂等：加载服务前先停掉手动实例，避免重复运行器与端口抢占。

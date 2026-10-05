@@ -1,14 +1,14 @@
 #!/bin/zsh
 # 30-min observe: score sanity/stability, fills, money-path blockers, doubts (read-only).
 set -euo pipefail
-ROOT="/Users/zengyun/Downloads/我的AI/crypto"
+ROOT="/Users/zengyun/我的AI/crypto"
 RAW="$ROOT/docs/observe_30m_raw.jsonl"
 LOG="$ROOT/docs/observe_30m_log.md"
 DOUBTS="$ROOT/docs/observe_doubts.md"
 AUDIT="$ROOT/docs/../runtime/review/decision_audit.jsonl"
-AUDIT="/Users/zengyun/Downloads/我的AI/crypto/runtime/review/decision_audit.jsonl"
-HIST="/Users/zengyun/Downloads/我的AI/crypto/runtime/review/trading_history.jsonl"
-LEDGER="/Users/zengyun/Downloads/我的AI/crypto/runtime/review/trade_ledger.jsonl"
+AUDIT="/Users/zengyun/我的AI/crypto/runtime/review/decision_audit.jsonl"
+HIST="/Users/zengyun/我的AI/crypto/runtime/review/trading_history.jsonl"
+LEDGER="/Users/zengyun/我的AI/crypto/runtime/review/trade_ledger.jsonl"
 mkdir -p "$ROOT/docs"
 
 # reuse snapshot into 30m raw
@@ -34,16 +34,16 @@ hist = get("/api/trading/history")
 items = hist if isinstance(hist, list) else (hist.get("items") or hist.get("history") or hist.get("trades") or [])
 if not isinstance(items, list):
     items = []
-pos_path = pathlib.Path("/Users/zengyun/Downloads/我的AI/crypto/runtime/review/positions.json")
+pos_path = pathlib.Path("/Users/zengyun/我的AI/crypto/runtime/review/positions.json")
 pos = {}
 if pos_path.exists():
     try:
         pos = json.loads(pos_path.read_text())
     except Exception as e:
         pos = {"_error": str(e)}
-ledger = pathlib.Path("/Users/zengyun/Downloads/我的AI/crypto/runtime/review/trade_ledger.jsonl")
-hist_file = pathlib.Path("/Users/zengyun/Downloads/我的AI/crypto/runtime/review/trading_history.jsonl")
-audit = pathlib.Path("/Users/zengyun/Downloads/我的AI/crypto/runtime/review/decision_audit.jsonl")
+ledger = pathlib.Path("/Users/zengyun/我的AI/crypto/runtime/review/trade_ledger.jsonl")
+hist_file = pathlib.Path("/Users/zengyun/我的AI/crypto/runtime/review/trading_history.jsonl")
+audit = pathlib.Path("/Users/zengyun/我的AI/crypto/runtime/review/decision_audit.jsonl")
 rec = {
     "ts_local": now,
     "unix": time.time(),
@@ -95,7 +95,7 @@ from pathlib import Path
 from collections import Counter
 CST=timezone(timedelta(hours=8))
 now=datetime.now(CST)
-ROOT=Path('/Users/zengyun/Downloads/我的AI/crypto')
+ROOT=Path('/Users/zengyun/我的AI/crypto')
 raw_path=ROOT/'docs'/'observe_30m_raw.jsonl'
 log_path=ROOT/'docs'/'observe_30m_log.md'
 doubts_path=ROOT/'docs'/'observe_doubts.md'

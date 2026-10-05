@@ -25,7 +25,7 @@
             初值: EMA_0 = C_0 (第一根收盘价, 与 TradingView / 币安同口径)
         DIF_t  = EMA(12)_t − EMA(26)_t
         DEA_t  = EMA(DIF, 9)_t,   初值 DEA_0 = DIF_0
-        HIST_t = DIF_t − DEA_t        红柱 = HIST > 0, 绿柱 = HIST < 0
+        HIST_t = DIF_t − DEA_t        绿柱 = HIST > 0, 红柱 = HIST < 0
         闸门只认 HIST 的正负号; 与 DIF 相对 0 轴的位置无关。
 """
 

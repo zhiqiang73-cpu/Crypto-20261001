@@ -1168,9 +1168,9 @@ class BinanceTestnetClient:
         # 保留交易所实际订单状态/ID；网络未知不能伪称已经撤销。
         res.error = (f"passive_exhausted: 被动 {len(attempts)} 次 + IOC限价兜底未确认成交; "
                      f"{res.error or res.order_state}")
-        res.raw = {**(res.raw or {}),
-                   "chase": {"attempts": attempts, "likely_maker": False}}
-        return res
+        # 复用同一套 chase meta 键名；2026-10-03 手写 {"attempts","likely_maker"} 导致
+        # 日志把 steps/passive 读成 0（「taker 被动0次」），真实原因被挡住。
+        return self._with_passive_meta(res, attempts, maker=False)
 
     @staticmethod
     def _finish_passive(

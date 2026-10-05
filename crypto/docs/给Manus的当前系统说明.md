@@ -1,6 +1,6 @@
 # 给 Manus 的当前系统说明
 
-**写于 2026-10-02 19:45（北京时间）。** 志强接下来用 Manus 继续开发。以本文件和当前代码为准。下面点名的旧文档有过时句子，不要照着改策略。
+**写于 2026-10-02 19:45（北京时间），2026-10-03 更新 5m 规则。** 志强接下来用 Manus 继续开发。以本文件和当前代码为准。下面点名的旧文档有过时句子，不要照着改策略。
 
 这是 Binance USDⓈ-M **测试网**上的 BTCUSDT、ETHUSDT 永续自动交易。只做测试网。`TRADING_MODE=live` 和主网 URL 会被拒绝。行情地址必须和下单地址是同一个市场。
 
@@ -15,11 +15,13 @@
 | 策略 id | 标的 | 周期 | 开仓规则 |
 | --- | --- | --- | --- |
 | `kdj15` | BTCUSDT | 15m | 收盘金叉**且 MACD(12,26,9) 能量柱为正**做多；死叉**且能量柱为负**做空。方向背离的交叉丢弃。无 K 极值过滤 |
-| `kdj5` | BTCUSDT | 5m | 金叉且 K<30 做多；死叉且 K>70 做空。当根收盘即可 |
+| `kdj5` | BTCUSDT | 5m | 与 `kdj15` 相同 |
 | `eth15` | ETHUSDT | 15m | 与 `kdj15` 相同 |
-| `eth5` | ETHUSDT | 5m | 与 `kdj5` 相同 |
+| `eth5` | ETHUSDT | 5m | 与 `kdj15` 相同 |
 
-**2026-10-02 21:40 变更（志强指令）**：两条 15m 策略原来用「价格突破上一根高低点 0.15×ATR_1H」做方向过滤，现已整条替换为 **MACD 能量柱正负**闸门。5m 两条策略未动。`price_breaks()` 与 `BREAK_ATR_MULT` 保留在 `shadow/signals.py` 里，但已不再被任何规格使用。
+**2026-10-02 21:40 变更（志强指令）**：两条 15m 策略原来用「价格突破上一根高低点 0.15×ATR_1H」做方向过滤，现已整条替换为 **MACD 能量柱正负**闸门。`price_breaks()` 与 `BREAK_ATR_MULT` 保留在 `shadow/signals.py` 里，但已不再被任何规格使用。
+
+**2026-10-03 变更（志强指令）**：两条 5m 策略改为与 15m **完全相同** —— 金叉且能量柱为正才做多，死叉且能量柱为负才做空，背离丢弃。原来的 K<30 / K>70 极值过滤全部停用（`entry_signal` 的同名参数只为历史测试保留，四条规格都传 `None`）。
 
 规格原文在 `config/strategies/deployed_kdj_*.json`。真正执行的分支在 `shadow/strategy_books.py` 的 `SPECS`，以及 `shadow/deploy.py` 的 `process_strategy()`。
 
@@ -30,7 +32,7 @@
 | BTC 15m | 多 | 0.190 | 86308.4 | 17:30 金叉 |
 | BTC 5m | 空 | 0.191 | 86314.4 | 16:40 |
 | ETH 15m | 空 | 4.722 | 2751.56 | 17:00 死叉 |
-| ETH 5m | 多 | 2.356 | 2748.64 | 17:35 金叉且 K<30 |
+| ETH 5m | 多 | 2.356 | 2748.64 | 17:35 金叉且 K<30（旧规则） |
 
 当时 BTC 净仓接近 0（0.190 多对 0.191 空）。ETH 净仓大约空 2.37。权益峰值约 5254 USDT，日初约 4951，未熔断。
 
@@ -52,16 +54,16 @@ KDJ 只在 `shadow/indicators.py::kdj`。参数 **(9, 3, 3)**：
 - 死叉：`K[t-1] ≥ D[t-1]` 且 `K[t] < D[t]`
 - 任一值为 NaN：没有信号
 
-15 分钟还要过 MACD 方向闸门，实现在 `shadow/signals.py::macd_gate`，指标在 `shadow/indicators.py::macd`：
+四条策略（15m 与 5m）都要过 MACD 方向闸门，实现在 `shadow/signals.py::macd_gate`，指标在 `shadow/indicators.py::macd`：
 
 - MACD 参数 **(12, 26, 9)**，口径与 TradingView / 币安一致：`EMA_t = α·C_t + (1−α)·EMA_{t−1}`，`α = 2/(n+1)`，初值取第一根收盘价；`DIF = EMA12 − EMA26`；`DEA = EMA9(DIF)`；**柱 = DIF − DEA**
-- 只认柱的**正负号**：红柱（>0）只许做多，绿柱（<0）只许做空
-- 金叉遇绿柱、或死叉遇红柱 = **方向背离 → 直接丢弃**：不开新仓、不平仓、不反手，等下一个同向信号
+- 只认柱的**正负号**：绿柱（>0）只许做多，红柱（<0）只许做空
+- 金叉遇红柱、或死叉遇绿柱 = **方向背离 → 直接丢弃**：不开新仓、不平仓、不反手，等下一个同向信号
 - 柱恰好等于 0、或数值不可用：同样丢弃
 
 ATR 是 **1 小时 Wilder(14)**，用来算仓位和灾难止损，不拿 15 分钟 ATR 代替。布林带 (20,2) 只记录，不参与开仓。
 
-5 分钟**没有**这道 MACD 闸门。5 分钟的过滤是 K<30 / K>70。
+5 分钟用的是**同一套**规则，没有单独的 K 极值过滤。
 
 `confirmed_signal()` 和规格上的 `confirm_next` **当前四条策略都是关的**（`confirm_next=False`）。不要把它打开来「实现下一根确认」。现在的「下一根开盘下限价」指的是：信号 K 线收盘之后，运行器在下一轮（约 15 秒内）按当时盘口挂限价单，而不是再等一根 K 线看 K 是否还在 D 的同一侧。
 
@@ -77,7 +79,7 @@ ATR 是 **1 小时 Wilder(14)**，用来算仓位和灾难止损，不拿 15 分
 
 5 分钟若和**同一个标的**的 15 分钟反向，数量再减半（`contra_5m_qty`）。15 分钟自己不减。15 分钟空仓时，5 分钟按满仓。
 
-出场：对侧信号用同一套规则反手（15 分钟要交叉加能量柱同向，5 分钟要交叉加 K 阈值）。**背离的交叉不动仓** —— 既不平掉现有仓，也不反手。先改虚拟仓，再按该标的净差额下单。
+出场：对侧信号用同一套规则反手（四条策略都是：交叉 + 能量柱同向）。**背离的交叉不动仓** —— 既不平掉现有仓，也不反手。先改虚拟仓，再按该标的净差额下单。
 
 账户：单向持仓、10 倍、逐仓。启动时向交易所读回核对。已有挂单则拒绝启动，不擅自撤用户的单。有仓且设置不符时拒绝改设置。
 
@@ -122,20 +124,20 @@ ATR 是 **1 小时 Wilder(14)**，用来算仓位和灾难止损，不拿 15 分
 | --- | --- |
 | 运行器主循环 | `shadow/deploy.py` |
 | 四条策略规格、净仓、5 分钟减半 | `shadow/strategy_books.py` |
-| 交叉与 15 分钟 MACD 闸门 | `shadow/signals.py`（`crossing` / `macd_gate`） |
+| 交叉与 MACD 闸门（四条策略共用） | `shadow/signals.py`（`crossing` / `macd_gate`） |
 | KDJ / MACD / ATR | `shadow/indicators.py` |
 | 限价追价 | `trading/binance_client.py` |
 | 行情地址闸门 | `config/market_endpoints.py` |
 | 面板 | `review/panel_server.py`，前端 `frontend/`，本机 `127.0.0.1:8788` |
 | 状态 | `runtime/shadow/deployed_state.json` |
-| 最新 15 分钟读数 | `runtime/shadow/latest_reading.json` |
+| 最新 15 分钟 / 5 分钟读数 | `runtime/shadow/latest_reading.json`、`latest_reading_5m.json`、`latest_reading_eth*.json` |
 | 成交日志 | `runtime/shadow/deployed_trades.csv` |
 | 密钥 | `runtime/secrets.json`（gitignore，不要读进仓库、不要写进说明） |
 
 启动交易器（已有 launchd 在跑时不要再起一份）：
 
 ```bash
-cd "/Users/zengyun/Downloads/我的AI/crypto"
+cd "/Users/zengyun/我的AI/crypto"
 python3 -m shadow.deploy --execute --interval 15
 ```
 
@@ -144,7 +146,7 @@ python3 -m shadow.deploy --execute --interval 15
 改完跑：
 
 ```bash
-cd "/Users/zengyun/Downloads/我的AI/crypto"
+cd "/Users/zengyun/我的AI/crypto"
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'
 ```
 

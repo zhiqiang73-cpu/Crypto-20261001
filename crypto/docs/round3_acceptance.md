@@ -5,7 +5,7 @@
 
 ## 代码基线
 
-- 路径：`/Users/zengyun/Downloads/我的AI/crypto`
+- 路径：`/Users/zengyun/我的AI/crypto`
 - 默认：`enabled=False`；长期观察-only
 - 实际衍生品采集：**FreeDerivativesCollector**
 - 评分→交易：`panel_server` → `score_once` → `on_snapshot`

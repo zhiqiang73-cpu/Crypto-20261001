@@ -6,7 +6,7 @@
 
 你在本机仓库工作：
 
-`/Users/zengyun/Downloads/我的AI/crypto`
+`/Users/zengyun/我的AI/crypto`
 
 这是 BTCUSDT「四面评分 → 短/长期决策 → Binance Futures（测试网）自动交易」系统。
 
@@ -20,7 +20,7 @@
 ## 启动步骤
 
 ```bash
-cd "/Users/zengyun/Downloads/我的AI/crypto"
+cd "/Users/zengyun/我的AI/crypto"
 # 确认 8787 空闲
 lsof -tiTCP:8787 -sTCP:LISTEN && echo busy || echo free
 python3 -m review.panel_server
@@ -36,7 +36,7 @@ python3 -m review.panel_server
 只读快照脚本（已有）：
 
 ```bash
-"/Users/zengyun/Downloads/我的AI/crypto/scripts/observe_tick_snapshot.sh"
+"/Users/zengyun/我的AI/crypto/scripts/observe_tick_snapshot.sh"
 ```
 
 人工日志追加到：

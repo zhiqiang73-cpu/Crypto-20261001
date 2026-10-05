@@ -534,7 +534,7 @@
         text: "开多",
         cls: "is-long",
         sub: d.require_macd
-          ? "金叉且 MACD 红柱"
+          ? "金叉且 MACD 绿柱"
           : d.require_break
             ? "金叉且价格突破"
             : d.signal_needs_k_extreme
@@ -547,7 +547,7 @@
         text: "开空",
         cls: "is-short",
         sub: d.require_macd
-          ? "死叉且 MACD 绿柱"
+          ? "死叉且 MACD 红柱"
           : d.require_break
             ? "死叉且价格突破"
             : d.signal_needs_k_extreme
@@ -563,7 +563,7 @@
           d.macd_note ||
           d.break_note ||
           (d.require_macd
-            ? "MACD 不是红柱"
+            ? "MACD 不是绿柱"
             : d.require_break
               ? "未涨破上一根高点"
               : d.signal_needs_k_extreme
@@ -579,7 +579,7 @@
           d.macd_note ||
           d.break_note ||
           (d.require_macd
-            ? "MACD 不是绿柱"
+            ? "MACD 不是红柱"
             : d.require_break
               ? "未跌破上一根低点"
               : d.signal_needs_k_extreme

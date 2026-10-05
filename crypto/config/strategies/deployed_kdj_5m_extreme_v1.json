@@ -1,7 +1,7 @@
 {
   "strategy_id": "deployed_kdj_5m_extreme_v1",
   "runtime_key": "kdj5",
-  "name": "KDJ 极值交叉 (BTCUSDT 5m)",
+  "name": "KDJ×MACD 双指标闸门 (BTCUSDT 5m)",
   "kind": "mean_reversion",
   "timeframe": "5m",
   "risk_timeframe": "1h",
@@ -11,15 +11,20 @@
   "entry": {
     "golden_cross": "K[t-1] <= D[t-1] and K[t] > D[t]",
     "dead_cross": "K[t-1] >= D[t-1] and K[t] < D[t]",
-    "long": "金叉且 K<30 做多",
-    "short": "死叉且 K>70 做空",
-    "execution": "t 收盘判定, 与 15m 策略合成净仓后限价追价"
+    "long": "金叉且 MACD 能量柱为正（绿柱）才做多",
+    "short": "死叉且 MACD 能量柱为负（红柱）才做空",
+    "execution": "t 收盘判定, 与同标的 15m 策略合成净仓后限价追价",
+    "divergence": "金叉遇红柱 / 死叉遇绿柱 → 方向背离，丢弃不操作：不开新仓、不平仓、不反手",
+    "loose_long": "已废弃：无极值过滤",
+    "loose_short": "已废弃：无极值过滤"
   },
   "exit": {
-    "mode_a": "与开仓同一套：死叉且 K>70 才翻空，金叉且 K<30 才翻多；再与 15m 合成净仓。普通死叉不过阈值则不动"
+    "mode_a": "对侧交叉同样要过能量柱方向闸门，下一根开盘限价反手；背离的交叉不动仓",
+    "mode_b": "对侧交叉平仓 (仅并行记录, 不执行)"
   },
   "indicators": {
     "KDJ": "(9,3,3) 5m",
+    "MACD": "(12,26,9) 5m —— 只取能量柱正负作为方向闸门; EMA_t=αC_t+(1-α)EMA_{t-1}, α=2/(n+1), 初值取第一根收盘价; DIF=EMA12-EMA26; DEA=EMA9(DIF); 柱=DIF-DEA; 绿柱>0, 红柱<0",
     "ATR": "(14) 1h Wilder，用于仓位",
     "BOLL": "(20,2) 5m —— 仅记录"
   },
@@ -42,8 +47,8 @@
     "order_type": "LIMIT_GTX_POST_ONLY_THEN_LIMIT_CROSS",
     "tag": "kd5"
   },
-  "status": "testnet_ready_manual_activation",
-  "enabled": true,
+  "status": "disabled_2026-10-03",
+  "enabled": false,
   "source": "user_spec",
-  "note": "2026-10-02 第二条策略。K 阈值 30/70。冷启动不追溯旧 5m K 线。"
+  "note": "2026-10-02 第二条策略。2026-10-03：入场规则由「K 阈值 30/70」改为与 15m 相同的 MACD(12,26,9) 能量柱方向闸门，背离丢弃。冷启动不追溯旧 5m K 线。2026-10-03 用户决定停用：5m 止损标定研究建议停用『5m 高噪声低信噪比』，实盘账本只保留两条 15m；本卡片保留仅作记录。"
 }
