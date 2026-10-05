@@ -1183,6 +1183,88 @@ def create_app(
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
+    async def _binance_key_payload(request):
+        """读取并校验测试网密钥请求；不返回任何明文凭据。"""
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - 允许空 body
+            body = {}
+        api_key = str(body.get("api_key") or "").strip()
+        api_secret = str(body.get("api_secret") or "").strip()
+        base_url = str(body.get("base_url") or "").strip()
+        if not api_key or not api_secret:
+            raise ValueError("api_key and api_secret required")
+        return api_key, api_secret, base_url
+
+    async def api_binance_keys_save(request):
+        """仅保存并热切换测试网客户端，不联网、不对账、不下单。"""
+        try:
+            api_key, api_secret, base_url = await _binance_key_payload(request)
+            new_client = BinanceTestnetClient(
+                api_key=api_key,
+                api_secret=api_secret,
+                base_url=base_url or None,
+            )
+            save_secrets({
+                "binance_testnet_api_key": api_key,
+                "binance_testnet_api_secret": api_secret,
+                **({"binance_testnet_base_url": base_url} if base_url else {}),
+            })
+            old_client = review.executor.client
+            review.executor.client = new_client
+            review.executor.manager.client = new_client
+            await old_client.close()
+            return web.json_response({
+                "ok": True,
+                "saved": True,
+                "key_masked": mask_secret(api_key),
+                "base_url": new_client.base_url,
+                "note": "测试网凭据已保存到本机；尚未执行通信测试。",
+            })
+        except (ValueError, RuntimeError) as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except OSError as exc:
+            return web.json_response(
+                {"ok": False, "error": f"写入本地凭据文件失败: {exc}"}, status=500
+            )
+        except Exception as exc:  # noqa: BLE001 - 客户端构造校验等
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+    async def api_binance_keys_test(request):
+        """只读通信测试：ping + 账户余额 + 标记价格，不保存、不对账。"""
+        client = None
+        try:
+            try:
+                api_key, api_secret, base_url = await _binance_key_payload(request)
+            except ValueError:
+                secrets = load_secrets()
+                api_key = secrets.get("binance_testnet_api_key") or ""
+                api_secret = secrets.get("binance_testnet_api_secret") or ""
+                base_url = secrets.get("binance_testnet_base_url") or ""
+                if not api_key or not api_secret:
+                    raise ValueError("尚未保存测试网凭据，请先填写并保存")
+            client = BinanceTestnetClient(
+                api_key=api_key,
+                api_secret=api_secret,
+                base_url=base_url or None,
+            )
+            info = await client.verify()
+            return web.json_response({
+                "ok": True,
+                "tested": True,
+                **info,
+                "note": "币安测试网通信正常；测试过程未下单、撤单或修改账户设置。",
+            })
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response(
+                {"ok": False, "error": f"通信测试失败: {exc}"}, status=400
+            )
+        finally:
+            if client is not None:
+                await client.close()
+
     # ------------------------------------------------------------ 主网凭据（只读）
     #
     # 安全约定（2026-10-05 用户要求，务必遵守）：
@@ -1258,6 +1340,65 @@ def create_app(
             "key_masked": mask_secret(api_key),
             "note": "只读预检通过。这不代表可以安全启动真实交易，"
                     "主网执行仍需人工审查与显式启用。",
+        })
+
+    async def api_alerts(request):
+        """运行器事件告警流（runtime/shadow/alerts.jsonl 尾部，只读）。"""
+        try:
+            limit = int(request.rel_url.query.get("limit", "50"))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 300))
+        path = os.path.join(ROOT, "runtime", "shadow", "alerts.jsonl")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except FileNotFoundError:
+            return web.json_response(
+                {"ok": False, "reason": "alerts_file_missing", "alerts": []}
+            )
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response(
+                {"ok": False, "reason": f"{type(exc).__name__}: {exc}", "alerts": []}
+            )
+        alerts: list = []
+        for line in lines[-limit:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                alerts.append(json.loads(line))
+            except Exception:  # noqa: BLE001
+                continue
+        alerts.reverse()  # 最新在前
+        return web.json_response({"ok": True, "alerts": alerts, "count": len(alerts)})
+
+    async def api_monitor(_request):
+        """运行监控附属数据：行情流健康 / 运行器锁 / 心跳 / 巡检日志尾部（只读）。"""
+        def read_json(name: str):
+            try:
+                with open(
+                    os.path.join(ROOT, "runtime", "shadow", name), encoding="utf-8"
+                ) as fh:
+                    return json.load(fh)
+            except Exception:  # noqa: BLE001
+                return None
+
+        monitor_tail: list = []
+        try:
+            with open(
+                os.path.join(ROOT, "runtime", "shadow", "monitor.log"),
+                encoding="utf-8",
+            ) as fh:
+                monitor_tail = fh.read().splitlines()[-12:]
+        except Exception:  # noqa: BLE001
+            pass
+        return web.json_response({
+            "ok": True,
+            "stream_health": read_json("market_stream_health.json"),
+            "lock": read_json("trader.lock"),
+            "heartbeat": read_json("runner_heartbeat.json"),
+            "monitor_tail": monitor_tail,
         })
 
     async def api_predict_fun_key(request):
@@ -1807,6 +1948,8 @@ def create_app(
     app.router.add_post("/api/paper/test-close", api_paper_test_close)
     app.router.add_post("/api/trading/verify", api_trading_verify)
     app.router.add_post("/api/trading/keys", api_binance_keys)
+    app.router.add_post("/api/trading/keys/save", api_binance_keys_save)
+    app.router.add_post("/api/trading/keys/test", api_binance_keys_test)
     app.router.add_post("/api/mainnet/keys", api_mainnet_keys)
     app.router.add_post("/api/mainnet/forget", api_mainnet_forget)
     app.router.add_post("/api/mainnet/verify", api_mainnet_verify)
@@ -1815,6 +1958,8 @@ def create_app(
     app.router.add_post("/api/scheduler/run", api_scheduler_run)
     app.router.add_get("/api/daily_summaries", api_daily_summaries)
     app.router.add_get("/api/chart", api_chart)
+    app.router.add_get("/api/alerts", api_alerts)
+    app.router.add_get("/api/monitor", api_monitor)
     return app
 
 

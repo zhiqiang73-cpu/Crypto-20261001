@@ -13,28 +13,29 @@
 (() => {
   "use strict";
 
-  const API = location.port === "8787" ? "" : "http://127.0.0.1:8787";
+  // 面板(8787)与本地预览(8799，自带 /api 代理)同源直连；其他静态端口回落面板 API。
+  const API = ["8787", "8799"].includes(location.port) ? "" : "http://127.0.0.1:8787";
   const REFRESH_MS = 5000;
   const $ = (id) => document.getElementById(id);
 
   const COLORS = {
-    up: "#8ac79e",
-    down: "#e58a8a",
-    upFill: "#8ac79e",
-    downFill: "#e58a8a",
-    grid: "#302e2a",
-    gridStrong: "#3a3733",
-    axis: "#9a9184",
-    text: "#c6beb1",
-    ink: "#f5f1e9",
-    kLine: "#7fb3e8",
-    dLine: "#d6a877",
-    jLine: "#6f6a61",
-    dif: "#7fb3e8",
-    dea: "#d6a877",
-    long: "rgba(138,199,158,0.06)",
-    short: "rgba(229,138,138,0.06)",
-    crosshair: "#d97757",
+    up: "#0ecb81",
+    down: "#f6465d",
+    upFill: "#0ecb81",
+    downFill: "#f6465d",
+    grid: "#1f2630",
+    gridStrong: "#2d3644",
+    axis: "#5f6875",
+    text: "#97a1b0",
+    ink: "#eaecef",
+    kLine: "#6aa9ff",
+    dLine: "#d9a441",
+    jLine: "#4a5361",
+    dif: "#6aa9ff",
+    dea: "#d9a441",
+    long: "rgba(14,203,129,0.06)",
+    short: "rgba(246,70,93,0.06)",
+    crosshair: "#f0b90b",
   };
 
   const LAYOUT = { left: 10, right: 78, top: 26, bottom: 24, gap: 12 };
@@ -253,7 +254,7 @@
     ctx.setLineDash([]);
     ctx.fillStyle = COLORS.crosshair;
     ctx.fillRect(R.price.x + R.price.w + 2, py(last.c) - 8, 74, 16);
-    ctx.fillStyle = "#1a1917";
+    ctx.fillStyle = "#17191d";
     ctx.fillText(px(last.c), R.price.x + R.price.w + 6, py(last.c));
 
     // ---- B / S 信号标记 ----
@@ -308,7 +309,7 @@
         ctx.arc(cx, y, 3.4, 0, Math.PI * 2);
         ctx.fillStyle = String(t.side).includes("多") ? COLORS.up : COLORS.down;
         ctx.fill();
-        ctx.strokeStyle = "#1a1917";
+        ctx.strokeStyle = "#12161d";
         ctx.lineWidth = 1.2;
         ctx.stroke();
       }

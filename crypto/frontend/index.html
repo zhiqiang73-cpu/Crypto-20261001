@@ -3,403 +3,290 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>BTC 量化控制台</title>
-  <link rel="stylesheet" href="/styles.css?v=25" />
+  <title>BTC 量化终端</title>
+  <link rel="stylesheet" href="/styles.css?v=2" />
 </head>
 <body>
-  <div class="app-shell">
-    <aside class="sidebar">
-      <div class="brand"><span class="brand-mark">B<span>·</span>Q</span><div><strong>BTC 量化</strong><small>本机交易终端</small></div></div>
-      <div class="mode-pill"><span class="dot amber"></span><div><b id="modeLabel">测试网 · 只读</b><small>主网交易锁定 / 模拟账户</small></div></div>
-      <nav class="nav">
-        <button class="nav-item active" data-view="trading"><span>01</span>交易总览</button>
-        <button class="nav-item" data-view="account"><span>02</span>账户连接</button>
-        <button class="nav-item" data-view="chart"><span>03</span>图片显示确认模块</button>
-      </nav>
-      <section class="sidebar-strategies" aria-label="已配置策略">
-        <div class="sidebar-section-head">
-          <div><p>策略配置</p><h2>已配置策略</h2></div>
-          <span class="sidebar-count" id="sidebarStrategyCount">—</span>
-        </div>
-        <div class="sidebar-strategy-list" id="sidebarStrategyList">
-          <div class="sidebar-strategy-loading">正在读取策略…</div>
-        </div>
-        <p class="sidebar-strategy-note">名称、启用状态和入场规则以本机策略配置为准。</p>
-      </section>
-      <div class="sidebar-bottom">
-        <div class="server-state"><span class="dot green"></span><div><b>本机引擎</b><small id="engineState">等待连接</small></div></div>
-        <small class="build">BTCUSDT + ETHUSDT / USDⓈ-M<br>本机系统 · v0.4</small>
+  <div class="app">
+
+    <!-- ==================== 顶栏：全局状态常驻 ==================== -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">B<span>·</span>Q</span>
+        <b>BTC 量化</b><span class="brand-sub">本机交易终端</span>
       </div>
-    </aside>
+      <nav class="nav" id="nav">
+        <button class="nav-tab active" data-view="desk">交易台</button>
+        <button class="nav-tab" data-view="monitor">监控</button>
+        <button class="nav-tab" data-view="chart">图表</button>
+        <button class="nav-tab" data-view="settings">设置</button>
+      </nav>
+      <div class="topbar-right">
+        <span class="pill" id="modePill"><i class="dot gray"></i><b id="modeLabel">读取中</b></span>
+        <span class="tstat" id="tsEngine"><i class="dot gray"></i><span>引擎</span><b id="tsEngineV">—</b></span>
+        <span class="tstat" id="tsFeed"><i class="dot gray"></i><span>行情</span><b id="tsFeedV">—</b></span>
+        <span class="tstat" id="tsRisk"><i class="dot gray"></i><span>风控</span><b id="tsRiskV">—</b></span>
+        <span class="alert-badge l0" id="alertBadge" title="告警级别（L0 正常 / L3 危险）">L0</span>
+        <span class="clock mono" id="clock">—</span>
+        <button class="btn ghost" id="refreshBtn" title="重新拉取全部数据">刷新 <kbd>R</kbd></button>
+      </div>
+    </header>
+
+    <!-- ==================== 行情条 ==================== -->
+    <div class="ticker">
+      <div class="tick">
+        <span class="sym">BTCUSDT<small>永续</small></span>
+        <span class="px mono" id="tickBTCpx">—</span>
+        <span class="chg mono" id="tickBTCchg">—</span>
+        <svg class="spark" id="sparkBTC" viewBox="0 0 86 24" preserveAspectRatio="none" aria-hidden="true"></svg>
+      </div>
+      <div class="tick">
+        <span class="sym">ETHUSDT<small>永续</small></span>
+        <span class="px mono" id="tickETHpx">—</span>
+        <span class="chg mono" id="tickETHchg">—</span>
+        <svg class="spark" id="sparkETH" viewBox="0 0 86 24" preserveAspectRatio="none" aria-hidden="true"></svg>
+      </div>
+      <div class="tick-meta">
+        <span>资金费年化 <b id="tickFunding">—</b></span>
+        <span>买/卖 <b id="tickSpread">—</b></span>
+        <span id="tickSource">—</span>
+        <span>数据 <b id="tickAge">—</b></span>
+      </div>
+    </div>
+
+    <!-- ==================== 告警横幅（条件显示） ==================== -->
+    <div class="banner l2" id="banner" hidden>
+      <span class="banner-icon" id="bannerIcon">!</span>
+      <div class="banner-body">
+        <b id="bannerTitle">—</b>
+        <span id="bannerDetail">—</span>
+      </div>
+      <div class="banner-actions" id="bannerActions"></div>
+    </div>
 
     <main class="main">
-      <header class="topbar">
-        <div><p class="eyebrow">工作台 / 币安测试网 <span class="header-divider">/</span> BTCUSDT + ETHUSDT</p><h1 id="pageTitle">交易总览<span class="title-period">.</span></h1><p class="page-intro">账户、信号与委托分开展示。每笔记录以交易所订单号核对。</p></div>
-        <div class="top-actions">
-          <span class="sync">
-            <span class="dot green"></span>
-            <span id="syncText">数据同步中</span>
-            <span class="sync-sep">·</span>
-            <span id="liveStamp">正在取数…</span>
-          </span>
-          <button class="ghost-btn" id="refreshBtn">刷新数据 <kbd>R</kbd></button>
-        </div>
-      </header>
 
-      <!-- ================= 第 1 页 · 交易总览 ================= -->
-      <section class="view active" id="view-trading">
-        <div class="risk-strip" id="riskStrip" aria-label="风控状态条">
-          <span class="rs-pill" id="rsMode"><i class="dot amber"></i>读取中…</span>
-          <span class="rs-item"><span class="rs-k">当日盈亏</span><b id="rsDayPnl">—</b></span>
-          <span class="rs-item"><span class="rs-k">日亏额度</span><b id="rsDayLoss">—</b><span class="rs-lim">/ 3%</span></span>
-          <span class="rs-item"><span class="rs-k">回撤</span><b id="rsDrawdown">—</b><span class="rs-lim">/ 10%</span></span>
-          <span class="rs-item"><span class="rs-k">halted</span><b id="rsHalted">—</b></span>
-          <span class="rs-item"><span class="rs-k">心跳</span><b id="rsHeartbeat">—</b></span>
-          <span class="rs-item"><span class="rs-k">错过 K 线</span><b id="rsMissed">—</b></span>
-          <span class="rs-stamp" id="rsStamp">—</span>
-        </div>
+      <!-- ========================================================
+           视图 1 · 交易台
+           ======================================================== -->
+      <section class="view active" id="view-desk">
+        <div class="desk-grid">
+          <div class="col-main">
 
-        <div class="notice-bar"><span class="notice-icon">i</span><div><strong>数据口径</strong><span>钱包余额、持仓与挂单为交易所实时状态；委托与逐笔成交只显示「记录起点」之后的记录（各最多 200 条），起点之前的历史已清零。逐笔成交不等于完整平仓笔数。</span></div><span id="runnerState" class="notice-status">检查运行器…</span></div>
-
-        <div class="notice-bar is-alert" id="externalBar" hidden>
-          <span class="notice-icon">!</span>
-          <div>
-            <strong id="externalTitle">检测到人工干预</strong>
-            <span id="externalDetail">—</span>
-          </div>
-          <button class="mini-btn" id="externalResumeBtn">确认恢复自动开仓</button>
-        </div>
-
-        <div class="sh"><span class="sh-no">01</span><h3>市场</h3><span class="sh-rule"></span><span class="sh-meta" id="mktSource">Binance USDⓈ-M</span></div>
-        <div class="hero-board">
-          <div class="hero-l">
-            <span class="hero-k">BTCUSDT · 标记价格 <em>实时推送</em></span>
-            <span class="hero-v" id="markPrice">连接中…</span>
-            <span class="price-change positive" id="priceChange">等待币安行情推送 <span>公开行情</span></span>
-          </div>
-          <div class="hero-r">
-            <svg class="spark" id="mktSpark" viewBox="0 0 200 56" preserveAspectRatio="none" aria-hidden="true"></svg>
-            <span class="hero-meta" id="mktRange">—</span>
-          </div>
-        </div>
-        <div class="strip">
-          <span class="rs-item"><span class="rs-k">ETHUSDT</span><b id="ethMark">—</b></span>
-          <span class="rs-item"><span class="rs-k">买一 / 卖一</span><b id="mktSpread">—</b></span>
-          <span class="rs-item"><span class="rs-k">资金费年化</span><b id="mktFunding">—</b></span>
-          <span class="rs-stamp" id="mktStamp">—</span>
-        </div>
-
-        <div class="sh"><span class="sh-no">02</span><h3>账户</h3><span class="sh-rule"></span><span class="sh-meta" id="acctMeta">USDT 本位 · 币安测试网</span></div>
-        <div class="kpis k4">
-          <article class="kpi">
-            <span class="k">钱包余额</span>
-            <span class="kpi-v" id="mWallet">—</span>
-            <span class="kpi-d">USDT · 币安账户</span>
-          </article>
-          <article class="kpi">
-            <span class="k">未实现盈亏</span>
-            <span class="sym-pnl-list">
-              <span class="sym-pnl-row"><span class="sym-chip">BTC</span><b class="sym-pnl-value" id="mUnrealBTC">—</b></span>
-              <span class="sym-pnl-row"><span class="sym-chip">ETH</span><b class="sym-pnl-value" id="mUnrealETH">—</b></span>
-            </span>
-            <span class="kpi-d">USDT · 分标的 <span id="posHint">无持仓</span></span>
-          </article>
-          <article class="kpi accent-card">
-            <span class="k">已实现盈亏 · 查询窗口</span>
-            <span class="sym-pnl-list">
-              <span class="sym-pnl-row"><span class="sym-chip">BTC</span><b class="sym-pnl-value" id="mRealBTC">—</b></span>
-              <span class="sym-pnl-row"><span class="sym-chip">ETH</span><b class="sym-pnl-value" id="mRealETH">—</b></span>
-            </span>
-            <span class="kpi-d">USDT · 净盈亏 <span id="realHint">币安逐笔成交</span></span>
-          </article>
-          <article class="kpi">
-            <span class="k">当前回撤</span>
-            <span class="kpi-v" id="acctDrawdown">—</span>
-            <span class="kpi-d">权益峰值回撤 <span id="acctDrawdownBasis">运行记录口径</span></span>
-          </article>
-        </div>
-
-        <div class="panel equity-panel">
-          <div class="panel-head">
-            <div><p class="eyebrow">运行记录口径</p><h2>权益曲线</h2></div>
-            <span class="tag" id="equityMeta">读取中</span>
-          </div>
-          <svg class="equity-svg" id="equitySvg" viewBox="0 0 640 130" preserveAspectRatio="none" aria-hidden="true"></svg>
-          <div class="equity-foot">
-            <span id="equityRange">—</span>
-            <span id="equityPeak">—</span>
-            <span id="equityDd">—</span>
-            <span id="equityStep">—</span>
-          </div>
-        </div>
-
-        <div class="sh"><span class="sh-no">03</span><h3>告警分级</h3><span class="sh-rule"></span><span class="sh-meta">L0 不着色 · 只有 L3 用满饱和红</span></div>
-        <div class="ladder" id="alertLadder">
-          <div class="lv lv-l0" id="lvRow0"><i class="dot"></i><span class="lv-tag">L0</span><span class="lv-text">正常运行</span><span class="lv-body" id="lvBody0">读取中…</span></div>
-          <div class="lv lv-l1" id="lvRow1"><i class="dot"></i><span class="lv-tag">L1</span><span class="lv-text">信息</span><span class="lv-body" id="lvBody1">—</span></div>
-          <div class="lv lv-l2" id="lvRow2"><i class="dot"></i><span class="lv-tag">L2</span><span class="lv-text">注意</span><span class="lv-body" id="lvBody2">—</span></div>
-          <div class="lv lv-l3" id="lvRow3"><i class="dot"></i><span class="lv-tag">L3</span><span class="lv-text">危险</span><span class="lv-body" id="lvBody3">—</span></div>
-        </div>
-
-        <div class="table-panel pos-panel">
-          <div class="panel-head">
-            <div><p class="eyebrow">持仓 / 币安净仓与策略腿</p><h2>当前仓位</h2><p class="subline">数量与保证金用交易所口径（USDT），与币安网页端逐位对应；小字为对应的币数量。所有时间为北京时间（UTC+8）：信号K线在收盘判定，下一根K线开盘才执行。每个标的各自一行策略仓，各自一行币安净仓，BTC 和 ETH 不混加。</p></div>
-            <span class="tag" id="posMarginTag">保证金 —</span>
-            <span class="tag" id="posSideTag">空仓</span>
-          </div>
-          <div class="table-head cols-pos"><span>标的</span><span>来源</span><span>方向</span><span>数量(USDT)</span><span>保证金</span><span>开仓价</span><span>信号K线 · 北京时间</span><span>原因</span><span>浮盈</span></div>
-          <div class="table-body" id="posBox">
-            <div class="empty-state"><span>○</span><div><b>空仓</b><small>当前无持仓</small></div></div>
-          </div>
-          <p class="pos-footnote">同一标的两行的<b>数量应完全相等</b>；一旦不等即为外部干预、漏单或部分成交，需查对账。两行<b>开仓价</b>口径不同：策略腿为下单时的<b>参考价</b>，币安净仓为交易所<b>成交均价</b>（分批成交的加权结果），两者之差会等比投影到<b>浮盈</b>；<b>保证金</b>策略腿按「名义价值 ÷ 杠杆」估算、净仓为交易所逐仓实际占用。逐位核对账户以币安净仓行为准。</p>
-        </div>
-
-        <div class="lower-grid">
-          <article class="panel">
-            <div class="panel-head"><div><p class="eyebrow">当前挂单</p><h2>当前委托</h2></div><span class="tag" id="openOrdersCount">0</span></div>
-            <div class="kv-list" id="openOrdersBox">
-              <div class="empty-state"><span>○</span><div><b>无挂单</b><small>追价完成后不留挂单</small></div></div>
-            </div>
-          </article>
-        </div>
-
-        <div class="sh"><span class="sh-no">06</span><h3>信号判定</h3><span class="sh-rule"></span><span class="sh-meta" id="sigRule">KDJ(9,3,3) + MACD(12,26,9)</span></div>
-        <div class="table-panel sig-panel">
-          <div class="table-head sig-head">
-            <span>策略</span><span>标的 / 周期</span><span>KDJ 位置</span><span>MACD 柱</span><span>交叉</span><span>闸门</span><span>结果</span>
-          </div>
-          <div class="table-body" id="signalBox">
-            <div class="empty-state"><span>○</span><div><b>等待读数</b><small>运行器尚未落盘 latest_reading</small></div></div>
-          </div>
-        </div>
-
-        <section class="quality-section" aria-label="核心指标看板">
-          <div class="section-head quality-head">
-            <div>
-              <p class="eyebrow">表现 · 风险 · 成本</p>
-              <h2>核心指标看板</h2>
-              <p class="subline">六项指标各自独立口径：净盈亏扣手续费且分标的；未实现单独列出；单笔边际按开仓名义金额、不依赖复利；回撤同时看账户权益与分组；胜率与盈亏比并列；交易成本逐项单列。</p>
-            </div>
-            <span class="tag" id="qualityWindow">窗口读取中</span>
-          </div>
-
-          <div class="metrics-grid">
-            <article class="metric-block">
-              <div class="card-kicker">① 已实现净盈亏 <span>· 扣手续费</span></div>
-              <b class="quality-value" id="qRealized">—</b>
-              <div class="metric-rows">
-                <div class="metric-row"><span class="sym-chip">BTC</span><b id="qRealBTC">—</b></div>
-                <div class="metric-row"><span class="sym-chip">ETH</span><b id="qRealETH">—</b></div>
+            <!-- 账户 KPI 条 -->
+            <section class="panel">
+              <div class="kpis">
+                <div class="kpi">
+                  <span class="k">钱包权益</span>
+                  <span class="v mono" id="kpiEquity">—</span>
+                  <span class="d" id="kpiEquitySub">—</span>
+                </div>
+                <div class="kpi">
+                  <span class="k">未实现盈亏</span>
+                  <span class="v mono" id="kpiUpnl">—</span>
+                  <span class="d" id="kpiUpnlSub">—</span>
+                </div>
+                <div class="kpi">
+                  <span class="k">今日盈亏</span>
+                  <span class="v mono" id="kpiDayPnl">—</span>
+                  <span class="d" id="kpiDayPnlSub">—</span>
+                </div>
+                <div class="kpi">
+                  <span class="k">当前回撤</span>
+                  <span class="v mono" id="kpiDd">—</span>
+                  <span class="d" id="kpiDdSub">—</span>
+                </div>
+                <div class="kpi">
+                  <span class="k">已实现净额 · 窗口</span>
+                  <span class="v mono" id="kpiReal">—</span>
+                  <span class="d" id="kpiRealSub">—</span>
+                </div>
+                <div class="kpi">
+                  <span class="k">保证金占用</span>
+                  <span class="v mono" id="kpiMargin">—</span>
+                  <span class="d" id="kpiMarginSub">—</span>
+                </div>
               </div>
-              <small>USDT · 已实现 − 手续费，分标的不混加</small>
-            </article>
+              <div class="footnote" id="kpiFoot">—</div>
+            </section>
 
-            <article class="metric-block">
-              <div class="card-kicker">② 未实现盈亏 <span>· 单独列出</span></div>
-              <b class="quality-value" id="qUnrealized">—</b>
-              <div class="metric-rows">
-                <div class="metric-row"><span class="sym-chip">BTC</span><b id="qUnrealBTC">—</b></div>
-                <div class="metric-row"><span class="sym-chip">ETH</span><b id="qUnrealETH">—</b></div>
+            <!-- 持仓 -->
+            <section class="panel">
+              <header class="ph">
+                <h2>持仓</h2>
+                <span class="tag dim" id="posSideTag">空仓</span>
+                <span class="ph-meta"><span class="mono" id="posMarginTag">保证金 —</span></span>
+              </header>
+              <div class="tbl">
+                <table class="grid">
+                  <thead>
+                    <tr>
+                      <th>合约</th><th>来源</th><th>方向</th>
+                      <th class="num">数量（USDT）</th><th class="num">开仓价</th><th class="num">标记价</th>
+                      <th class="num">保证金</th><th class="num">浮盈</th><th class="c">层</th>
+                      <th>信号 · 原因</th>
+                    </tr>
+                  </thead>
+                  <tbody id="posBox">
+                    <tr><td colspan="10"><div class="empty"><b>空仓</b>当前无持仓</div></td></tr>
+                  </tbody>
+                </table>
               </div>
-              <small>USDT · 当前持仓浮动（分标的合计），不与已实现混合</small>
-            </article>
+              <div class="footnote" id="posFoot">策略腿与币安净仓逐位核对：数量应相等，不等即为干预/漏单。</div>
+            </section>
 
-            <article class="metric-block">
-              <div class="card-kicker">③ 单笔边际 <span>· 开仓名义口径</span></div>
-              <b class="quality-value" id="qEdge">—</b>
-              <div class="metric-rows">
-                <div class="metric-row"><span>开仓名义</span><b id="qOpenNotional">—</b></div>
-                <div class="metric-row"><span>窗口净额</span><b id="qNetForEdge">—</b></div>
+            <!-- 当前委托 -->
+            <section class="panel">
+              <header class="ph">
+                <h2>当前委托</h2>
+                <span class="tag dim" id="openOrdersCount">0</span>
+                <span class="ph-meta" id="openOrdersMeta">—</span>
+              </header>
+              <div class="tbl">
+                <table class="grid">
+                  <thead>
+                    <tr>
+                      <th>时间</th><th>合约</th><th>方向</th><th>性质</th>
+                      <th class="num">价格</th><th class="num">数量</th><th>单号</th>
+                    </tr>
+                  </thead>
+                  <tbody id="openOrdersBox">
+                    <tr><td colspan="7"><div class="empty"><b>无挂单</b>追价完成后不留挂单</div></td></tr>
+                  </tbody>
+                </table>
               </div>
-              <small id="qEdgeBasis">净额 ÷ 开仓腿名义 × 10000，不依赖复利</small>
-            </article>
+            </section>
 
-            <article class="metric-block">
-              <div class="card-kicker">④ 最大回撤 <span>· 账户 + 分组</span></div>
-              <b class="quality-value" id="qDrawdown">—</b>
-              <div class="metric-rows">
-                <div class="metric-row"><span class="sym-chip">BTC</span><b id="qDdBTC">—</b></div>
-                <div class="metric-row"><span class="sym-chip">ETH</span><b id="qDdETH">—</b></div>
-              </div>
-              <small id="qDrawdownBasis">账户权益回撤（%）＋分标的已实现回撤（USDT）</small>
-            </article>
-
-            <article class="metric-block">
-              <div class="card-kicker">⑤ 胜率与盈亏比 <span>· 不只看胜率</span></div>
-              <b class="quality-value" id="qWinRate">—</b>
-              <div class="metric-rows">
-                <div class="metric-row"><span>盈亏比</span><b id="qProfitFactor">—</b></div>
-                <div class="metric-row"><span>平均盈利 / 亏损</span><b id="qAvgWinLoss">—</b></div>
-                <div class="metric-row"><span>盈利 / 亏损笔数</span><b id="qWinLossCount">—</b></div>
-              </div>
-              <small>盈亏比 = 总盈利 ÷ 总亏损；胜率按带已实现盈亏的成交腿统计，必须与盈亏比同时看</small>
-            </article>
-
-            <article class="metric-block">
-              <div class="card-kicker">⑥ 交易成本 <span>· 逐项单列</span></div>
-              <b class="quality-value" id="qCostTotal">—</b>
-              <div class="metric-rows">
-                <div class="metric-row"><span>挂单手续费</span><b id="qFeeMaker">—</b></div>
-                <div class="metric-row"><span>吃单手续费</span><b id="qFeeTaker">—</b></div>
-                <div class="metric-row"><span>资金费</span><b id="qFeeFunding">—</b></div>
-                <div class="metric-row"><span>滑点估算</span><b id="qSlippage">—</b></div>
-              </div>
-              <small id="qCostBasis">USDT · 手续费取自逐笔成交，资金费与滑点口径见下</small>
-            </article>
+            <!-- 历史记录（委托 / 成交） -->
+            <section class="panel">
+              <header class="ph">
+                <h2 id="histTitle">历史记录</h2>
+                <div class="seg" id="histTabs">
+                  <button class="seg-btn active" data-hist="orders">历史委托</button>
+                  <button class="seg-btn" data-hist="trades">历史成交</button>
+                </div>
+                <span class="ph-meta">
+                  <span class="mono" id="histMeta">—</span>
+                  <span class="seg" id="histLimits">
+                    <button class="seg-btn" data-limit="10">10</button>
+                    <button class="seg-btn" data-limit="20">20</button>
+                  </span>
+                </span>
+              </header>
+              <div class="tbl" id="histBox"></div>
+              <div class="footnote" id="histFoot">只显示「记录起点」之后、来源为策略自动的成交；撤单不显示。</div>
+            </section>
           </div>
 
-          <div class="table-panel sym-detail-panel">
-            <div class="panel-head">
-              <div>
-                <p class="eyebrow">分标的拆分</p>
-                <h2>分标的明细</h2>
-                <p class="subline">BTC 与 ETH 各自一行，绝不混加；每行都可独立核对净盈亏、胜率、盈亏比、开仓名义与边际。</p>
-              </div>
-            </div>
-            <div class="table-head cols-sym">
-              <span>标的</span><span>净盈亏(USDT)</span><span>胜率</span><span>盈亏比</span>
-              <span>盈利/亏损笔</span><span>开仓名义(USDT)</span><span>单笔边际</span>
-              <span>已实现回撤(USDT)</span><span>挂单/吃单手续费</span>
-            </div>
-            <div class="table-body" id="symDetailBox">
-              <div class="empty-state"><span>○</span><div><b>等待账户数据</b><small>连接 Testnet 后按标的拆分</small></div></div>
-            </div>
-          </div>
-          <div class="quality-detail-grid">
-            <article class="panel quality-detail-panel">
-              <div class="panel-head"><div><p class="eyebrow">原因</p><h2>原因记录</h2></div><span class="tag" id="qStrategyMode">—</span></div>
-              <div class="quality-list" id="qualityReasons"><div class="empty-state"><span>○</span><div><b>等待汇总</b><small>读取运行记录中的信号与策略原因</small></div></div></div>
-            </article>
-            <article class="panel quality-detail-panel">
-              <div class="panel-head"><div><p class="eyebrow">下一步改进</p><h2>接下来怎么做</h2></div><span class="tag safe">只观察，不自动改策略</span></div>
-              <ol class="quality-actions" id="qualityActions"><li>等待质量快照</li></ol>
-            </article>
-          </div>
-        </section>
+          <!-- 右栏 -->
+          <aside class="col-rail">
 
-        <div class="table-panel">
-          <div class="panel-head">
-            <div><p class="eyebrow">历史委托 / 币安接口</p><h2>历史委托 · 策略成交</h2><p class="subline">显示后端查询窗口内已成交的策略单，撤单不显示。盈亏按该委托下逐笔成交汇总：已实现 − 手续费。</p></div>
-            <div class="hist-tools" aria-label="历史委托显示条数">
-              <button type="button" class="hist-limit-btn is-on" data-limit="10">10</button>
-              <button type="button" class="hist-limit-btn" data-limit="20">20</button>
-            </div>
-          </div>
-          <div class="table-head cols-o10"><span>时间 · 北京时间</span><span>标的</span><span>方向 / 类型</span><span>委托号</span><span>来源</span><span>委托 / 均价</span><span>委托量</span><span>成交量</span><span>盈亏</span><span>状态</span></div>
-          <div class="table-body" id="histOrdersBox"></div>
+            <!-- 系统监控速览 -->
+            <section class="panel">
+              <header class="ph">
+                <h2>系统监控</h2>
+                <button class="link" data-nav="monitor">全部 →</button>
+              </header>
+              <div class="health-list" id="healthList">
+                <div class="hl"><span class="dot gray"></span><span class="hl-k">运行器</span><span class="hl-v">读取中…</span></div>
+              </div>
+            </section>
+
+            <!-- 信号 -->
+            <section class="panel">
+              <header class="ph">
+                <h2>信号</h2>
+                <span class="ph-meta mono" id="sigMeta">—</span>
+              </header>
+              <div class="sig-cards" id="sigCards">
+                <div class="empty"><b>等待读数</b>运行器尚未落盘 latest_reading</div>
+              </div>
+            </section>
+
+            <!-- 事件流 -->
+            <section class="panel">
+              <header class="ph">
+                <h2>事件流</h2>
+                <button class="link" data-nav="monitor">全部 →</button>
+              </header>
+              <div class="feed" id="feedBox">
+                <div class="empty"><b>读取中</b>—</div>
+              </div>
+            </section>
+          </aside>
         </div>
-
-        <div class="table-panel">
-          <div class="panel-head">
-            <div><p class="eyebrow">历史成交 / 币安接口</p><h2>历史成交 · 策略成交</h2><p class="subline">按委托号合并后端查询窗口内的策略成交，一笔委托一行。开仓腿已实现通常为 0；平仓腿才有已实现盈亏。</p></div>
-            <div class="hist-tools" aria-label="历史成交显示条数">
-              <button type="button" class="hist-limit-btn is-on" data-limit="10">10</button>
-              <button type="button" class="hist-limit-btn" data-limit="20">20</button>
-            </div>
-          </div>
-          <div class="table-head cols-t9"><span>时间 · 北京时间</span><span>标的</span><span>订单号 / 成交ID</span><span>来源</span><span>方向 / 角色</span><span>价格 × 数量</span><span>已实现</span><span>手续费</span><span>盈亏</span></div>
-          <div class="table-body" id="histTradesBox"></div>
-        </div>
-
       </section>
 
-      <!-- ================= 第 2 页 · 账户连接 ================= -->
-      <section class="view" id="view-account">
-        <div class="section-head">
-          <div>
-            <p class="eyebrow">币安合约测试网</p>
-            <h2>账户连接与密钥</h2>
-            <p class="subline">密钥只提交到本机后端并保存在本地 secrets 文件，不会发送到聊天或主网。</p>
-          </div>
-          <span class="tag paused">仅测试网</span>
-        </div>
+      <!-- ========================================================
+           视图 2 · 监控（100% 覆盖）
+           ======================================================== -->
+      <section class="view" id="view-monitor">
+        <div class="mon-grid">
 
-        <div class="account-grid">
-          <form class="account-form" id="accountForm">
-            <label>API Key<input id="apiKeyInput" type="text" autocomplete="off" spellcheck="false" placeholder="粘贴 Testnet API Key" required></label>
-            <label>API Secret<input id="apiSecretInput" type="password" autocomplete="new-password" placeholder="粘贴 Testnet API Secret" required></label>
-            <label>Base URL<input id="baseUrlInput" type="url" value="https://testnet.binancefuture.com" required></label>
-            <button class="primary-btn" type="submit">保存并验证 Testnet 连接</button>
-            <button class="secondary-btn" type="button" id="testnetSmokeBtn">非策略功能测试：0.001 BTC 入场后平仓（产生历史成交）</button>
-            <button class="secondary-btn" type="button" id="testnetFlattenBtn">立即平掉当前 Testnet 仓位</button>
-            <button class="secondary-btn" type="button" id="reconcileBtn">立即对账（修复陈旧阻塞）</button>
-            <p class="form-note" id="accountResult">尚未提交密钥。请确认使用的是重新生成的 Testnet Key。</p>
-          </form>
-          <div class="account-state">
-            <div class="card-kicker">连接状态</div>
-            <div class="connection-big" id="accountConnection">未配置</div>
-            <div class="account-line"><span>账户余额</span><b id="accountBalance">—</b></div>
-            <div class="account-line"><span>交易所仓位</span><b id="accountPosition">—</b></div>
-            <div class="account-line"><span>交易权限</span><b class="blocked">纸面 / 测试网</b></div>
-            <div class="account-line"><span>对账状态</span><b id="reconcileState">—</b></div>
-            <div class="account-line"><span>运行模式</span><b id="accountMode">—</b></div>
-          </div>
-        </div>
+          <section class="panel span4">
+            <header class="ph"><h2>运行器</h2><span class="ph-meta" id="mrMeta">—</span></header>
+            <div class="kv" id="mrKv"></div>
+          </section>
 
-        <!-- ---------------- 主网凭据（只读验收，默认禁用执行） ---------------- -->
-        <div class="panel mainnet-panel">
-          <div class="panel-head">
-            <div>
-              <p class="eyebrow">Binance USDⓈ-M 主网 · 只读</p>
-              <h2>主网 API 凭据部署（只读验收）</h2>
-              <p class="subline">
-                凭据只保存在本机 <code>runtime/secrets.json</code>（权限 600，已排除在 Git 之外）。
-                测试连接只发送两个 GET 请求：<code>/fapi/v1/time</code> 与签名 <code>/fapi/v2/account</code>，
-                <b>不下单、不撤单、不改杠杆、不划转</b>。保存或测试成功都不会启用主网交易。
-              </p>
-            </div>
-            <span class="tag paused">默认禁用执行</span>
-          </div>
+          <section class="panel span4">
+            <header class="ph"><h2>行情链路</h2><span class="ph-meta" id="mfMeta">—</span></header>
+            <div class="kv" id="mfKv"></div>
+          </section>
 
-          <div class="mainnet-warning">
-            <b>上线前必读</b>
-            <span>
-              请新建一把专用主网 Key：仅勾选「读取」+「USDⓈ-M 合约交易」，<b>禁止提现、禁止资金划转</b>，
-              并绑定固定 IP 白名单。任何曾出现在聊天、截图或剪贴板历史的 Key 都必须先撤销再重建。
-            </span>
-          </div>
+          <section class="panel span4">
+            <header class="ph"><h2>风控闸门</h2><span class="ph-meta" id="mrkMeta">—</span></header>
+            <div class="kv" id="mrkKv"></div>
+          </section>
 
-          <div class="account-grid">
-            <form class="account-form" id="mainnetForm">
-              <label>主网 API Key<input id="mainnetKeyInput" type="text" autocomplete="off" spellcheck="false" placeholder="粘贴 binance.com 主网 Futures API Key"></label>
-              <label>主网 API Secret<input id="mainnetSecretInput" type="password" autocomplete="new-password" placeholder="粘贴主网 API Secret"></label>
-              <label>Base URL（固定，不可改）<input id="mainnetBaseUrlInput" type="url" value="https://fapi.binance.com" readonly></label>
-              <button class="primary-btn" type="button" id="mainnetSaveBtn">保存到本机（不启用主网交易）</button>
-              <button class="secondary-btn" type="button" id="mainnetVerifyBtn">测试连接（仅签名只读，不下单）</button>
-              <button class="secondary-btn danger" type="button" id="mainnetForgetBtn">删除本机保存的主网凭据</button>
-              <p class="form-note" id="mainnetResult">尚未保存主网凭据。</p>
-            </form>
+          <section class="panel span6">
+            <header class="ph"><h2>执行与保护</h2><span class="ph-meta" id="mprMeta">—</span></header>
+            <div class="kv" id="mprKv"></div>
+            <div class="footnote" id="mprActionsFoot">最近动作</div>
+            <div class="mono-block" id="mprActions">—</div>
+          </section>
 
-            <div class="account-state">
-              <div class="card-kicker">主网凭据状态</div>
-              <div class="connection-big blocked" id="mainnetConnection">未配置</div>
-              <div class="account-line"><span>已保存 Key</span><b id="mainnetKeyMasked">—</b></div>
-              <div class="account-line"><span>目标地址</span><b id="mainnetBaseUrl">—</b></div>
-              <div class="account-line"><span>只读预检</span><b id="mainnetVerifyState">—</b></div>
-              <div class="account-line"><span>主网执行</span><b class="blocked">已禁用</b></div>
-            </div>
-          </div>
+          <section class="panel span6">
+            <header class="ph"><h2>账本对账</h2><span class="ph-meta" id="mrcMeta">—</span></header>
+            <div class="kv" id="mrcKv"></div>
+            <div class="footnote">人工干预检测</div>
+            <div class="kv" id="mrcExt"></div>
+          </section>
 
-          <div class="mainnet-steps">
-            <div class="mainnet-step"><span>1</span><div><b>你本人保存并测试</b><small>只读预检通过，只证明这把 Key 能读取主网合约账户。</small></div></div>
-            <div class="mainnet-step"><span>2</span><div><b>你本人执行部署前验收</b><small>核对持仓模式 / 逐仓 / 杠杆 / 精度 / 最低下单量 / 保护单可挂。</small></div></div>
-            <div class="mainnet-step"><span>3</span><div><b>你本人显式启用主网执行</b><small>需要修改运行模式并重启运行器——这一步只能由你操作。</small></div></div>
-            <div class="mainnet-step"><span>4</span><div><b>回滚入口</b><small>停止运行器 → 恢复 <code>TRADING_MODE=testnet</code> → 重启；或删除主网凭据。</small></div></div>
-          </div>
+          <section class="panel span6">
+            <header class="ph"><h2>数据覆盖与成本</h2><span class="ph-meta" id="mcvMeta">—</span></header>
+            <div class="kv" id="mcvKv"></div>
+          </section>
+
+          <section class="panel span6">
+            <header class="ph"><h2>巡检快照</h2><span class="ph-meta" id="msnapMeta">—</span></header>
+            <div class="mono-block" id="msnapBox">—</div>
+            <div class="footnote" id="msnapFoot">每小时巡检写一行：权益 / 开平仓计数 / 熔断 / 最后 K 线。</div>
+          </section>
+
+          <section class="panel span12">
+            <header class="ph">
+              <h2>事件日志</h2>
+              <div class="feed-toolbar" id="evtFilters">
+                <button class="seg-btn btn sm" data-evt="all">全部</button>
+                <button class="seg-btn btn sm" data-evt="CRITICAL">仅 CRITICAL</button>
+                <button class="seg-btn btn sm" data-evt="WARN">仅 WARN</button>
+              </div>
+              <span class="ph-meta mono" id="evtMeta">—</span>
+            </header>
+            <div class="feed" id="evtBox" style="max-height: 380px;"></div>
+          </section>
         </div>
       </section>
-      <!-- ================= 第 3 页 · 图片显示确认模块 ================= -->
+
+      <!-- ========================================================
+           视图 3 · 图表（K线 / KDJ / MACD / B·S 信号）
+           ======================================================== -->
       <section class="view" id="view-chart">
-        <div class="notice-bar">
-          <span class="notice-icon">i</span>
-          <div>
-            <strong>图片显示确认模块</strong>
-            <span>把 bot 真正使用的测试网行情画出来：KDJ(9,3,3) 的 K / D 线、MACD(12,26,9) 能量柱，以及策略的 B / S 信号。B = 金叉且 MACD 柱为正；S = 死叉且 MACD 柱为负；标记画在信号 K 线上，实际执行在其下一根 K 线开盘。方向背离的交叉已按规则丢弃。策略是单仓不加仓：已持多时再出同向 B 只画空心标记、不动作，只有对侧信号才反手。本页只读展示，不下单。</span>
-          </div>
-          <span id="chartStatus" class="chart-status">正在取数…</span>
-        </div>
-
-        <div class="panel chart-panel">
+        <section class="panel">
+          <header class="ph">
+            <h2>图表确认</h2>
+            <span class="ph-meta" id="chartStatus">正在取数…</span>
+          </header>
           <div class="chart-controls">
             <div class="seg" role="group" aria-label="标的">
               <button type="button" class="seg-btn" data-chart-symbol="BTCUSDT">BTCUSDT</button>
@@ -420,40 +307,147 @@
             <label class="chart-check"><input type="checkbox" id="chartShowSignals" checked><span>显示 B / S</span></label>
             <label class="chart-check"><input type="checkbox" id="chartShowTrades" checked><span>显示成交</span></label>
             <label class="chart-check"><input type="checkbox" id="chartAuto" checked><span>自动刷新</span></label>
-            <button class="ghost-btn" id="chartRefreshBtn">立即刷新</button>
+            <button class="btn ghost sm" id="chartRefreshBtn">立即刷新</button>
           </div>
           <div class="chart-meta" id="chartMeta">正在读取行情…</div>
           <div class="chart-legend">
-            <span class="lg"><i class="sw-up"></i>阳线 / 绿柱(柱&gt;0)</span>
-            <span class="lg"><i class="sw-down"></i>阴线 / 红柱(柱&lt;0)</span>
+            <span class="lg"><i class="sw-up"></i>阳线 / 绿柱(&gt;0)</span>
+            <span class="lg"><i class="sw-down"></i>阴线 / 红柱(&lt;0)</span>
             <span class="lg"><i class="sw-k"></i>K 线 / DIF</span>
             <span class="lg"><i class="sw-d"></i>D 线 / DEA</span>
             <span class="lg"><i class="sw-long"></i>底纹＝推演持多</span>
             <span class="lg"><i class="sw-short"></i>底纹＝推演持空</span>
             <span class="lg"><i class="sw-repeat"></i>空心＝重复信号（不动作）</span>
-            <span class="chart-zoom" id="chartZoomInfo"></span>
-            <button type="button" class="ghost-btn chart-zoom-reset" id="chartZoomReset">复位视图</button>
+            <span class="chart-zoom mono" id="chartZoomInfo"></span>
+            <button type="button" class="btn ghost sm" id="chartZoomReset">复位视图</button>
           </div>
-          <div class="chart-wrap">
-            <canvas id="chartCanvas"></canvas>
-          </div>
-        </div>
+          <div class="chart-wrap"><canvas id="chartCanvas"></canvas></div>
+        </section>
 
-        <div class="table-panel">
-          <div class="panel-head">
-            <div>
-              <p class="eyebrow">窗口内信号</p>
-              <h2>B / S 信号明细</h2>
-              <p class="subline">按部署规格逐根判定：金叉且 MACD 柱为正 → B；死叉且柱为负 → S；方向背离的交叉一律丢弃。数值与图上、与运行器同源，可直接逐笔核对。</p>
-            </div>
-          </div>
-          <div class="table-body chart-signal-body" id="chartSignalBox"></div>
-        </div>
+        <section class="panel" style="margin-top: 12px;">
+          <header class="ph">
+            <h2>B / S 信号明细</h2>
+            <span class="ph-meta">金叉且柱为正 → B；死叉且柱为负 → S；背离丢弃</span>
+          </header>
+          <div class="table-body" id="chartSignalBox"></div>
+        </section>
       </section>
 
+      <!-- ========================================================
+           视图 4 · 设置（账户连接 / 参数 / 危险操作）
+           ======================================================== -->
+      <section class="view" id="view-settings">
+        <div class="set-grid">
+
+          <section class="panel span6">
+            <header class="ph"><h2>账户连接与密钥</h2><span class="tag dim">仅测试网</span></header>
+            <form class="form" id="accountForm">
+              <label>API Key<input id="apiKeyInput" type="text" autocomplete="off" spellcheck="false" placeholder="粘贴 Testnet API Key" required></label>
+              <label>API Secret<input id="apiSecretInput" type="password" autocomplete="new-password" placeholder="粘贴 Testnet API Secret" required></label>
+              <label>Base URL<input id="baseUrlInput" type="url" value="https://testnet.binancefuture.com" required></label>
+              <div class="row">
+                <button class="btn primary" type="submit">保存到本机</button>
+                <button class="btn" type="button" id="testnetTestBtn">测试通信</button>
+              </div>
+              <p class="form-note" id="accountResult">密钥只提交到本机后端并保存在本地；测试通信只读，不会下单。</p>
+            </form>
+          </section>
+
+          <section class="panel span6">
+            <header class="ph"><h2>连接状态与交易所设置</h2></header>
+            <div class="kv" id="setConnKv"></div>
+          </section>
+
+          <section class="panel span12">
+            <header class="ph"><h2>运行参数</h2><span class="ph-meta" id="setParamsMeta">—</span></header>
+            <div class="kv" id="setParamsKv"></div>
+          </section>
+
+          <!-- ---------------- 主网凭据（真实资金 · 默认禁用执行） ---------------- -->
+          <section class="panel mainnet-zone span12">
+            <header class="ph">
+              <h2>主网 API 凭据</h2>
+              <span class="tag warn">真实资金 · 默认禁用执行</span>
+            </header>
+            <div class="mn-hero">
+              <div class="mn-big blocked" id="mainnetConnection">未配置</div>
+              <p class="mn-lead">
+                这组凭据用于<b>真实资金</b>交易（binance.com 主网合约），只保存在本机
+                <code>runtime/secrets.json</code>（权限 600、不进 Git）。
+                「测试连接」只做两个只读请求：<code>GET /fapi/v1/time</code> 与签名
+                <code>GET /fapi/v2/account</code> —— <b>不下单、不撤单、不改杠杆、不划转</b>。
+                保存或测试成功都不会自动启用主网交易。
+              </p>
+            </div>
+            <div class="mn-grid">
+              <form class="form" id="mainnetForm">
+                <label>主网 API Key<input id="mainnetKeyInput" type="text" autocomplete="off" spellcheck="false" placeholder="粘贴 binance.com 主网 Futures API Key"></label>
+                <label>主网 API Secret<input id="mainnetSecretInput" type="password" autocomplete="new-password" placeholder="粘贴主网 API Secret"></label>
+                <label>Base URL（固定）<input id="mainnetBaseUrlInput" type="url" value="https://fapi.binance.com" readonly></label>
+                <div class="row">
+                  <button class="btn primary lg" type="button" id="mainnetSaveBtn">保存到本机</button>
+                  <button class="btn lg" type="button" id="mainnetVerifyBtn">测试连接（只读）</button>
+                  <button class="btn danger lg" type="button" id="mainnetForgetBtn">删除凭据</button>
+                </div>
+                <p class="form-note" id="mainnetResult">尚未保存主网凭据。</p>
+              </form>
+              <div class="mn-state">
+                <div class="kv" id="mnKv"></div>
+              </div>
+            </div>
+            <div class="warn-box">
+              <b>上线前必读</b>
+              <span>
+                新建一把<b>专用</b>主网 Key：只勾「读取」+「USDⓈ-M 合约交易」，
+                <b>禁止提现、禁止划转</b>，并绑定固定 IP 白名单。
+                任何出现在过聊天、截图或剪贴板里的 Key 都要先撤销再重建。
+              </span>
+            </div>
+            <ol class="mn-steps">
+              <li><span class="n">1</span><div><b>保存并测试</b><small>只读预检通过，只证明这把 Key 能读取主网合约账户。</small></div></li>
+              <li><span class="n">2</span><div><b>部署前验收</b><small>核对持仓模式 / 逐仓 / 杠杆 / 精度 / 最低下单量 / 保护单可挂。</small></div></li>
+              <li><span class="n">3</span><div><b>显式启用主网执行</b><small>修改运行模式并重启运行器（需你确认后执行）。</small></div></li>
+              <li><span class="n">4</span><div><b>回滚入口</b><small>停止运行器 → 恢复 <code>TRADING_MODE=testnet</code> → 重启；或删除主网凭据。</small></div></li>
+            </ol>
+          </section>
+
+          <section class="panel danger-zone span12">
+            <header class="ph"><h2>危险操作</h2><span class="ph-meta">均需二次确认 · 只作用于测试网</span></header>
+            <div class="dz-row">
+              <span class="t">立即对账</span>
+              <span class="d">修复陈旧阻塞：让面板与交易所状态重新同步。</span>
+              <span class="a"><button class="btn sm" id="reconcileBtn">执行对账</button></span>
+            </div>
+            <div class="dz-row">
+              <span class="t">恢复自动开仓</span>
+              <span class="d" id="dzResumeDesc">检测到人工干预且未确认时，运行器会暂停该标的自动开仓。</span>
+              <span class="a"><button class="btn sm" id="externalResumeBtn" data-symbol="" disabled>确认恢复</button></span>
+            </div>
+            <div class="dz-row">
+              <span class="t">立即平掉当前 Testnet 仓位</span>
+              <span class="d">按交易所净额平仓；属于运行器策略账本的仓位默认拒绝。</span>
+              <span class="a"><button class="btn sm danger" id="testnetFlattenBtn">平仓</button></span>
+            </div>
+            <div class="dz-row">
+              <span class="t">非策略功能测试</span>
+              <span class="d">0.001 BTC 入场后平仓，产生真实委托与手续费；需输入确认词。</span>
+              <span class="a"><button class="btn sm danger" id="testnetSmokeBtn">执行功能测试</button></span>
+            </div>
+          </section>
+        </div>
+      </section>
     </main>
+
+    <footer class="foot">
+      <span>BTCUSDT + ETHUSDT · USDⓈ-M 永续 · 币安测试网</span>
+      <span id="footSync">—</span>
+      <span class="right">本机系统 v0.5 · 交易所风格重做</span>
+    </footer>
   </div>
-  <script src="/chart.js?v=4"></script>
-  <script src="/app.js?v=46"></script>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="/chart.js?v=2"></script>
+  <script src="/app.js?v=2"></script>
 </body>
 </html>

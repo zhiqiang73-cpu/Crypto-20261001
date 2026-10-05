@@ -1,161 +1,50 @@
-/* BTC Quant Console — 两页前端
- * 第 1 页 交易总览: 余额 / 仓位 / 当前委托 / 策略 / 赚了多少 / 历史委托 / 历史成交
- * 第 2 页 账户连接: API Key 管理与连接状态
+/* BTC 量化终端 · 交易所风格控制台
+ * ---------------------------------------------------------------------------
+ * 数据一律来自本机面板 API（同源 8787 或跨端口回落），金额/仓位/委托/成交
+ * 取自币安接口，不由本地账本推算；离线时显示明确的「不可达」状态，绝不伪造。
  *
- * 原则: 金额、仓位、委托、成交一律取自币安接口, 不由本地账本推算。
+ * 视图：交易台（重点信息）/ 监控（100% 覆盖）/ 图表 / 设置
+ * 监控纪律：正常态安静；异常由横幅、徽标与监控清单喊出来；风控状态常驻可见。
  */
 (() => {
   "use strict";
 
-  // 面板已同源服务前端：8787 直连用相对路径（无 CORS），
-  // 其他端口（如 8788 静态服务）仍回落到本机 8787 API。
-  const API = location.port === "8787" ? "" : "http://127.0.0.1:8787";
+  // 面板(8787)与本地预览(8799，自带 /api 代理)同源直连；其他静态端口回落面板 API。
+  const API = ["8787", "8799"].includes(location.port) ? "" : "http://127.0.0.1:8787";
   const REFRESH_MS = 20000;
   const $ = (id) => document.getElementById(id);
 
-  const VIEW_TITLES = {
-    trading: "交易总览",
-    account: "账户连接",
-    chart: "图片显示确认模块",
-  };
-  let currentView = "trading";
+  const VIEWS = ["desk", "monitor", "chart", "settings"];
+  let currentView = "desk";
   let timer = null;
-  let markSocket = null;
-  // 记录起点由 /api/account/summary.record_start_ms 下发（精确到分钟）；
-  // 前端不定义起点，也不允许用「今天」这种粗口径把起点前的记录放进来。
-  let historyStartMs = 0;
+  let clockTimer = null;
+  let lastSyncAt = 0;
+  let apiFailStreak = 0;
+
+  // 数据缓存（同一轮刷新内绝不重复请求同一接口）
+  let statusCache = null;
+  let summaryCache = null;
+  let readingCache = null;
+  let equityCache = null;
+  let monitorCache = null;
+  let alertsCache = null;
+  let marketCache = null;
+  let ordersCache = [];
+  let tradesCache = [];
+  let sparks = { BTCUSDT: null, ETHUSDT: null };
+  let sparkFetchedAt = 0;
+  let wsAliveAt = 0;
+
+  // 历史记录显示设置（沿用旧键，用户原设置不丢）
   const HISTORY_LIMITS = [10, 20];
   const historyLimitKey = "crypto.histLimit";
   let historyLimit = 10;
   try {
     const saved = Number(localStorage.getItem(historyLimitKey) || 10);
     if (HISTORY_LIMITS.includes(saved)) historyLimit = saved;
-  } catch (e) {
-    historyLimit = 10;
-  }
-
-  const coin = (symbol) => {
-    const text = String(symbol || "").toUpperCase();
-    if (text.startsWith("ETH")) return "ETH";
-    if (text.startsWith("BTC")) return "BTC";
-    return text.replace("USDT", "") || "—";
-  };
-
-  // 交易所返回 LONG / SHORT / FLAT，界面统一显示中文。
-  const sideZh = (side) => {
-    const s = String(side || "FLAT").toUpperCase();
-    return s === "LONG" ? "多" : s === "SHORT" ? "空" : "空仓";
-  };
-
-  const coinCell = (symbol) =>
-    `<span class="sym-chip">${esc(coin(symbol))}</span>`;
-
-  const SOURCE_ZH = {
-    strategy: "策略自动",
-    manual_web: "网页手动",
-    function_test: "功能测试",
-    user_action: "面板手动",
-    unknown: "未判定",
-  };
-
-  const sourceCell = (row) => {
-    const key = String(row.source || "unknown");
-    return `<span class="src src-${esc(key)}">${esc(
-      SOURCE_ZH[key] || row.source_label || key
-    )}</span>`;
-  };
-
-  const isHistoryRow = (row) =>
-    String(row.source || "") === "strategy" &&
-    (!historyStartMs ||
-      Number(row.time ?? row.updateTime ?? 0) >= historyStartMs);
-
-  const isFilledOrder = (row) =>
-    isHistoryRow(row) && Number(row.executedQty || 0) > 0;
-
-  const newestFirst = (rows, getMs) =>
-    rows.slice().sort((a, b) => Number(getMs(b) || 0) - Number(getMs(a) || 0));
-
-  const takeHistory = (rows) => rows.slice(0, historyLimit);
-
-  const collapseTradesByOrder = (trades) => {
-    const by = {};
-    (trades || []).filter(isHistoryRow).forEach((t) => {
-      const id = String(t.orderId || "");
-      if (!id) return;
-      if (!by[id]) {
-        by[id] = {
-          orderId: id,
-          time: t.time,
-          source: t.source,
-          source_label: t.source_label,
-          symbol: t.symbol || "",
-          side: t.side,
-          maker: true,
-          qty: 0,
-          notional: 0,
-          realized: 0,
-          commission: 0,
-          fills: 0,
-        };
-      }
-      const row = by[id];
-      row.symbol = row.symbol || t.symbol || "";
-      row.time = Math.max(Number(row.time || 0), Number(t.time || 0));
-      row.qty += Number(t.qty || 0);
-      row.notional += Number(t.price || 0) * Number(t.qty || 0);
-      row.realized += Number(t.realizedPnl || 0);
-      row.commission += Number(t.commission || 0);
-      row.fills += 1;
-      row.maker = row.maker && !!t.maker;
-    });
-    return Object.values(by);
-  };
-
-  const syncHistoryLimitButtons = () => {
-    document.querySelectorAll(".hist-limit-btn").forEach((btn) => {
-      btn.classList.toggle("is-on", Number(btn.dataset.limit) === historyLimit);
-    });
-  };
-
-  const setHistoryLimit = (n) => {
-    const next = HISTORY_LIMITS.includes(Number(n)) ? Number(n) : 10;
-    historyLimit = next;
-    try {
-      localStorage.setItem(historyLimitKey, String(next));
-    } catch (e) {
-      /* ignore */
-    }
-    syncHistoryLimitButtons();
-  };
-
-  const orderPnlMap = (trades) => {
-    const map = {};
-    (trades || []).forEach((t) => {
-      const id = String(t.orderId || "");
-      if (!id) return;
-      if (!map[id]) map[id] = { realized: 0, commission: 0 };
-      map[id].realized += Number(t.realizedPnl || 0);
-      map[id].commission += Number(t.commission || 0);
-    });
-    return map;
-  };
-
-  const netPnl = (realized, commission) =>
-    Number(realized || 0) - Number(commission || 0);
-
-  const runnerStatusText = (runner) => {
-    if (!runner) return "无运行器心跳 · 当前未确认运行";
-    const age = Date.now() - Number(runner.updated_ms || 0);
-    const mode = runner.mode === "testnet_orders" ? "测试网自动下单"
-      : runner.mode === "observation_only" ? "仅观察" : runner.mode || "未知模式";
-    if (age > 60 * 1000) return `心跳过期 ${Math.floor(age / 1000)} 秒 · ${mode}`;
-    if (runner.status === "running") return `运行中 · ${mode}`;
-    if (runner.status === "starting") return `正在启动 · ${mode}`;
-    if (runner.status === "blocked") return `启动被拦截 · ${runner.detail || mode}`;
-    if (runner.status === "error") return `运行异常 · ${runner.detail || mode}`;
-    return `已停止 · ${runner.detail || mode}`;
-  };
+  } catch (e) { historyLimit = 10; }
+  let histMode = "orders";
+  let evtFilter = "all";
 
   // ------------------------------------------------------------------ utils
   const num = (v, d = 2) =>
@@ -166,30 +55,67 @@
           maximumFractionDigits: d,
         });
 
+  const numOrNull = (v) =>
+    v === undefined || v === null || v === "" || Number.isNaN(Number(v))
+      ? null
+      : Number(v);
+
   const signed = (v, d = 2) => {
     if (v === null || v === undefined || Number.isNaN(Number(v))) return "—";
     const n = Number(v);
     return (n >= 0 ? "+" : "") + num(n, d);
   };
 
-  const pct = (v, d = 1) =>
+  const pct = (v, d = 2) =>
     v === null || v === undefined || Number.isNaN(Number(v))
       ? "—"
       : (Number(v) * 100).toFixed(d) + "%";
 
-  const pnlClass = (v) => {
+  const signedPct = (v, d = 2) => {
+    if (v === null || v === undefined || Number.isNaN(Number(v))) return "—";
     const n = Number(v);
-    if (!Number.isFinite(n) || n === 0) return "";
-    return n > 0 ? "positive" : "negative";
+    return (n >= 0 ? "+" : "") + (n * 100).toFixed(d) + "%";
   };
 
-  const setPnl = (el, v, d = 2) => {
-    if (!el) return;
-    el.textContent = signed(v, d);
-    el.classList.remove("positive", "negative");
-    const c = pnlClass(v);
-    if (c) el.classList.add(c);
+  const esc = (s) =>
+    String(s === null || s === undefined ? "" : s).replace(
+      /[&<>"']/g,
+      (c) =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+    );
+
+  const coin = (symbol) => {
+    const text = String(symbol || "").toUpperCase();
+    if (text.startsWith("ETH")) return "ETH";
+    if (text.startsWith("BTC")) return "BTC";
+    return text.replace("USDT", "") || "—";
   };
+
+  const coinChip = (symbol) => {
+    const c = coin(symbol);
+    const cls = c === "BTC" ? "btc" : c === "ETH" ? "eth" : "";
+    return `<span class="chip ${cls}">${esc(c)}</span>`;
+  };
+
+  const sideZh = (side) => {
+    const s = String(side || "FLAT").toUpperCase();
+    return s === "LONG" ? "多" : s === "SHORT" ? "空" : "空仓";
+  };
+
+  const sideChip = (side) => {
+    const s = String(side || "FLAT").toUpperCase();
+    const cls = s === "LONG" ? "long" : s === "SHORT" ? "short" : "flat";
+    return `<span class="chip ${cls}">${sideZh(s)}</span>`;
+  };
+
+  const pnlCls = (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n === 0) return "";
+    return n > 0 ? "up" : "down";
+  };
+
+  const pnlHtml = (v, d = 2) =>
+    `<span class="${pnlCls(v)}">${signed(v, d)}</span>`;
 
   const fmtTime = (ms) => {
     if (!ms) return "—";
@@ -201,1192 +127,1253 @@
       hourCycle: "h23",
     }).format(d);
   };
+  const fmtMDHM = (ms) => {
+    const s = fmtTime(ms);
+    return s === "—" ? "—" : s.slice(5, 16); // 10-05 09:54
+  };
+  const fmtHMS = (ms) => {
+    const s = fmtTime(ms);
+    return s === "—" ? "—" : s.slice(11); // 09:54:02
+  };
 
-  // 所有面向用户的交易所/策略时间统一为北京时间（UTC+8）。
-  // 策略的 bar_ms 是K线开盘时刻；信号必须等待该根收盘，实际下单是下一根开盘。
+  // 信号 K 线：bar_ms 是该根开盘时刻，信号须等收盘、下一根开盘执行
   const fmtKlineBeijing = (ms, interval) => {
     if (!ms) return "—";
     const start = fmtTime(ms);
     const mins = String(interval || "15m").toLowerCase() === "5m" ? 5 : 15;
     const end = fmtTime(Number(ms) + mins * 60_000);
     if (start === "—" || end === "—") return "—";
-    // 同一天时仅重复结束时分，不把“11:45”误解为这一刻即时下单。
-    return `${start.slice(0, 16)}–${end.slice(11, 16)} 北京时间`;
+    return `${start.slice(5, 16)}–${end.slice(11, 16)}`;
   };
 
-  const esc = (s) =>
-    String(s === null || s === undefined ? "" : s).replace(
-      /[&<>"']/g,
-      (c) =>
-        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
-    );
-
-  const empty = (msg, sub = "") =>
-    `<div class="empty-state"><span>○</span><div><b>${esc(msg)}</b>${
-      sub ? `<small>${esc(sub)}</small>` : ""
-    }</div></div>`;
-
-  async function api(path, opts) {
-    const res = await fetch(API + path, opts);
-    const text = await res.text();
-    let data;
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch (e) {
-      throw new Error(`返回非 JSON (HTTP ${res.status}): ${text.slice(0, 120)}`);
-    }
-    return data;
-  }
-
-  // ------------------------------------------------------------------- nav
-  function switchView(name) {
-    currentView = name;
-    document.querySelectorAll(".nav-item").forEach((b) =>
-      b.classList.toggle("active", b.dataset.view === name)
-    );
-    document.querySelectorAll(".view").forEach((s) =>
-      s.classList.toggle("active", s.id === "view-" + name)
-    );
-    if ($("pageTitle")) $("pageTitle").textContent = VIEW_TITLES[name] || name;
-    // 第 3 页自带渲染与刷新循环，进入时启动、离开时停止，避免后台空转取数。
-    if (name === "chart") {
-      if (window.ChartModule) window.ChartModule.enter();
-    } else if (window.ChartModule) {
-      window.ChartModule.leave();
-    }
-    if (name === "trading") refreshTrading();
-    else if (name === "account") refreshAccount();
-  }
-
-  // ------------------------------------------------------------- 实时行情
-  //
-  // WS 地址**由后端下发**, 不再硬编码。
-  // 历史事故：前端曾写死主网 WS 地址, 与测试网下单错位。
-  // 现在拿不到后端下发的地址就只重试, 绝不退回主网 ——
-  // 宁可暂时无行情, 也不显示另一个市场的价格。
-  let marketWsUrl = null;
-  let marketLabel = "";
-
-  function renderPrice(price) {
-    const n = Number(price);
-    if (!Number.isFinite(n)) return;
-    if ($("markPrice"))
-      $("markPrice").textContent =
-        "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    const tag = marketLabel
-      ? `币安${marketLabel.replace(/\s*\(.*?\)\s*/, "")}`
-      : "币安";
-    if ($("priceChange")) $("priceChange").innerHTML = `实时推送中 · <span>${tag} 行情推送</span>`;
-    if ($("syncText")) $("syncText").textContent = `${tag} 实时同步`;
-    if ($("engineState")) $("engineState").textContent = "行情已连接";
-  }
-
-  async function resolveMarketWs() {
-    try {
-      const d = await api("/api/market");
-      if (d && d.ok && d.market_ws) {
-        marketWsUrl = d.market_ws + "?streams=btcusdt@markPrice@1s";
-        marketLabel = d.market_label || d.market || "";
-      }
-    } catch (_) {}
-    return marketWsUrl;
-  }
-
-  function connectMarkPrice() {
-    const open = async () => {
-      try {
-        if (!marketWsUrl) await resolveMarketWs();
-        if (!marketWsUrl) {
-          if ($("syncText")) $("syncText").textContent = "等待后端下发行情地址";
-          setTimeout(open, 3000);
-          return;
-        }
-        markSocket = new WebSocket(marketWsUrl);
-        markSocket.onmessage = (e) => {
-          try {
-            const packet = JSON.parse(e.data);
-            const d = packet.data || packet;
-            renderPrice(d.p);
-          } catch (_) {}
-        };
-        markSocket.onerror = () => { if (markSocket) markSocket.close(); };
-        markSocket.onclose = () => {
-          markSocket = null;
-          if ($("syncText")) $("syncText").textContent = "行情重连中";
-          setTimeout(open, 3000);
-        };
-      } catch (_) {
-        setTimeout(open, 3000);
-      }
-    };
-    open();
-  }
-
-  // -------------------------------------------------------- 第 1 页 数据加载
-  async function loadMarket() {
-    try {
-      const d = await api("/api/market");
-      const price = d.mark_price ?? d.price ?? d.last_price;
-      if (price) renderPrice(price);
-    } catch (e) {
-      if ($("markPrice")) $("markPrice").textContent = "行情不可用";
-    }
-  }
-
-  async function loadStatus() {
-    try {
-      const s = await api("/api/trading/status");
-      statusCache = s;
-      const nets = Object.assign(
-        {},
-        s.exchange_position ? { BTCUSDT: s.exchange_position } : {},
-        s.exchange_positions || {}
-      );
-      const sources = s.position_sources || [];
-      const symbols = ["BTCUSDT", "ETHUSDT"];
-      const liveNets = symbols.filter((sym) => {
-        const pos = nets[sym] || {};
-        const qty = Number(pos.quantity || pos.position_amt || 0);
-        const side = String(pos.side || "FLAT").toUpperCase();
-        return side !== "FLAT" && qty;
-      });
-
-      if ($("posSideTag")) {
-        $("posSideTag").textContent = liveNets.length
-          ? liveNets.map((sym) => `${coin(sym)} ${sideZh(nets[sym].side)}`).join(" · ")
-          : "空仓";
-        $("posSideTag").className = "tag " + (liveNets.length ? "safe" : "");
-      }
-      if ($("posHint")) {
-        $("posHint").textContent = liveNets.length
-          ? liveNets.map((sym) => {
-              const pos = nets[sym];
-              return `${coin(sym)} ${sideZh(pos.side)} ${Number(pos.quantity || 0)}`;
-            }).join(" · ")
-          : "无持仓";
-      }
-
-      if ($("posBox")) {
-        const lotPnl = (mark, lotSide, lotQty, lotPx) => {
-          if (!mark || !lotPx || !lotQty) return null;
-          const sign = lotSide === "LONG" ? 1 : -1;
-          return (mark - lotPx) * lotQty * sign;
-        };
-        let html = "";
-        symbols.forEach((sym) => {
-          const lots = sources.filter((src) => (src.symbol || "BTCUSDT") === sym);
-          const pos = nets[sym] || {};
-          const side = String(pos.side || "FLAT").toUpperCase();
-          const qty = Number(pos.quantity || pos.position_amt || 0);
-          if (!lots.length && (side === "FLAT" || !qty)) return;
-          const mark = Number(pos.mark_price ?? pos.markPrice ?? 0);
-          const upnl = Number(pos.unrealized_pnl ?? pos.unrealizedProfit ?? 0);
-          const entry = Number(pos.entry_price ?? pos.entryPrice ?? 0);
-          const lev = Number(pos.leverage || 10) || 10;
-          html += lots.map((src) => {
-            const zh = src.side === "LONG" ? "多" : "空";
-            const lotSign = src.side === "LONG" ? 1 : -1;
-            const est = lotPnl(mark, src.side, Number(src.qty), Number(src.px));
-            // 数量一律用币安网页端的 USDT 口径（名义价值），小字保留币数量。
-            const lotUsdt = mark ? Number(src.qty) * mark * lotSign : null;
-            const lotMargin = lotUsdt == null ? null : Math.abs(lotUsdt) / lev;
-            return `<div class="table-row cols-pos">
-              <span>${coinCell(src.symbol || sym)}</span>
-              <span>${esc(src.name || src.interval)}</span>
-              <span class="${src.side === "LONG" ? "positive" : "negative"}">${zh}</span>
-              <span>${lotUsdt == null ? "—" : `${num(lotUsdt, 2)} <small>USDT</small>`}<br><small class="net-notional">${num(src.qty, 4)} ${coin(src.symbol || sym)}</small></span>
-              <span>${lotMargin == null ? "—" : `${num(lotMargin, 2)} <small>估算</small>`}</span>
-              <span>${num(src.px, 2)}<small>参考价</small></span>
-              <span>${fmtKlineBeijing(src.bar_ms, src.interval)}</span>
-              <span>${esc(src.reason || "—")}</span>
-              <span class="${est == null ? "" : pnlClass(est)}">${est == null ? "—" : `${signed(est)} <small>估算</small>`}</span>
-            </div>`;
-          }).join("");
-          const netSide = side === "FLAT" || !qty ? "空仓" : (side === "LONG" ? "多" : "空");
-          // 净仓行直接用交易所返回的 notional / isolatedMargin，与币安网页端逐位一致。
-          const netSign = side === "LONG" ? 1 : side === "SHORT" ? -1 : 0;
-          const exNotional = Number(pos.notional ?? 0);
-          const netUsdt = exNotional !== 0 ? exNotional : (mark ? qty * mark * netSign : 0);
-          const exMargin = Number(pos.margin ?? 0);
-          const netMargin = exMargin > 0 ? exMargin : Math.abs(netUsdt) / lev;
-          html += `<div class="table-row cols-pos is-net">
-            <span>${coinCell(sym)}</span>
-            <span>币安净仓</span>
-            <span class="${!qty ? "" : side === "LONG" ? "positive" : "negative"}">${esc(netSide)}</span>
-            <span>${qty ? `${num(netUsdt, 2)} <small>USDT</small><br><small class="net-notional">${num(qty, 4)} ${coin(sym)}</small>` : "—"}</span>
-            <span>${qty ? `${num(netMargin, 2)} <small>交易所</small>` : "—"}</span>
-            <span>${entry ? num(entry, 2) : "—"}${entry ? "<small>成交均价</small>" : ""}</span>
-            <span>—</span>
-            <span>${lots.length > 1 ? "同标的两条策略合成" : (lots[0] ? `${lots[0].name} 对应净仓` : "交易所账户")}</span>
-            <span class="${pnlClass(upnl)}">${signed(upnl)} <small>交易所</small></span>
-          </div>`;
-        });
-        $("posBox").innerHTML = html || empty("空仓", "当前无持仓");
-        const totalMargin = symbols.reduce(
-          (acc, sym) => acc + (Number((nets[sym] || {}).margin) || 0),
-          0
-        );
-        if ($("posMarginTag")) {
-          $("posMarginTag").textContent = totalMargin > 0
-            ? `保证金 ${num(totalMargin, 2)} USDT`
-            : "保证金 —";
-        }
-      }
-
-      const recon = Boolean(s.reconciliation_needed);
-      renderExternal(s.external_interventions);
-      // 对账以「策略账本期望净额 vs 交易所真实净额」为准（每标的单独比）。
-      // 旧 V7 的 reconciliation_needed 来自已不参与交易的模块，只作附注，不再冒充对账结论。
-      const wantNets = s.desired_nets || {};
-      const signedEx = (sym) => {
-        const pos = nets[sym] || {};
-        const sd = String(pos.side || "FLAT").toUpperCase();
-        const q = Number(pos.quantity || 0);
-        return sd === "LONG" ? q : sd === "SHORT" ? -q : 0;
-      };
-      const netGaps = symbols
-        .map((sym) => ({ sym, want: Number(wantNets[sym] || 0), have: signedEx(sym) }))
-        .map((r) => ({ ...r, gap: Math.abs(r.want - r.have) }))
-        .filter((r) => r.gap >= 5e-4);
-      if ($("reconcileState")) {
-        if (!netGaps.length) {
-          $("reconcileState").textContent = recon
-            ? "一致（旧 V7 模块仍标记需对账，该模块已不参与交易）"
-            : "一致";
-          $("reconcileState").className = "positive";
-        } else {
-          $("reconcileState").textContent =
-            "不一致：" +
-            netGaps.map((r) => `${coin(r.sym)} 差 ${num(r.want - r.have, 4)}`).join(" · ");
-          $("reconcileState").className = "blocked";
-        }
-      }
-      if ($("accountPosition"))
-        $("accountPosition").textContent = liveNets.length
-          ? liveNets.map((sym) => `${coin(sym)} ${sideZh(nets[sym].side)} ${num(nets[sym].quantity, 4)}`).join(" · ")
-          : "空仓";
-      if ($("accountBalance"))
-        $("accountBalance").textContent = num(
-          s.balance?.total_wallet_balance ?? s.balance?.available_balance,
-          2
-        );
-      if ($("accountConnection")) {
-        const ok = s.connected !== false;
-        $("accountConnection").textContent = ok ? "已连接" : "未配置";
-        $("accountConnection").className =
-          "connection-big " + (ok ? "positive" : "blocked");
-      }
-      if ($("accountMode"))
-        $("accountMode").textContent = "测试网 API · 策略进程状态另查";
-      if ($("modeLabel"))
-        $("modeLabel").textContent = s.connected ? "测试网 · 接口已连接" : "测试网 · 接口未连接";
-      if ($("engineState")) $("engineState").textContent = "后端已连接";
-    } catch (e) {
-      if ($("engineState")) $("engineState").textContent = "后端不可达";
-    }
-  }
-
-  // ---------------------------------------------------- 核心指标（实时计算）
-  //
-  // 六项指标全部由已取到的实时数据推导，因此不存在“等待面板更新”这类占位。
-  // 后端 quality 字段优先，缺失时由账户汇总就地推导，口径保持一致。
-  let summaryCache = null;
-  let strategyCache = null;
-  // Swiss 面板复用已有请求结果，绝不重复查询交易所：
-  // 同一轮刷新把同一个接口查两遍会触发币安 429 (-1003)。
-  let statusCache = null;
-  let swissReading = null;
-  let swissEquity = null;
-  let sparkFetchedAt = 0;
-
-  const n0 = (v) => Number(v || 0);
-  const numOrNull = (v) =>
-    v === undefined || v === null || v === "" || Number.isNaN(Number(v))
-      ? null
-      : Number(v);
-
-  function qualityModel() {
-    const s = summaryCache;
-    if (!s || s.connected === false) return null;
-    const q = s.quality || {};
-    const bySym = s.by_symbol || {};
-    const posBy = s.positions_by_symbol || {};
-    const costs = q.costs || {};
-    const dd = q.drawdown || {};
-    const sym = (code) => bySym[code] || {};
-    const pos = (code) => posBy[code] || {};
-    const realized =
-      q.realized_net_pnl !== undefined
-        ? n0(q.realized_net_pnl)
-        : n0(sym("BTCUSDT").net_pnl) + n0(sym("ETHUSDT").net_pnl);
-    // 未实现合计与分标的同源：有持仓行时用两个标的相加，保证卡片自身能对上，
-    // 不会出现「合计 +0.05 而 BTC+ETH = +17.83」这种自相矛盾。
-    const upB = n0(pos("BTCUSDT").unrealized_pnl);
-    const upE = n0(pos("ETHUSDT").unrealized_pnl);
-    const hasPosRow =
-      pos("BTCUSDT").side !== undefined || pos("ETHUSDT").side !== undefined;
-    return {
-      window: q.window || s.record_start || s.stats_start || null,
-      // ① 已实现净盈亏：扣手续费、分标的
-      realized,
-      realizedBy: {
-        BTC: n0(sym("BTCUSDT").net_pnl),
-        ETH: n0(sym("ETHUSDT").net_pnl),
-      },
-      // ② 未实现盈亏：单独列出，不与已实现混合
-      unrealized: hasPosRow
-        ? upB + upE
-        : q.unrealized_pnl !== undefined
-        ? n0(q.unrealized_pnl)
-        : n0(s.unrealized_pnl),
-      unrealizedBy: {
-        BTC: upB,
-        ETH: upE,
-      },
-      // ③ 单笔净边际：开仓名义金额口径，不依赖复利
-      edge: numOrNull(q.unit_edge_bps) ?? numOrNull(s.unit_edge_bps),
-      openNotional:
-        numOrNull(q.open_notional) ??
-        (n0(sym("BTCUSDT").open_notional) + n0(sym("ETHUSDT").open_notional)),
-      // ④ 最大回撤：账户权益 + 按标的分组
-      ddAccount: numOrNull(q.recorded_max_drawdown),
-      ddBy: {
-        BTC:
-          numOrNull((dd.by_symbol || {}).BTCUSDT) ??
-          numOrNull(sym("BTCUSDT").realized_max_drawdown),
-        ETH:
-          numOrNull((dd.by_symbol || {}).ETHUSDT) ??
-          numOrNull(sym("ETHUSDT").realized_max_drawdown),
-      },
-      // ⑤ 胜率与盈亏比：不能只看胜率
-      winRate: numOrNull(q.win_rate) ?? numOrNull(s.win_rate),
-      profitFactor: numOrNull(q.profit_factor) ?? numOrNull(s.profit_factor),
-      payoffRatio: numOrNull(q.payoff_ratio) ?? numOrNull(s.payoff_ratio),
-      wins: n0(q.wins ?? s.wins),
-      losses: n0(q.losses ?? s.losses),
-      avgWin: numOrNull(q.avg_win) ?? numOrNull(s.avg_win),
-      avgLoss: numOrNull(q.avg_loss) ?? numOrNull(s.avg_loss),
-      // ⑥ 交易成本：maker / taker / 资金费 / 滑点逐项单列
-      costs: {
-        maker: n0(costs.maker_fee ?? s.maker_fee),
-        taker: n0(costs.taker_fee ?? s.taker_fee),
-        funding: numOrNull(costs.funding_fee),
-        slippage: numOrNull(costs.slippage_est),
-        fundingBasis: costs.funding_basis,
-        slippageBasis: costs.slippage_basis,
-      },
-      edgeBasis: q.unit_edge_basis,
-      drawdownBasis: q.drawdown_basis,
-      reasons: Array.isArray(q.reasons) ? q.reasons : null,
-      actions: Array.isArray(q.next_actions) ? q.next_actions : null,
-      ctx: q.context || {},
-      bySymbol: bySym,
-    };
-  }
-
-  function derivedReasons(m, strategies) {
-    const out = [];
-    if (strategies.length) {
-      out.push({
-        text: `当前运行 ${strategies.length} 条策略：${strategies.join(" + ")}`,
-        count: 1,
-      });
-    }
-    const ctx = m.ctx || {};
-    if (ctx.five_minute_disabled) {
-      out.push({
-        text: "5m 已停用：趋势中缺少正常出口，最终只能吃 3×ATR 灾难止损",
-        count: 1,
-      });
-    }
-    if (ctx.halted) {
-      out.push({ text: "运行器处于熔断状态，已停止开新仓", count: 1 });
-    }
-    if (ctx.missed_bars) {
-      out.push({ text: `停机期间漏记 K 线 ${num(ctx.missed_bars, 0)} 根（只记账不补单）`, count: 1 });
-    }
-    if (!out.length) {
-      out.push({ text: "运行记录中没有异常跳过或阻塞项", count: 1 });
-    }
-    return out;
-  }
-
-  const BASE_ACTIONS = [
-    "固定 15m-only 观察窗口，不在盈利后临时改参数或放大仓位",
-    "累计 ≥4 周或 30 个完整平仓样本，再评估单笔净边际与跨币一致性",
-    "补齐逐笔开平仓配对与完整权益曲线，当前边际为成交腿近似",
-  ];
-
-  const METRIC_IDS = [
-    "qRealized", "qRealBTC", "qRealETH",
-    "qUnrealized", "qUnrealBTC", "qUnrealETH",
-    "qEdge", "qOpenNotional", "qNetForEdge",
-    "qDrawdown", "qDdBTC", "qDdETH",
-    "qWinRate", "qProfitFactor", "qAvgWinLoss", "qWinLossCount",
-    "qCostTotal", "qFeeMaker", "qFeeTaker", "qFeeFunding", "qSlippage",
-  ];
-
-  function renderSymDetail(m) {
-    const box = $("symDetailBox");
-    if (!box) return;
-    if (!m) {
-      box.innerHTML = empty("账户未连接", "连接测试网后按标的拆分");
-      return;
-    }
-    box.innerHTML = ["BTCUSDT", "ETHUSDT"]
-      .map((code) => {
-        const b = m.bySymbol[code] || {};
-        const has = b.trade_count !== undefined;
-        const net = n0(b.net_pnl);
-        const edge = numOrNull(b.unit_edge_bps);
-        const pf = numOrNull(b.profit_factor);
-        const dd = numOrNull(b.realized_max_drawdown);
-        return `<div class="table-row cols-sym">
-          <span>${coinCell(code)}</span>
-          <span class="${pnlClass(net)}">${has ? signed(net, 2) : "—"}</span>
-          <span>${b.win_rate == null ? "—" : pct(b.win_rate, 1)}</span>
-          <span>${pf == null ? "—" : num(pf, 2)}</span>
-          <span>${num(b.wins, 0)} / ${num(b.losses, 0)}</span>
-          <span>${num(b.open_notional, 2)}</span>
-          <span class="${pnlClass(edge)}">${edge == null ? "—" : signed(edge, 2) + " bp"}</span>
-          <span class="${dd != null && dd > 0 ? "negative" : ""}">${dd == null ? "—" : num(dd, 2)}</span>
-          <span>${num(b.maker_fee, 4)} / ${num(b.taker_fee, 4)}</span>
-        </div>`;
-      })
-      .join("");
-  }
-
-  function renderQuality() {
-    const strategies = strategyCache || [];
-    const m = qualityModel();
-    if ($("qualityWindow"))
-      $("qualityWindow").textContent = m?.window
-        ? `记录起点 ${m.window}`
-        : "实时口径";
-    if (!m) {
-      METRIC_IDS.forEach((id) => {
-        const el = $(id);
-        if (el) {
-          el.textContent = "—";
-          el.classList.remove("positive", "negative");
-        }
-      });
-      if ($("qualityReasons"))
-        $("qualityReasons").innerHTML = empty(
-          "账户未连接",
-          summaryCache?.reason || "请在账户连接页配置测试网密钥"
-        );
-      if ($("qualityActions"))
-        $("qualityActions").innerHTML = BASE_ACTIONS.map((t) => `<li>${esc(t)}</li>`).join("");
-      renderSymDetail(null);
-      return;
-    }
-
-    // ① 已实现净盈亏（扣手续费、区分 BTC/ETH）
-    setPnl($("qRealized"), m.realized, 2);
-    setPnl($("qRealBTC"), m.realizedBy.BTC, 2);
-    setPnl($("qRealETH"), m.realizedBy.ETH, 2);
-
-    // ② 未实现盈亏（单独列出）
-    setPnl($("qUnrealized"), m.unrealized, 2);
-    setPnl($("qUnrealBTC"), m.unrealizedBy.BTC, 2);
-    setPnl($("qUnrealETH"), m.unrealizedBy.ETH, 2);
-
-    // ③ 单笔净边际（开仓名义金额口径）
-    const edgeEl = $("qEdge");
-    if (edgeEl) {
-      edgeEl.textContent = m.edge == null ? "—" : signed(m.edge, 2) + " bp";
-      edgeEl.classList.remove("positive", "negative");
-      if (m.edge != null && m.edge !== 0)
-        edgeEl.classList.add(m.edge > 0 ? "positive" : "negative");
-    }
-    if ($("qOpenNotional"))
-      $("qOpenNotional").textContent = m.openNotional ? num(m.openNotional, 2) : "—";
-    if ($("qNetForEdge")) setPnl($("qNetForEdge"), m.realized, 2);
-    if ($("qEdgeBasis"))
-      $("qEdgeBasis").textContent =
-        m.edgeBasis || "净额 ÷ 开仓腿名义 × 10000，不依赖复利";
-
-    // ④ 最大回撤（账户权益 + 按标的分组）
-    const ddEl = $("qDrawdown");
-    if (ddEl) {
-      ddEl.textContent = m.ddAccount == null ? "—" : pct(m.ddAccount, 2);
-      ddEl.classList.toggle("negative", m.ddAccount != null && m.ddAccount > 0);
-    }
-    [
-      ["qDdBTC", m.ddBy.BTC],
-      ["qDdETH", m.ddBy.ETH],
-    ].forEach(([id, v]) => {
-      const el = $(id);
-      if (!el) return;
-      el.textContent = v == null ? "—" : num(v, 2);
-      el.classList.toggle("negative", v != null && v > 0);
-    });
-    if ($("qDrawdownBasis"))
-      $("qDrawdownBasis").textContent =
-        m.drawdownBasis || "账户权益回撤（%）＋分标的已实现回撤（USDT）";
-
-    // ⑤ 胜率与盈亏比（不能只看胜率）
-    if ($("qWinRate"))
-      $("qWinRate").textContent = m.winRate == null ? "—" : pct(m.winRate, 1);
-    if ($("qProfitFactor"))
-      $("qProfitFactor").textContent = m.profitFactor == null ? "—" : num(m.profitFactor, 2);
-    if ($("qAvgWinLoss"))
-      $("qAvgWinLoss").textContent =
-        m.avgWin == null && m.avgLoss == null
-          ? "—"
-          : `${m.avgWin == null ? "—" : num(m.avgWin, 2)} / ${
-              m.avgLoss == null ? "—" : num(m.avgLoss, 2)
-            }`;
-    if ($("qWinLossCount"))
-      $("qWinLossCount").textContent = `${num(m.wins, 0)} / ${num(m.losses, 0)}`;
-
-    // ⑥ 交易成本（maker / taker / 资金费 / 滑点单列）
-    const c = m.costs;
-    const total =
-      n0(c.maker) + n0(c.taker) + n0(c.funding) + n0(c.slippage);
-    if ($("qCostTotal")) $("qCostTotal").textContent = num(total, 2);
-    if ($("qFeeMaker")) $("qFeeMaker").textContent = num(c.maker, 4);
-    if ($("qFeeTaker")) $("qFeeTaker").textContent = num(c.taker, 4);
-    if ($("qFeeFunding"))
-      $("qFeeFunding").textContent = c.funding == null ? "未接入" : num(c.funding, 4);
-    if ($("qSlippage"))
-      $("qSlippage").textContent = c.slippage == null ? "—" : num(c.slippage, 2);
-    if ($("qCostBasis"))
-      $("qCostBasis").textContent = `USDT · ${
-        c.fundingBasis || "资金费口径未知"
-      }；${c.slippageBasis || "滑点口径未知"}`;
-
-    if ($("qStrategyMode"))
-      $("qStrategyMode").textContent = strategies.length
-        ? strategies.join(" + ")
-        : "策略列表读取中";
-
-    renderSymDetail(m);
-
-    const reasons = m.reasons && m.reasons.length ? m.reasons : derivedReasons(m, strategies);
-    if ($("qualityReasons")) {
-      $("qualityReasons").innerHTML = reasons
-        .map(
-          (r) =>
-            `<div class="quality-reason"><span class="reason-dot"></span><span>${esc(r.text)}${
-              r.count > 1 ? `<small>记录 ${num(r.count, 0)} 次</small>` : ""
-            }</span></div>`
-        )
-        .join("");
-    }
-    if ($("qualityActions")) {
-      const actions = m.actions && m.actions.length ? m.actions : BASE_ACTIONS;
-      $("qualityActions").innerHTML = actions.map((t) => `<li>${esc(t)}</li>`).join("");
-    }
-  }
-
-  async function loadSummary() {
-    try {
-      const s = await api("/api/account/summary");
-      summaryCache = s;
-      renderQuality();
-      renderSwiss();
-      if (!s.connected) {
-        if ($("mWallet")) $("mWallet").textContent = "未连接";
-        ["mUnrealBTC", "mUnrealETH", "mRealBTC", "mRealETH"].forEach((id) => {
-          if ($(id)) $(id).textContent = "—";
-        });
-        if ($("realHint")) $("realHint").textContent = s.reason || "密钥未配置";
-        return;
-      }
-      if ($("mWallet")) $("mWallet").textContent = num(s.wallet_balance, 2);
-      // 分标的显示：BTC 与 ETH 各自统计，绝不混加。
-      // 未实现 = 交易所逐标的未实现盈亏；已实现用净额（已实现 − 手续费）。
-      const posBy = s.positions_by_symbol || {};
-      const bySym = s.by_symbol || {};
-      setPnl($("mUnrealBTC"), (posBy.BTCUSDT || {}).unrealized_pnl ?? 0);
-      setPnl($("mUnrealETH"), (posBy.ETHUSDT || {}).unrealized_pnl ?? 0);
-      setPnl($("mRealBTC"), (bySym.BTCUSDT || {}).net_pnl ?? 0);
-      setPnl($("mRealETH"), (bySym.ETHUSDT || {}).net_pnl ?? 0);
-      if ($("realHint")) {
-        historyStartMs = Number(s.record_start_ms || 0);
-        $("realHint").textContent =
-          `净 = 已实现 − 手续费 · 自 ${s.record_start || s.stats_start || "—"} 起`;
-      }
-    } catch (e) {
-      summaryCache = null;
-      renderQuality();
-      renderSwiss();
-      if ($("mWallet")) $("mWallet").textContent = "读取失败";
-      ["mUnrealBTC", "mUnrealETH", "mRealBTC", "mRealETH"].forEach((id) => {
-        if ($(id)) $(id).textContent = "—";
-      });
-    }
-  }
-
-  async function loadOpenOrders() {
-    if (!$("openOrdersBox")) return;
-    try {
-      // 复用 loadStatus 的同一轮结果，缓存未就绪时才补查。
-      const s = statusCache || (await api("/api/trading/status"));
-      const orders = s.open_orders || s.orders || [];
-      if ($("openOrdersCount")) $("openOrdersCount").textContent = String(orders.length);
-      if (!orders.length) {
-        $("openOrdersBox").innerHTML = empty("无挂单", "追价完成后不留挂单");
-        return;
-      }
-      $("openOrdersBox").innerHTML = orders
-        .map(
-          (o) => `<div class="kv-row"><span>${esc(coin(o.symbol))} ${esc(o.side === "BUY" ? "买入" : "卖出")} ${esc(ORDER_TYPE_ZH[o.type] || o.type || "")}</span>
-            <b>${num(o.price, 2)} × ${num(o.origQty ?? o.quantity, 4)}</b></div>`
-        )
-        .join("");
-    } catch (e) {
-      /* 保持原样 */
-    }
-  }
-
-  // 运行器心跳：只更新状态文字。「最近一根信号读数」板块已按用户要求移除。
-  async function loadRunner() {
-    try {
-      const d = await api("/api/strategy/reading");
-      if ($("runnerState")) $("runnerState").textContent = runnerStatusText(d.runner);
-    } catch (e) {
-      if ($("runnerState")) $("runnerState").textContent = "运行器状态读取失败";
-    }
-  }
-
-  async function loadStrategies() {
-    const sidebarBox = $("sidebarStrategyList");
-    const sidebarCount = $("sidebarStrategyCount");
-    try {
-      const d = await api("/api/strategies/active");
-      const list = d.strategies || [];
-      // 质量卡的策略口径与侧边栏共用同一份实时数据，避免两处不一致。
-      strategyCache = list
-        .filter((s) => s.enabled)
-        .map((s) => `${coin(s.symbol)} ${s.timeframe || ""}`.trim());
-      renderQuality();
-      if (!list.length) {
-        if (sidebarBox) sidebarBox.innerHTML = `<div class="sidebar-strategy-loading">暂无策略</div>`;
-        if (sidebarCount) sidebarCount.textContent = "0";
-        return;
-      }
-      if (sidebarCount) sidebarCount.textContent = String(list.length);
-      if (sidebarBox) {
-        sidebarBox.innerHTML = list.map((s) => {
-          const on = !!s.enabled;
-          const e = s.entry || {};
-          const rt = s.runtime || {};
-          const state = on ? (rt.halted ? "已熔断" : "已启用") : "未启用";
-          const signal = on
-            ? `${e.long || "金叉做多"} / ${e.short || "死叉做空"}`
-            : (s.status || "等待启用");
-          const title = `${coin(s.symbol)} ${s.timeframe || ""}`.trim() || (s.name || s.strategy_id);
-          return `<article class="sidebar-strategy-item${on ? " is-enabled" : ""}">
-            <div class="sidebar-strategy-top">
-              <span class="sidebar-strategy-dot ${on && !rt.halted ? "online" : "offline"}"></span>
-              <b>${esc(title)}</b>
-              <span class="sidebar-strategy-state ${on && !rt.halted ? "on" : "off"}">${esc(state)}</span>
-            </div>
-            <p>${esc(s.symbol || "BTCUSDT")} · ${esc(s.name || s.kind || "策略")}</p>
-            <small>${esc(signal)}</small>
-          </article>`;
-        }).join("");
-      }
-    } catch (e) {
-      if (sidebarBox) sidebarBox.innerHTML = `<div class="sidebar-strategy-loading">策略读取失败</div>`;
-      if (sidebarCount) sidebarCount.textContent = "!";
-    }
-  }
-
-  const ORDER_STATUS_ZH = {
-    NEW: "挂单中",
-    PARTIALLY_FILLED: "部分成交",
-    FILLED: "已成交",
-    CANCELED: "已撤销",
-    EXPIRED: "已过期",
-    REJECTED: "已拒绝",
-  };
-
-  // 交易所返回的委托类型与时效也是英文枚举，界面统一显示中文。
-  const ORDER_TYPE_ZH = {
-    LIMIT: "限价",
-    MARKET: "市价",
-    LIMIT_MAKER: "只挂单限价",
-    STOP: "止损限价",
-    STOP_MARKET: "止损市价",
-    TAKE_PROFIT: "止盈限价",
-    TAKE_PROFIT_MARKET: "止盈市价",
-    TRAILING_STOP_MARKET: "跟踪止损市价",
-  };
-  const TIME_IN_FORCE_ZH = {
-    GTC: "撤销前有效",
-    GTX: "只挂单",
-    IOC: "立即成交或取消",
-    FOK: "全部成交或取消",
-  };
-
-  async function loadHistory() {
-    const orderBox = $("histOrdersBox");
-    const tradeBox = $("histTradesBox");
-    if (!orderBox && !tradeBox) return;
-    syncHistoryLimitButtons();
-    try {
-      // 账户汇总在 loadSummary 里已经查过，这里复用，避免同一轮刷新
-      // 把 /api/account/summary 查两遍而触发币安 429；缓存未就绪时才补查。
-      const [od, td] = await Promise.all([
-        api("/api/binance/orders?limit=200"),
-        api("/api/binance/trades?limit=200"),
-      ]);
-      const summary = summaryCache || (await api("/api/account/summary"));
-      if (summary && summary.record_start_ms) {
-        historyStartMs = Number(summary.record_start_ms);
-      }
-      if (!od.connected) {
-        if (orderBox) orderBox.innerHTML = empty("币安未连接", od.reason || "请到账户连接页配置密钥");
-      }
-      if (!td.connected) {
-        if (tradeBox) tradeBox.innerHTML = empty("币安未连接", td.reason || "请到账户连接页配置密钥");
-      }
-      if (!od.connected && !td.connected) return;
-
-      const pnlMap = orderPnlMap(td.trades || []);
-      const orders = takeHistory(
-        newestFirst((od.orders || []).filter(isFilledOrder), (o) => o.updateTime ?? o.time)
-      );
-      const trades = takeHistory(
-        newestFirst(collapseTradesByOrder(td.trades || []), (t) => t.time)
-      );
-
-      if (orderBox && od.connected) {
-        if (!orders.length) {
-          orderBox.innerHTML = empty("没有已成交的策略委托", "撤单已隐藏");
-        } else {
-          orderBox.innerHTML = orders
-            .map((o) => {
-              const p = pnlMap[String(o.orderId)] || { realized: 0, commission: 0 };
-              const net = netPnl(p.realized, p.commission);
-              return `<div class="table-row cols-o10">
-                <span>${fmtTime(o.time ?? o.updateTime)}</span>
-                <span>${coinCell(o.symbol)}</span>
-                <span class="${o.side === "BUY" ? "positive" : "negative"}">${esc(o.side === "BUY" ? "买入" : "卖出")}<small>${esc(ORDER_TYPE_ZH[o.type] || o.type)} · ${esc(TIME_IN_FORCE_ZH[o.timeInForce] || o.timeInForce || "—")}</small></span>
-                <span class="mono id-cell">${esc(o.orderId)}</span>
-                <span>${sourceCell(o)}</span>
-                <span>${Number(o.price) ? num(o.price, 2) : "市价"}<small>成交均价 ${Number(o.avgPrice) ? num(o.avgPrice, 2) : "—"}</small></span>
-                <span>${num(o.origQty, 4)}</span>
-                <span>${num(o.executedQty, 4)}</span>
-                <span class="${pnlClass(net)}">${signed(net, 4)}<small>已实现 ${signed(p.realized, 4)}</small></span>
-                <span>${esc(ORDER_STATUS_ZH[o.status] || o.status)}</span>
-              </div>`;
-            })
-            .join("");
-        }
-      }
-
-      if (tradeBox && td.connected) {
-        if (!trades.length) {
-          tradeBox.innerHTML = empty("没有已成交的策略成交", "按委托号合并，不含撤单");
-        } else {
-          tradeBox.innerHTML = trades
-            .map((t) => {
-              const realized = Number(t.realized || 0);
-              const fee = Number(t.commission || 0);
-              const net = netPnl(realized, fee);
-              const avg = t.qty ? t.notional / t.qty : 0;
-              return `<div class="table-row cols-t9">
-                <span>${fmtTime(t.time)}</span>
-                <span>${coinCell(t.symbol)}</span>
-                <span class="mono id-cell">${esc(t.orderId)}<small>${t.fills} 笔逐笔</small></span>
-                <span>${sourceCell(t)}</span>
-                <span class="${t.side === "BUY" ? "positive" : "negative"}">${esc(t.side === "BUY" ? "买入" : "卖出")}<small>${t.maker ? "挂单" : "吃单"}</small></span>
-                <span>${num(avg, 2)}<small>× ${num(t.qty, 4)} ${esc(coin(t.symbol))}</small></span>
-                <span class="${pnlClass(realized)}">${signed(realized, 4)}</span>
-                <span>${num(fee, 4)}</span>
-                <span class="${pnlClass(net)}">${signed(net, 4)}</span>
-              </div>`;
-            })
-            .join("");
-        }
-      }
-    } catch (e) {
-      if (orderBox) orderBox.innerHTML = empty("历史委托读取失败", String(e.message || e));
-      if (tradeBox) tradeBox.innerHTML = empty("历史成交读取失败", String(e.message || e));
-    }
-  }
-
-  // ------------------------------------------- Swiss Terminal 面板（只读）
-  const STRAT_ID = {
-    "BTCUSDT|15m": "kdj15", "ETHUSDT|15m": "eth15",
-    "BTCUSDT|5m": "kdj5", "ETHUSDT|5m": "eth5",
-  };
-
-  function sparkPath(values, w, h, pad) {
-    if (!values || values.length < 2) return "";
-    const min = Math.min.apply(null, values);
-    const max = Math.max.apply(null, values);
-    const span = (max - min) || 1;
-    return values
-      .map((v, i) => {
-        const x = pad + (i * (w - pad * 2)) / (values.length - 1);
-        const y = h - pad - ((v - min) / span) * (h - pad * 2);
-        return `${i ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`;
-      })
-      .join(" ");
-  }
-
-  function drawSpark(svg, values, color) {
-    if (!svg) return false;
-    const vb = (svg.getAttribute("viewBox") || "0 0 200 56").split(/\s+/).map(Number);
-    const w = vb[2], h = vb[3];
-    const d = sparkPath(values, w, h, 4);
-    if (!d) { svg.innerHTML = ""; return false; }
-    svg.innerHTML =
-      `<path d="${d} L${(w - 4).toFixed(1)},${h} L4,${h} Z" fill="${color}" opacity="0.10"/>` +
-      `<path d="${d}" fill="none" stroke="${color}" stroke-width="1.5" ` +
-      `vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/>`;
-    return true;
-  }
-
-  function drawEquity(svg, values) {
-    if (!svg) return false;
-    const vb = (svg.getAttribute("viewBox") || "0 0 640 130").split(/\s+/).map(Number);
-    const w = vb[2], h = vb[3];
-    const d = sparkPath(values, w, h, 6);
-    if (!d) { svg.innerHTML = ""; return false; }
-    svg.innerHTML =
-      `<path d="${d} L${(w - 6).toFixed(1)},${h} L6,${h} Z" fill="#4c8dff" opacity="0.09"/>` +
-      `<path d="${d}" fill="none" stroke="#4c8dff" stroke-width="1.6" ` +
-      `vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/>`;
-    return true;
-  }
-
-  function ageText(ms) {
+  const ageText = (ms) => {
     if (!ms) return "—";
     const s = Math.max(0, Math.round((Date.now() - Number(ms)) / 1000));
-    if (s < 60) return `${s}s 前`;
-    if (s < 3600) return `${Math.round(s / 60)}m 前`;
-    return `${(s / 3600).toFixed(1)}h 前`;
+    if (s < 60) return `${s}s`;
+    if (s < 3600) return `${Math.round(s / 60)}m`;
+    return `${(s / 3600).toFixed(1)}h`;
+  };
+
+  const ageTitle = (ms) => {
+    if (!ms) return "无时间戳";
+    return `更新于 ${fmtTime(ms)}`;
+  };
+
+  // 数值变化闪烁（一次性高亮，不做滚动动画）
+  const prevNums = new Map();
+  function flash(el, val, forceDir) {
+    if (!el) return;
+    const n = Number(val);
+    if (!Number.isFinite(n)) return;
+    const prev = prevNums.get(el.id);
+    if (prev !== undefined && n !== prev) {
+      const dir = forceDir || (n > prev ? "flash-up" : "flash-down");
+      el.classList.remove("flash-up", "flash-down");
+      void el.offsetWidth;
+      el.classList.add(dir);
+      setTimeout(() => el.classList.remove("flash-up", "flash-down"), 800);
+    }
+    prevNums.set(el.id, n);
   }
 
-  // 运行器口径的风控量：mtm = 钱包余额 + 未实现
-  function runnerRisk(summary) {
-    const q = (summary && summary.quality) || {};
+  const setText = (id, text, cls) => {
+    const el = $(id);
+    if (!el) return;
+    el.textContent = text;
+    if (cls !== undefined) el.className = cls;
+  };
+
+  let toastTimer = null;
+  function toast(msg, kind) {
+    const t = $("toast");
+    if (!t) return;
+    t.textContent = msg;
+    t.className = "toast " + (kind || "");
+    t.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { t.hidden = true; }, 7000);
+  }
+
+  async function api(path, opts) {
+    const res = await fetch(API + path, Object.assign({ cache: "no-store" }, opts || {}));
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  // ------------------------------------------------------------------ 状态推导
+  // 运行器口径风控量：mtm = 钱包余额 + 未实现；日亏/回撤都以运行记录为准
+  function runnerRisk() {
+    const s = summaryCache || {};
+    const q = s.quality || {};
     const ctx = q.context || {};
-    const wallet = Number((summary && summary.wallet_balance) || 0);
-    const upnl = Number((summary && summary.unrealized_pnl) || 0);
+    const wallet = Number(s.wallet_balance || 0);
+    const upnl = Number(s.unrealized_pnl || 0);
     const mtm = wallet + upnl;
     const dayStart = Number(ctx.day_start_eq || 0);
     const peakEq = Number(ctx.peak || 0);
     return {
-      ctx: ctx,
-      q: q,
-      mtm: mtm,
-      dayStart: dayStart,
-      peakEq: peakEq,
+      ctx, q, mtm, dayStart, peakEq,
       dayPnl: dayStart > 0 ? (mtm - dayStart) / dayStart : null,
-      dayLoss: dayStart > 0 ? (dayStart - mtm) / dayStart : null,
+      dayLoss: dayStart > 0 ? Math.max(0, (dayStart - mtm) / dayStart) : null,
       dd: peakEq > 0 ? Math.max(0, (peakEq - mtm) / peakEq) : null,
     };
   }
 
-  // 常驻风控状态条
-  function renderRiskStrip(reading, status, summary) {
-    const runner = (reading && reading.runner) || {};
-    const r = runnerRisk(summary);
-    const mode = runner.mode || "";
+  function runnerInfo() {
+    return (readingCache && readingCache.runner) || null;
+  }
+
+  function heartbeatState() {
+    const r = runnerInfo();
+    if (!r || !r.updated_ms) return { level: "bad", text: "无心跳", age: null };
+    const ageSec = (Date.now() - Number(r.updated_ms)) / 1000;
+    if (r.status !== "running" && r.status !== "starting")
+      return { level: "bad", text: r.status || "未知", age: ageSec };
+    if (ageSec > 90) return { level: "bad", text: "心跳过期", age: ageSec };
+    if (ageSec > 60) return { level: "warn", text: "心跳偏慢", age: ageSec };
+    return { level: "ok", text: r.status === "starting" ? "启动中" : "运行中", age: ageSec };
+  }
+
+  function marketState() {
+    const m = marketCache || {};
+    const ageSec = m.event_time_ms ? (Date.now() - Number(m.event_time_ms)) / 1000 : null;
+    const sh = (monitorCache && monitorCache.stream_health) || null;
+    const streamOk = !sh || sh.state === "connected"; // 无流数据时不误报
+    if (ageSec === null) return { level: "warn", text: "无行情", ageSec: null, streamOk };
+    if (!streamOk || ageSec > 120) return { level: "bad", text: "行情中断", ageSec, streamOk };
+    if (ageSec > 30) return { level: "warn", text: "行情偏旧", ageSec, streamOk };
+    return { level: "ok", text: "实时", ageSec, streamOk };
+  }
+
+  function protectionState() {
+    const st = statusCache || {};
+    const g = st.guardian || {};
+    if (g.protection_ok === false) return { level: "bad", text: "保护单异常" };
+    if (g.last_error) return { level: "warn", text: "有保护错误" };
+    return { level: "ok", text: "正常" };
+  }
+
+  function reconState() {
+    const st = statusCache || {};
+    const nets = exchangeNets();
+    const want = st.desired_nets || {};
+    const gaps = ["BTCUSDT", "ETHUSDT"].map((sym) => {
+      const w = Number(want[sym] || 0);
+      const h = nets[sym] ? Number(nets[sym].signed || 0) : 0;
+      return { sym, want: w, have: h, gap: Math.abs(w - h) };
+    }).filter((r) => r.gap >= 5e-4);
+    return { gaps, ok: gaps.length === 0 };
+  }
+
+  function exchangeNets() {
+    const st = statusCache || {};
+    const out = {};
+    const put = (p) => {
+      if (!p) return;
+      const sym = p.symbol || "";
+      if (!sym) return;
+      const side = String(p.side || "FLAT").toUpperCase();
+      const qty = Number(p.quantity || 0);
+      out[sym] = Object.assign({}, p, {
+        signed: side === "LONG" ? qty : side === "SHORT" ? -qty : 0,
+      });
+    };
+    put(st.exchange_position);
+    Object.values(st.exchange_positions || {}).forEach(put);
+    return out;
+  }
+
+  // 告警合成：返回 { level, items, paused, holds, reconGaps }
+  function computeAlerts() {
+    const r = runnerRisk();
+    const hb = heartbeatState();
+    const mk = marketState();
+    const pr = protectionState();
+    const rc = reconState();
+    const st = statusCache || {};
+    const ext = st.external_interventions || {};
+    const extEntries = Object.entries(ext).filter(([, v]) => v);
+    const paused = extEntries.filter(([, v]) => v && v.paused);
+    const holds = extEntries.filter(([, v]) => v && v.hold && !v.paused);
+
+    const items = []; // {level, text}
+    const push = (level, text) => items.push({ level, text });
+
+    if (hb.level === "bad") push(2, `运行器：${hb.text}${hb.age != null ? `（${ageText(runnerInfo()?.updated_ms)} 前）` : ""}`);
+    if (hb.level === "warn") push(2, `运行器：${hb.text}`);
+    if (mk.level === "bad") push(2, mk.text === "行情中断" ? `行情数据中断（${Math.round(mk.ageSec || 0)}s 未更新）` : mk.text);
+    if (mk.level === "warn") push(1, "行情数据偏旧");
+
+    if (r.ctx.halted) push(3, "熔断已触发 · 停止开新仓，等待人工解除");
+    if (r.dayLoss != null && r.dayLoss >= 0.03) push(3, `日亏 ${pct(r.dayLoss)} ≥ 3% 额度`);
+    else if (r.dayLoss != null && r.dayLoss >= 0.02) push(2, `日亏 ${pct(r.dayLoss)} 接近 3% 额度`);
+    if (r.dd != null && r.dd >= 0.10) push(3, `回撤 ${pct(r.dd)} ≥ 10% 熔断线`);
+    else if (r.dd != null && r.dd >= 0.05) push(2, `回撤 ${pct(r.dd)} 已过 5%`);
+
+    if (paused.length) push(3, `人工干预未确认 · 已暂停自动开仓：${paused.map(([s]) => coin(s)).join(" · ")}`);
+    else if (holds.length) push(1, `已跟随人工操作：${holds.map(([s]) => coin(s)).join(" · ")}`);
+
+    if (pr.level === "bad") push(3, "保护单异常 · 该标的已禁止开新仓");
+    else if (pr.level === "warn") push(2, "保护单存在错误记录");
+
+    if (!rc.ok) {
+      const gapText = rc.gaps.map((g) => `${coin(g.sym)} 差 ${num(g.gap, 4)}`).join(" · ");
+      const mode = ((readingCache || {}).runner || {}).mode;
+      if (mode === "observation_only" || mode === "observe") {
+        push(1, `观察模式：策略账本与交易所净仓不联动（${gapText}）`);
+      } else {
+        push(2, `净仓不一致：${gapText}`);
+      }
+    }
+
+    if (r.ctx.missed_bars) push(1, `停机期间错过 ${r.ctx.missed_bars} 根 K 线（只记账不补单）`);
+
+    // 近 2 小时关键事件提示（详情在事件流）
+    const crit2h = (alertsCache || []).filter((a) => {
+      if (String(a.level) !== "CRITICAL") return false;
+      const t = Number(a.epoch || 0) * 1000;
+      return t && Date.now() - t < 2 * 3600 * 1000;
+    });
+    if (crit2h.length) push(1, `近 2 小时关键事件 ${crit2h.length} 条（见事件流）`);
+
+    const level = items.reduce((m, it) => Math.max(m, it.level), 0);
+    return { level, items, paused, holds, reconGaps: rc.gaps };
+  }
+
+  // ------------------------------------------------------------------ 顶栏 / 行情条
+  function renderTopbar() {
+    const r = runnerInfo();
+    const hb = heartbeatState();
+    const mk = marketState();
+    const rk = runnerRisk();
+
+    // 模式
+    const mode = r && r.mode;
     const modeZh =
       mode === "testnet_orders" ? "测试网 · 实盘下单"
-      : mode === "observe" ? "测试网 · 只观察"
+      : mode === "observe" || mode === "observation_only" ? "测试网 · 只观察"
       : mode === "paper" ? "纸面 · Paper"
-      : mode || "未上报";
-    if ($("rsMode")) {
-      $("rsMode").innerHTML =
-        `<i class="dot ${mode === "testnet_orders" ? "green" : "amber"}"></i>${esc(modeZh)}`;
+      : mode || "模式未上报";
+    const modeEl = $("modePill");
+    if (modeEl) {
+      const isObserve = mode === "observe" || mode === "observation_only";
+      const dotCls = hb.level === "ok" ? (isObserve ? "amber" : "green") : hb.level === "warn" ? "amber" : "red";
+      modeEl.className = "pill " + (hb.level === "ok" ? (isObserve ? "is-warn" : "is-live") : hb.level === "warn" ? "is-warn" : "is-danger");
+      modeEl.innerHTML = `<i class="dot ${dotCls}"></i><b>${esc(modeZh)}</b>`;
+      modeEl.title = r ? `心跳 ${fmtTime(r.updated_ms)} · pid ${r.pid || "—"}` : "未收到运行器心跳";
     }
-    if ($("rsDayPnl")) {
-      const el = $("rsDayPnl");
-      el.textContent = r.dayPnl == null ? "—" : signed(r.dayPnl * 100, 2) + "%";
-      el.className = r.dayPnl == null ? "" : r.dayPnl < 0 ? "negative" : "positive";
-    }
-    if ($("rsDayLoss")) {
-      const el = $("rsDayLoss");
-      const used = r.dayLoss == null ? null : Math.max(0, r.dayLoss);
-      el.textContent = used == null ? "—" : pct(used, 2);
-      el.className =
-        used == null ? "" : used >= 0.03 ? "negative" : used >= 0.02 ? "warn" : "";
-    }
-    if ($("rsDrawdown")) {
-      const el = $("rsDrawdown");
-      el.textContent = r.dd == null ? "—" : pct(r.dd, 2);
-      el.className =
-        r.dd == null ? "" : r.dd >= 0.1 ? "negative" : r.dd >= 0.05 ? "warn" : "";
-    }
-    if ($("rsHalted")) {
-      const el = $("rsHalted");
-      const halted = !!r.ctx.halted;
-      el.textContent = halted ? "true" : "false";
-      el.className = halted ? "negative" : "";
-    }
-    if ($("rsHeartbeat")) {
-      const el = $("rsHeartbeat");
-      el.textContent = (runner.status || "—") + " · " + ageText(runner.updated_ms);
-      el.className = runner.status === "running" ? "positive" : "negative";
-    }
-    if ($("rsMissed")) {
-      $("rsMissed").textContent =
-        `${r.ctx.missed_bars ?? 0} 根 / ${r.ctx.missed_signals ?? 0} 信号`;
-    }
-    if ($("rsStamp")) {
-      $("rsStamp").textContent = runner.updated_ms ? fmtTime(runner.updated_ms) : "—";
-    }
-  }
 
-  // 告警四级阶梯
-  function renderAlertLadder(reading, status, summary) {
-    const runner = (reading && reading.runner) || {};
-    const r = runnerRisk(summary);
-    const ext = (status && status.external_interventions) || {};
-    const extEntries = Object.entries(ext).filter(([, v]) => v);
-    const extAll = extEntries.map(([, v]) => v);
-    const extPaused = extEntries.filter(([, v]) => v && v.paused);
-    const stale = runner.updated_ms
-      ? Date.now() - Number(runner.updated_ms) > 90 * 1000
-      : true;
-
-    const dayLoss = r.dayLoss || 0;
-    const dd = r.dd || 0;
-    let level = 0;
-    let detail = [];
-    if (r.ctx.halted || dd >= 0.1 || dayLoss >= 0.03 || extPaused.length) {
-      level = 3;
-      if (r.ctx.halted) detail.push("熔断已触发 · 停止开新仓，等待人工解除");
-      if (dayLoss >= 0.03) detail.push(`日亏 ${pct(dayLoss, 2)} ≥ 3% 额度，已停止开新仓`);
-      if (dd >= 0.1) detail.push(`回撤 ${pct(dd, 2)} ≥ 10% 熔断线`);
-      if (extPaused.length)
-        detail.push(`人工干预未确认 · ${extPaused.map(([s]) => coin(s)).join(" · ")}`);
-    } else if (dayLoss >= 0.02 || dd >= 0.05 || stale) {
-      level = 2;
-      if (dayLoss >= 0.02) detail.push(`日亏 ${pct(dayLoss, 2)} 接近 3% 额度`);
-      if (dd >= 0.05) detail.push(`回撤 ${pct(dd, 2)} 已过 5%`);
-      if (stale) detail.push(`运行器心跳 ${ageText(runner.updated_ms)}，可能已停`);
-    } else if (extAll.length || r.ctx.missed_bars) {
-      level = 1;
-      if (extAll.length)
-        detail.push(`已跟随人工操作 · ${extEntries.map(([s]) => coin(s)).join(" · ")}`);
-      if (r.ctx.missed_bars)
-        detail.push(`停机期间错过 ${r.ctx.missed_bars} 根 K 线（只记账不补单）`);
+    const tsE = $("tsEngine");
+    if (tsE) {
+      tsE.className = "tstat " + (hb.level === "ok" ? "good" : hb.level === "warn" ? "warn" : "bad");
+      $("tsEngineV").textContent = hb.age == null ? "—" : ageText(r && r.updated_ms);
+      tsE.title = r ? `${hb.text} · ${ageTitle(r.updated_ms)}` : "无运行器心跳";
     }
-    if (!detail.length) detail = ["心跳正常、无异常挂单、无人工干预"];
-
-    const labels = {
-      0: `正常运行 · ${detail[0]}`,
-      1: `信息 · ${detail.join("；")}`,
-      2: `注意 · ${detail.join("；")}`,
-      3: `危险 · ${detail.join("；")}`,
-    };
-    for (let i = 0; i < 4; i += 1) {
-      const row = $("lvRow" + i);
-      const body = $("lvBody" + i);
-      if (row) row.classList.toggle("is-active", i === level);
-      if (body) body.textContent = i === level ? labels[i] : "未触发";
+    const tsF = $("tsFeed");
+    if (tsF) {
+      tsF.className = "tstat " + (mk.level === "ok" ? "good" : mk.level === "warn" ? "warn" : "bad");
+      $("tsFeedV").textContent = mk.ageSec == null ? "—" : `${Math.round(mk.ageSec)}s`;
+      tsF.title = `${mk.text} · 行情事件时间 ${fmtTime(marketCache && marketCache.event_time_ms)}`;
     }
-  }
-
-  // 权益曲线
-  function renderEquityCurve(equity, summary) {
-    const r = runnerRisk(summary);
-    if ($("acctDrawdown")) $("acctDrawdown").textContent = r.dd == null ? "—" : pct(r.dd, 2);
-    if ($("acctDrawdownBasis")) {
-      $("acctDrawdownBasis").textContent = `峰值 ${num(r.peakEq, 2)} · 运行器口径`;
-    }
-    if (!equity || !equity.ok || !(equity.points || []).length) {
-      if ($("equityMeta")) $("equityMeta").textContent = "无运行记录";
-      if ($("equityRange")) $("equityRange").textContent = "—";
-      if ($("equityPeak")) $("equityPeak").textContent = "—";
-      if ($("equityDd")) $("equityDd").textContent = "—";
-      if ($("equityStep")) $("equityStep").textContent = "—";
-      drawEquity($("equitySvg"), []);
-      return;
-    }
-    const pts = equity.points;
-    const values = pts.map((p) => Number(p.equity));
-    const ok = drawEquity($("equitySvg"), values);
-    if ($("equityMeta")) {
-      $("equityMeta").textContent = `${pts.length} 个记录点 · 运行记录口径`;
-    }
-    if ($("equityRange")) {
-      $("equityRange").textContent = ok
-        ? `${num(values[0], 2)} → ${num(values[values.length - 1], 2)} USDT`
-        : "—";
-    }
-    if ($("equityPeak")) {
-      $("equityPeak").textContent = `峰值 ${num(equity.peak, 2)} USDT`;
-    }
-    if ($("equityDd")) {
-      $("equityDd").textContent = `记录峰值回撤 ${pct(equity.max_drawdown, 2)}`;
-    }
-    if ($("equityStep")) {
-      // 权益是运行器逐根落盘的记录值；出入金或口径切换会造成台阶跳变，
-      // 单看曲线容易误读成交易盈亏，这里把最大单步变化显式标出。
-      let maxStep = 0;
-      for (let i = 1; i < values.length; i += 1) {
-        const step = Math.abs(values[i] - values[i - 1]);
-        if (step > maxStep) maxStep = step;
+    const tsR = $("tsRisk");
+    if (tsR) {
+      let cls = "good", text = "正常";
+      if (rk.ctx.halted || (rk.dayLoss != null && rk.dayLoss >= 0.03) || (rk.dd != null && rk.dd >= 0.10)) {
+        cls = "bad"; text = "危险";
+      } else if ((rk.dayLoss != null && rk.dayLoss >= 0.02) || (rk.dd != null && rk.dd >= 0.05)) {
+        cls = "warn"; text = "注意";
       }
-      $("equityStep").textContent =
-        `最大单步 ${signed(maxStep, 2)} USDT（含出入金/口径变化）`;
+      tsR.className = "tstat " + cls;
+      $("tsRiskV").textContent = text;
+      tsR.title = `日亏 ${pct(rk.dayLoss)} / 回撤 ${pct(rk.dd)} / halted ${rk.ctx.halted ? "true" : "false"}`;
+    }
+
+    const al = computeAlerts();
+    const badge = $("alertBadge");
+    if (badge) {
+      badge.textContent = "L" + al.level;
+      badge.className = "alert-badge l" + al.level;
+      badge.title = al.items.length ? al.items.map((i) => `L${i.level} ${i.text}`).join("\n") : "正常运行";
+    }
+
+    const clk = $("clock");
+    if (clk) clk.textContent = fmtTime(Date.now()).slice(11, 19);
+
+    // 页脚同步状态
+    const foot = $("footSync");
+    if (foot) {
+      if (!lastSyncAt) foot.textContent = "正在取数…";
+      else {
+        const age = Math.floor((Date.now() - lastSyncAt) / 1000);
+        foot.textContent = `数据更新 ${fmtHMS(lastSyncAt)}${age <= 1 ? "（刚刚）" : `（${age}s 前）`}${apiFailStreak >= 2 ? " · 接口异常" : ""}`;
+      }
     }
   }
 
-  // 信号判定：KDJ 刻度 + MACD 正负柱
-  function renderSignalTable(reading) {
-    const box = $("signalBox");
+  function renderTicker() {
+    const m = marketCache || {};
+    ["BTCUSDT", "ETHUSDT"].forEach((sym) => {
+      const id = sym === "BTCUSDT" ? "BTC" : "ETH";
+      const pxEl = $("tick" + id + "px");
+      const chgEl = $("tick" + id + "chg");
+      const closes = sparks[sym];
+      let px = null;
+      if (sym === "BTCUSDT") px = numOrNull(m.mark_price) ?? numOrNull(m.price);
+      if (px == null) px = numOrNull(readingClose(sym));
+      if (px != null && pxEl) {
+        pxEl.textContent = num(px, 2);
+        flash(pxEl, px);
+      } else if (pxEl) {
+        pxEl.textContent = "—";
+      }
+      if (closes && closes.length > 1 && chgEl) {
+        const first = closes[0], last = closes[closes.length - 1];
+        const chg = (last - first) / first;
+        chgEl.textContent = `${chg >= 0 ? "▲" : "▼"} ${signedPct(chg)}`;
+        chgEl.className = "chg mono " + (chg >= 0 ? "up" : "down");
+        chgEl.title = "近 24 小时（96 根 15m）首尾对比";
+      } else if (chgEl) {
+        chgEl.textContent = "—";
+      }
+      drawSpark($("spark" + id), closes);
+    });
+
+    setText("tickFunding", m.funding_rate_annualized == null ? "—" : signedPct(m.funding_rate_annualized), "mono");
+    setText("tickSpread", m.best_bid && m.best_ask ? `${num(m.best_bid, 1)} / ${num(m.best_ask, 1)}` : "—", "mono");
+    const src = $("tickSource");
+    if (src) {
+      const sh = (monitorCache && monitorCache.stream_health) || null;
+      const stream = sh ? (sh.state === "connected" ? "WS 已连接" : `WS ${sh.state || "未知"}`) : "WS —";
+      src.textContent = `${m.market_label || m.market || "币安"} · ${stream}`;
+    }
+    setText("tickAge", m.event_time_ms ? ageText(m.event_time_ms) : "—", "mono");
+  }
+
+  function readingClose(sym) {
+    const rows = (readingCache && readingCache.readings) || [];
+    const hit = rows.find((x) => x && x.symbol === sym && x.interval === "15m");
+    return hit ? hit.close : null;
+  }
+
+  function drawSpark(svg, closes) {
+    if (!svg) return;
+    if (!closes || closes.length < 2) { svg.innerHTML = ""; return; }
+    const w = 86, h = 24, pad = 1;
+    const min = Math.min.apply(null, closes), max = Math.max.apply(null, closes);
+    const span = max - min || 1;
+    const pts = closes.map((v, i) => {
+      const x = pad + (i / (closes.length - 1)) * (w - pad * 2);
+      const y = h - pad - ((v - min) / span) * (h - pad * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(" ");
+    const up = closes[closes.length - 1] >= closes[0];
+    const color = up ? "#0ecb81" : "#f6465d";
+    svg.innerHTML = `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.2" opacity="0.85"></polyline>`;
+  }
+
+  // ------------------------------------------------------------------ 告警横幅
+  function renderBanner() {
+    const bar = $("banner");
+    if (!bar) return;
+    const al = computeAlerts();
+    if (!al.items.length) { bar.hidden = true; return; }
+    bar.hidden = false;
+    const lv = al.level;
+    bar.className = "banner " + (lv >= 3 ? "l3" : lv === 2 ? "l2" : "info-b");
+    $("bannerIcon").textContent = lv >= 3 ? "!" : lv === 2 ? "!" : "i";
+    $("bannerTitle").textContent =
+      lv >= 3 ? `危险 · ${al.items.filter((i) => i.level >= 3).map((i) => i.text)[0] || "需要处理"}`
+      : lv === 2 ? `注意 · ${al.items.filter((i) => i.level >= 2).map((i) => i.text).join("；")}`
+      : "提示";
+    $("bannerDetail").textContent = al.items.map((i) => `L${i.level} ${i.text}`).join("　·　");
+
+    const box = $("bannerActions");
+    const actions = [];
+    al.paused.forEach(([sym, v]) => {
+      actions.push(`<button class="btn danger sm" data-resume="${esc(sym)}" title="${esc(v && v.detail ? v.detail : "")}">确认恢复 ${esc(coin(sym))} 自动开仓</button>`);
+    });
+    if (al.reconGaps.length) {
+      actions.push(`<button class="btn sm" data-act="reconcile">立即对账</button>`);
+    }
+    box.innerHTML = actions.join("");
+    box.querySelectorAll("[data-resume]").forEach((b) =>
+      b.addEventListener("click", () => resumeSymbol(b.dataset.resume)));
+    box.querySelectorAll('[data-act="reconcile"]').forEach((b) =>
+      b.addEventListener("click", () => doReconcile()));
+  }
+
+  // ------------------------------------------------------------------ 交易台
+  function renderKpis() {
+    const s = summaryCache || {};
+    const r = runnerRisk();
+    const st = statusCache || {};
+    const nets = exchangeNets();
+    const bySym = s.by_symbol || {};
+    const posBySym = s.positions_by_symbol || {};
+
+    // 钱包权益
+    const wallet = numOrNull(s.wallet_balance);
+    setText("kpiEquity", wallet == null ? "—" : num(wallet, 2), "v mono");
+    flash($("kpiEquity"), wallet);
+    setText("kpiEquitySub", s.available_balance == null ? "可用 —" : `可用 ${num(s.available_balance, 2)} · USDT`);
+
+    // 未实现
+    const upnl = numOrNull(s.unrealized_pnl);
+    const upEl = $("kpiUpnl");
+    if (upEl) {
+      upEl.textContent = upnl == null ? "—" : signed(upnl, 2);
+      upEl.className = "v mono " + pnlCls(upnl);
+      flash(upEl, upnl);
+    }
+    const uParts = ["BTCUSDT", "ETHUSDT"].map((sym) => {
+      const v = (posBySym[sym] || {}).unrealized_pnl;
+      return v == null ? `${coin(sym)} —` : `${coin(sym)} ${signed(v, 2)}`;
+    });
+    setText("kpiUpnlSub", uParts.join(" · ") + " · USDT");
+
+    // 今日盈亏
+    const dayPnl = r.dayPnl;
+    const dayEl = $("kpiDayPnl");
+    if (dayEl) {
+      dayEl.textContent = dayPnl == null ? "—" : signedPct(dayPnl);
+      dayEl.className = "v mono " + pnlCls(dayPnl);
+      flash(dayEl, dayPnl);
+    }
+    const dayUsd = r.dayStart > 0 ? r.mtm - r.dayStart : null;
+    setText("kpiDayPnlSub", `日初 ${num(r.dayStart, 2)}${dayUsd == null ? "" : ` · ${signed(dayUsd, 2)} USDT`}`);
+
+    // 回撤
+    const dd = r.dd;
+    const ddEl = $("kpiDd");
+    if (ddEl) {
+      ddEl.textContent = dd == null ? "—" : pct(dd);
+      ddEl.className = "v mono " + (dd == null ? "" : dd >= 0.10 ? "down" : dd >= 0.05 ? "warn" : "");
+      flash(ddEl, dd);
+    }
+    setText("kpiDdSub", `峰值 ${num(r.peakEq, 2)} · 运行器口径`);
+
+    // 已实现净额（窗口）
+    const real = numOrNull(s.net_pnl);
+    const realEl = $("kpiReal");
+    if (realEl) {
+      realEl.textContent = real == null ? "—" : signed(real, 2);
+      realEl.className = "v mono " + pnlCls(real);
+      flash(realEl, real);
+    }
+    const fee = numOrNull(s.commission);
+    setText("kpiRealSub", `自 ${esc(s.record_start || "—")} · 手续费 ${num(fee, 2)}`);
+
+    // 保证金占用
+    const totalMargin = ["BTCUSDT", "ETHUSDT"].reduce(
+      (acc, sym) => acc + (Number((nets[sym] || {}).margin) || 0), 0);
+    const marginPct = r.mtm > 0 ? totalMargin / r.mtm : null;
+    const mEl = $("kpiMargin");
+    if (mEl) {
+      mEl.textContent = totalMargin > 0 ? num(totalMargin, 2) : "—";
+      mEl.className = "v mono " + (marginPct == null ? "" : marginPct >= 0.8 ? "down" : marginPct >= 0.6 ? "warn" : "");
+      flash(mEl, totalMargin);
+    }
+    const mSub = ["BTCUSDT", "ETHUSDT"].map((sym) => {
+      const v = Number((nets[sym] || {}).margin) || 0;
+      return `${coin(sym)} ${num(v, 0)}`;
+    });
+    setText("kpiMarginSub", `占用 ${marginPct == null ? "—" : pct(marginPct)} · ${mSub.join(" · ")}`);
+
+    setText("kpiFoot",
+      `记录窗口自 ${s.record_start || "—"} 起（委托/成交/成本/回撤）；持仓、余额、挂单为交易所实时状态。` +
+      (s.record_start_note ? "" : ""));
+
+    // 模式提示（若闸门关闭，明确展示）
+    const rp = (runnerInfo() && runnerInfo().params) || {};
+    const gates = [];
+    if (rp.block_on_daily_loss === false) gates.push("日亏闸门关");
+    if (rp.halt_on_max_drawdown === false) gates.push("回撤熔断关");
+    if (gates.length) setText("kpiFoot", (($("kpiFoot") || {}).textContent || "") + ` 注意：${gates.join(" / ")}（以运行器参数为准，监控页可见）。`);
+  }
+
+  function renderPositions() {
+    const st = statusCache || {};
+    const nets = exchangeNets();
+    const sources = st.position_sources || [];
+    const m = marketCache || {};
+    const box = $("posBox");
     if (!box) return;
-    const rows = ((reading && reading.readings) || []).filter(
-      (r) => r && r.symbol && r.interval === "15m"
-    );
+
+    let html = "";
+    let any = false;
+    ["BTCUSDT", "ETHUSDT"].forEach((sym) => {
+      const lots = sources.filter((src) => (src.symbol || "BTCUSDT") === sym);
+      const pos = nets[sym] || {};
+      const side = String(pos.side || "FLAT").toUpperCase();
+      const qty = Number(pos.quantity || 0);
+      if (!lots.length && (side === "FLAT" || !qty)) return;
+      any = true;
+      const mark = Number(pos.mark_price ?? (sym === "BTCUSDT" ? m.mark_price : null) ?? 0);
+
+      lots.forEach((src) => {
+        const lotSide = String(src.side || "LONG").toUpperCase();
+        const sign = lotSide === "LONG" ? 1 : -1;
+        const lotQty = Number(src.qty || 0);
+        const lotPx = Number(src.px || 0);
+        const est = mark && lotPx ? (mark - lotPx) * lotQty * sign : null;
+        const notional = mark ? lotQty * mark * sign : null;
+        const margin = notional == null ? null : Math.abs(notional) / 10;
+        html += `<tr>
+          <td>${coinChip(sym)}</td>
+          <td><span class="src src-strategy">${esc(src.name || src.strategy_id || "策略")}</span></td>
+          <td>${sideChip(lotSide)}</td>
+          <td class="num">${notional == null ? "—" : num(notional, 2)}<span class="sub">${num(lotQty, 4)} ${coin(sym)}</span></td>
+          <td class="num">${num(lotPx, 2)}<span class="sub">参考价</span></td>
+          <td class="num">${mark ? num(mark, 2) : "—"}</td>
+          <td class="num">${margin == null ? "—" : num(margin, 2)}<span class="sub">估算</span></td>
+          <td class="num">${est == null ? "—" : pnlHtml(est)}<span class="sub">估算</span></td>
+          <td class="c">${src.layer_count != null ? `${src.layer_count}/${src.max_layers || 3}` : "—"}</td>
+          <td><span class="mono">${esc(fmtKlineBeijing(src.bar_ms, src.interval))}</span><span class="sub why">${esc(src.reason || "—")}</span></td>
+        </tr>`;
+      });
+
+      if (side !== "FLAT" && qty) {
+        const netNotional = Number(pos.notional || 0) || (mark ? qty * mark * (side === "LONG" ? 1 : -1) : 0);
+        const netMargin = Number(pos.margin || 0) || Math.abs(netNotional) / 10;
+        const upnl = Number(pos.unrealized_pnl || 0);
+        html += `<tr class="is-net">
+          <td>${coinChip(sym)}</td>
+          <td><span class="tag dim">币安净仓</span></td>
+          <td>${sideChip(side)}</td>
+          <td class="num">${num(netNotional, 2)}<span class="sub">${num(qty, 4)} ${coin(sym)}</span></td>
+          <td class="num">${pos.entry_price ? num(pos.entry_price, 2) : "—"}<span class="sub">成交均价</span></td>
+          <td class="num">${pos.mark_price ? num(pos.mark_price, 2) : (mark ? num(mark, 2) : "—")}</td>
+          <td class="num">${num(netMargin, 2)}<span class="sub">交易所</span></td>
+          <td class="num">${pnlHtml(upnl)}<span class="sub">交易所</span></td>
+          <td class="c">—</td>
+          <td><span class="sub why">${lots.length > 1 ? "两条策略合成" : lots[0] ? `${esc(lots[0].name)} 对应净仓` : "交易所账户"}</span></td>
+        </tr>`;
+      }
+    });
+
+    box.innerHTML = html || `<tr><td colspan="10"><div class="empty"><b>空仓</b>当前无持仓</div></td></tr>`;
+
+    const liveNets = ["BTCUSDT", "ETHUSDT"].filter((sym) => {
+      const p = nets[sym] || {};
+      return String(p.side || "FLAT").toUpperCase() !== "FLAT" && Number(p.quantity || 0);
+    });
+    const sideTag = $("posSideTag");
+    if (sideTag) {
+      sideTag.textContent = liveNets.length
+        ? liveNets.map((sym) => `${coin(sym)} ${sideZh(nets[sym].side)}`).join(" · ")
+        : "空仓";
+      sideTag.className = "tag " + (liveNets.length ? "up" : "dim");
+    }
+    const totalMargin = ["BTCUSDT", "ETHUSDT"].reduce(
+      (acc, sym) => acc + (Number((nets[sym] || {}).margin) || 0), 0);
+    setText("posMarginTag", totalMargin > 0 ? `保证金 ${num(totalMargin, 2)} USDT` : "保证金 —", "mono");
+    setText("posFoot", "策略腿与币安净仓逐位核对：数量应相等；不等即为外部干预、漏单或部分成交，需查对账。两行开仓价口径不同（参考价 vs 成交均价）。");
+  }
+
+  function renderOpenOrders() {
+    const st = statusCache || {};
+    const list = st.open_orders || [];
+    const box = $("openOrdersBox");
+    if (!box) return;
+    const nProtect = list.filter((o) => o.reduceOnly).length;
+    setText("openOrdersCount", String(list.length), "tag " + (list.length ? "warn" : "dim"));
+    setText("openOrdersMeta", list.length ? `保护单 ${nProtect} / 开仓单 ${list.length - nProtect}` : "追价完成后不留挂单");
+    box.innerHTML = list.length ? list.map((o) => {
+      const isProt = !!o.reduceOnly;
+      const sideTxt = o.side === "SELL" ? "卖出" : "买入";
+      const sideCls = o.side === "SELL" ? "down" : "up";
+      const kind = isProt
+        ? `<span class="tag warn" title="${esc(o.clientOrderId || "")}">保护单</span>`
+        : `<span class="tag info">开仓/加仓</span>`;
+      return `<tr>
+        <td><span class="mono">${esc(fmtHMS(o.time))}</span></td>
+        <td>${coinChip(o.symbol)}</td>
+        <td class="${sideCls}">${sideTxt}</td>
+        <td>${kind}</td>
+        <td class="num">${num(o.price, 2)}</td>
+        <td class="num">${num(o.origQty, 4)}</td>
+        <td><span class="mono muted" title="${esc(o.clientOrderId || "")}">${esc(String(o.clientOrderId || "").slice(0, 14))}</span></td>
+      </tr>`;
+    }).join("") : `<tr><td colspan="7"><div class="empty"><b>无挂单</b>追价完成后不留挂单</div></td></tr>`;
+  }
+
+  // ------------------------------------------------------------------ 历史记录
+  const isHistoryRow = (row) => {
+    const start = Number((summaryCache || {}).record_start_ms || 0);
+    return String(row.source || "") === "strategy" &&
+      (!start || Number(row.time ?? row.updateTime ?? 0) >= start);
+  };
+
+  function orderPnlMap() {
+    const map = {};
+    (tradesCache || []).forEach((t) => {
+      const id = String(t.orderId || "");
+      if (!id) return;
+      if (!map[id]) map[id] = { realized: 0, commission: 0 };
+      map[id].realized += Number(t.realizedPnl || 0);
+      map[id].commission += Number(t.commission || 0);
+    });
+    return map;
+  }
+
+  function collapseTradesByOrder() {
+    const by = {};
+    (tradesCache || []).filter(isHistoryRow).forEach((t) => {
+      const id = String(t.orderId || "");
+      if (!id) return;
+      if (!by[id]) {
+        by[id] = { orderId: id, time: t.time, source: t.source, symbol: t.symbol || "",
+          side: t.side, maker: true, qty: 0, notional: 0, realized: 0, commission: 0, fills: 0 };
+      }
+      const row = by[id];
+      row.symbol = row.symbol || t.symbol || "";
+      row.time = Math.max(Number(row.time || 0), Number(t.time || 0));
+      row.qty += Number(t.qty || 0);
+      row.notional += Number(t.price || 0) * Number(t.qty || 0);
+      row.realized += Number(t.realizedPnl || 0);
+      row.commission += Number(t.commission || 0);
+      row.fills += 1;
+      row.maker = row.maker && !!t.maker;
+    });
+    return Object.values(by).sort((a, b) => Number(b.time || 0) - Number(a.time || 0));
+  }
+
+  function renderHistory() {
+    const box = $("histBox");
+    if (!box) return;
+    setText("histTitle", histMode === "orders" ? "历史委托" : "历史成交");
+    const start = (summaryCache || {}).record_start || "—";
+    const pnlMap = orderPnlMap();
+
+    if (histMode === "orders") {
+      const rows = (ordersCache || [])
+        .filter((o) => isHistoryRow(o) && Number(o.executedQty || 0) > 0)
+        .sort((a, b) => Number(b.time || 0) - Number(a.time || 0))
+        .slice(0, historyLimit);
+      setText("histMeta", `${rows.length} / 最多 ${historyLimit} 条 · 自 ${start}`, "mono");
+      box.innerHTML = `<table class="grid">
+        <thead><tr><th>时间</th><th>合约</th><th>方向 / 类型</th><th class="num">委托 / 均价</th><th class="num">委托量</th><th class="num">成交量</th><th class="num">盈亏</th><th>来源</th><th>状态</th></tr></thead>
+        <tbody>${rows.length ? rows.map((o) => {
+          const pnl = pnlMap[String(o.orderId)];
+          const net = pnl ? pnl.realized - pnl.commission : null;
+          return `<tr>
+            <td><span class="mono">${esc(fmtMDHM(o.time))}</span></td>
+            <td>${coinChip(o.symbol)}</td>
+            <td>${o.side === "BUY" ? "买" : "卖"} · ${esc(o.type || "")}</td>
+            <td class="num">${num(o.price, 2)} / ${Number(o.avgPrice) ? num(o.avgPrice, 2) : "—"}</td>
+            <td class="num">${num(o.origQty, 4)}</td>
+            <td class="num">${num(o.executedQty, 4)}</td>
+            <td class="num">${net == null ? "—" : pnlHtml(net)}</td>
+            <td><span class="src src-strategy">策略自动</span></td>
+            <td>${esc(statusZh(o.status))}</td>
+          </tr>`;
+        }).join("") : `<tr><td colspan="9"><div class="empty"><b>无记录</b>记录起点之后暂无已成交的策略委托</div></td></tr>`}</tbody>
+      </table>`;
+    } else {
+      const rows = collapseTradesByOrder().slice(0, historyLimit);
+      setText("histMeta", `${rows.length} / 最多 ${historyLimit} 笔 · 自 ${start}`, "mono");
+      box.innerHTML = `<table class="grid">
+        <thead><tr><th>时间</th><th>合约</th><th>订单号</th><th>方向 / 角色</th><th class="num">价格 × 数量</th><th class="num">已实现</th><th class="num">手续费</th><th class="num">净盈亏</th><th>来源</th></tr></thead>
+        <tbody>${rows.length ? rows.map((t) => {
+          const px = t.qty ? t.notional / t.qty : 0;
+          const net = t.realized - t.commission;
+          return `<tr>
+            <td><span class="mono">${esc(fmtMDHM(t.time))}</span></td>
+            <td>${coinChip(t.symbol)}</td>
+            <td><span class="mono muted" title="${esc(t.orderId)}">…${esc(String(t.orderId).slice(-8))}</span></td>
+            <td>${t.side === "BUY" ? "买" : "卖"} · ${t.maker ? "Maker" : "Taker"}${t.fills > 1 ? ` ×${t.fills}` : ""}</td>
+            <td class="num">${num(px, 2)} × ${num(t.qty, 4)}</td>
+            <td class="num">${signed(t.realized, 2)}</td>
+            <td class="num">${num(t.commission, 4)}</td>
+            <td class="num">${pnlHtml(net)}</td>
+            <td><span class="src src-strategy">策略自动</span></td>
+          </tr>`;
+        }).join("") : `<tr><td colspan="9"><div class="empty"><b>无记录</b>记录起点之后暂无策略成交</div></td></tr>`}</tbody>
+      </table>`;
+    }
+  }
+
+  function statusZh(st) {
+    const s = String(st || "").toUpperCase();
+    if (s === "FILLED") return "已成交";
+    if (s === "CANCELED") return "已撤销";
+    if (s === "NEW") return "挂单中";
+    if (s === "PARTIALLY_FILLED") return "部分成交";
+    if (s === "EXPIRED") return "已过期";
+    return s || "—";
+  }
+
+  // ------------------------------------------------------------------ 右栏：系统监控清单
+  function renderHealth() {
+    const box = $("healthList");
+    if (!box) return;
+    const hb = heartbeatState();
+    const mk = marketState();
+    const pr = protectionState();
+    const rc = reconState();
+    const r = runnerRisk();
+    const rp = (runnerInfo() && runnerInfo().params) || {};
+    const st = statusCache || {};
+    const g = st.guardian || {};
+    const sh = (monitorCache && monitorCache.stream_health) || null;
+    const s = summaryCache || {};
+
+    const rows = [];
+    rows.push({
+      cls: hb.level === "bad" ? "is-bad" : hb.level === "warn" ? "is-warn" : "",
+      dot: hb.level === "ok" ? "green pulse" : hb.level === "warn" ? "amber" : "red",
+      k: "运行器", v: hb.age == null ? "无心跳" : `${hb.text} · ${ageText(runnerInfo()?.updated_ms)}`,
+      x: runnerInfo() ? `pid ${runnerInfo().pid || "—"}` : "",
+    });
+    rows.push({
+      cls: mk.level === "bad" ? "is-bad" : mk.level === "warn" ? "is-warn" : "",
+      dot: mk.level === "ok" ? "green pulse" : mk.level === "warn" ? "amber" : "red",
+      k: "行情链路", v: sh && sh.state !== "connected" ? `WS ${sh.state}` : mk.text,
+      x: mk.ageSec == null ? "" : `${Math.round(mk.ageSec)}s 前`,
+    });
+    const riskBad = r.ctx.halted || (r.dayLoss != null && r.dayLoss >= 0.03) || (r.dd != null && r.dd >= 0.10);
+    const riskWarn = !riskBad && ((r.dayLoss != null && r.dayLoss >= 0.02) || (r.dd != null && r.dd >= 0.05));
+    rows.push({
+      cls: riskBad ? "is-bad" : riskWarn ? "is-warn" : "",
+      dot: riskBad ? "red" : riskWarn ? "amber" : "green",
+      k: "风控", v: riskBad ? "危险" : riskWarn ? "注意" : "正常",
+      x: `日亏 ${pct(r.dayLoss)} / 回撤 ${pct(r.dd)}`,
+    });
+    const protectOrders = (st.open_orders || []).filter((o) => o.reduceOnly).length;
+    rows.push({
+      cls: pr.level === "bad" ? "is-bad" : pr.level === "warn" ? "is-warn" : "",
+      dot: pr.level === "ok" ? "green" : pr.level === "warn" ? "amber" : "red",
+      k: "保护单", v: pr.text,
+      x: `${protectOrders} 张挂单 · ${g.allow_new_entries ? "允许开新仓" : "禁止开新仓"}`,
+    });
+    rows.push({
+      cls: rc.ok ? "" : "is-bad",
+      dot: rc.ok ? "green" : "red",
+      k: "账本对账", v: rc.ok ? "一致" : "不一致",
+      x: rc.ok ? "" : rc.gaps.map((g2) => `${coin(g2.sym)} 差 ${num(g2.gap, 4)}`).join(" · "),
+    });
+    rows.push({
+      cls: r.ctx.missed_bars ? "is-warn" : "",
+      dot: r.ctx.missed_bars ? "amber" : "green",
+      k: "数据质量", v: `错过 ${r.ctx.missed_bars ?? 0} 根 / ${r.ctx.missed_signals ?? 0} 信号`,
+      x: s.coverage ? `成交覆盖 ${s.coverage.fills ?? "—"} 笔` : "",
+    });
+    rows.push({
+      cls: "",
+      dot: "blue",
+      k: "记录窗口", v: `自 ${s.record_start || "—"}`,
+      x: `净额 ${signed(s.net_pnl, 2)}`,
+    });
+    if (rp.block_on_daily_loss === false || rp.halt_on_max_drawdown === false) {
+      const off = [];
+      if (rp.block_on_daily_loss === false) off.push("日亏闸门关");
+      if (rp.halt_on_max_drawdown === false) off.push("回撤熔断关");
+      rows.push({ cls: "is-warn", dot: "amber", k: "风控闸门", v: off.join(" / "), x: "运行器参数" });
+    }
+
+    box.innerHTML = rows.map((r2) =>
+      `<div class="hl ${r2.cls}"><span class="dot ${r2.dot}"></span><span class="hl-k">${esc(r2.k)}</span><span class="hl-v">${r2.v}</span>${r2.x ? `<span class="hl-x">${r2.x}</span>` : ""}</div>`
+    ).join("");
+  }
+
+  // ------------------------------------------------------------------ 右栏：信号卡
+  function renderSignals() {
+    const box = $("sigCards");
+    if (!box) return;
+    const reading = readingCache || {};
+    const rows = (reading.readings || []).filter((r) => r && r.symbol && r.interval === "15m");
+    setText("sigMeta", reading.updated_ms ? `更新 ${fmtHMS(reading.updated_ms)}` : "—", "ph-meta mono");
     if (!rows.length) {
-      box.innerHTML = empty("等待读数", "运行器尚未落盘 latest_reading");
+      box.innerHTML = `<div class="empty"><b>等待读数</b>运行器尚未落盘 latest_reading</div>`;
       return;
     }
-    const maxHist = Math.max.apply(
-      null,
-      rows.map((r) => Math.abs(Number(r.MACD_HIST || 0))).concat([1])
-    );
-    box.innerHTML = rows
-      .map((r) => {
-        const k = Number(r.K || 0);
-        const d = Number(r.D || 0);
-        const hist = Number(r.MACD_HIST || 0);
-        const cross = r.gold ? "金叉" : r.dead ? "死叉" : "—";
-        const crossCls = r.gold ? "positive" : r.dead ? "negative" : "muted";
-        const gate = hist > 0 ? "柱为正" : hist < 0 ? "柱为负" : "柱为 0";
-        const gateCls = hist > 0 ? "positive" : hist < 0 ? "negative" : "muted";
-        let result = r.position || "无信号";
-        let cls = "muted";
-        if (r.signal_long) { result = "做多"; cls = "positive"; }
-        else if (r.signal_short) { result = "做空"; cls = "negative"; }
-        else if (
-          (r.gold && hist <= 0) || (r.dead && hist >= 0)
-        ) { result = "方向背离 · 丢弃"; cls = "warn"; }
-        const sid = STRAT_ID[`${r.symbol}|${r.interval}`] || r.symbol;
-        const barW = Math.max(2, Math.round((Math.abs(hist) / maxHist) * 20));
-        const kp = Math.max(0, Math.min(100, k));
-        const dp = Math.max(0, Math.min(100, d));
-        return `<div class="sig-row">
-          <span class="sig-id">${esc(sid)}</span>
-          <span class="sig-sym">${esc(coin(r.symbol))} <em>${esc(r.interval)}</em></span>
-          <span class="sig-kdj">
-            <span class="meter"><span class="fill" style="width:${kp.toFixed(1)}%"></span><i class="mk-k" style="left:${kp.toFixed(1)}%"></i><i class="mk-d" style="left:${dp.toFixed(1)}%"></i></span>
-            <span class="num">${num(k, 2)} / ${num(d, 2)}</span>
-          </span>
-          <span class="sig-macd">
-            <span class="mb"><i class="${hist >= 0 ? "p" : "n"}" style="width:${barW}px"></i></span>
-            <span class="num ${hist >= 0 ? "positive" : "negative"}">${signed(hist, 4)}</span>
-          </span>
-          <span class="${crossCls}">${esc(cross)}</span>
-          <span class="${gateCls}">${esc(gate)}</span>
-          <span class="sig-result ${cls}">${esc(result)}<small>信号 K 线 ${esc(r.bar_utc || "—")} UTC</small></span>
-        </div>`;
-      })
-      .join("");
+    const st = statusCache || {};
+    const srcs = st.position_sources || [];
+    box.innerHTML = rows.map((r) => {
+      const sym = r.symbol;
+      const k = numOrNull(r.K), d = numOrNull(r.D), hist = numOrNull(r.MACD_HIST);
+      const src = srcs.find((x) => (x.symbol || "") === sym);
+      const posTag = src
+        ? `<span class="tag ${src.side === "LONG" ? "up" : "down"}">${sideZh(src.side)} ${src.layer_count ?? 1}/${src.max_layers ?? 3} 层</span>`
+        : `<span class="tag dim">空仓</span>`;
+      const cross = r.gold ? "金叉" : r.dead ? "死叉" : "无交叉";
+      const crossCls = r.gold ? "up" : r.dead ? "down" : "muted";
+      const histCls = hist == null ? "" : hist > 0 ? "up" : hist < 0 ? "down" : "";
+      const kdRel = k != null && d != null ? (k > d ? "K 在 D 上" : k < d ? "K 在 D 下" : "K=D") : "—";
+      const missed = (r.missed_bars || r.missed_signals)
+        ? ` · <span class="warn">错过 ${r.missed_bars || 0}/${r.missed_signals || 0}</span>` : "";
+      return `<div class="sig-card">
+        <div class="sig-head">
+          <span class="name">${esc(coin(sym))} 15m</span>
+          <span class="id">${esc(src ? src.strategy_id : sym === "BTCUSDT" ? "kdj15" : "eth15")}</span>
+          ${posTag}
+        </div>
+        <div class="sig-nums">
+          <span class="sig-num"><span class="k">K</span><span class="v mono">${k == null ? "—" : num(k, 1)}</span></span>
+          <span class="sig-num"><span class="k">D</span><span class="v mono">${d == null ? "—" : num(d, 1)}</span></span>
+          <span class="sig-num"><span class="k">MACD柱</span><span class="v mono ${histCls}">${hist == null ? "—" : signed(hist, 2)}</span></span>
+        </div>
+        ${sigSpark(r.series)}
+        <div class="sig-foot">
+          <span class="grow">${esc(fmtKlineBeijing(r.bar_ms, r.interval))} · <span class="${crossCls}">${cross}</span> · ${kdRel}${missed}</span>
+        </div>
+      </div>`;
+    }).join("");
   }
 
-  function renderSwiss() {
-    renderRiskStrip(swissReading, statusCache, summaryCache);
-    renderAlertLadder(swissReading, statusCache, summaryCache);
-    renderEquityCurve(swissEquity, summaryCache);
-    renderSignalTable(swissReading);
+  function sigSpark(series) {
+    const k = (series && series.k) || [];
+    const d = (series && series.d) || [];
+    const h = (series && series.hist) || [];
+    if (k.length < 2) return "";
+    const W = 240, H = 40, topH = 26, pad = 2;
+    const n = k.length;
+    const xAt = (i) => pad + (i / (n - 1)) * (W - pad * 2);
+    const yAt = (v) => pad + (1 - Math.min(100, Math.max(0, v)) / 100) * (topH - pad * 2);
+    const line = (arr) => arr.map((v, i) => `${xAt(i).toFixed(1)},${yAt(Number(v)).toFixed(1)}`).join(" ");
+    const maxH = Math.max.apply(null, h.map((v) => Math.abs(Number(v) || 0)).concat([1e-9]));
+    const bw = (W - pad * 2) / n * 0.6;
+    const bars = h.map((v, i) => {
+      const val = Number(v) || 0;
+      const hh = Math.max(1, Math.abs(val) / maxH * (H - topH - pad));
+      const x = xAt(i) - bw / 2;
+      const y = val >= 0 ? H - hh - pad : H - pad - 0.5;
+      const color = val >= 0 ? "#0ecb81" : "#f6465d";
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${hh.toFixed(1)}" fill="${color}" opacity="0.55"></rect>`;
+    }).join("");
+    return `<svg class="sig-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
+      <polyline points="${line(k)}" fill="none" stroke="#6aa9ff" stroke-width="1.4"></polyline>
+      <polyline points="${line(d)}" fill="none" stroke="#d9a441" stroke-width="1.4"></polyline>
+      ${bars}
+    </svg>`;
   }
 
-  async function loadSwissPanels() {
-    // 只读本机落盘的读数与权益记录（不联网、不查交易所）。
-    // 账户与交易状态复用 loadSummary / loadStatus 的结果，避免同一轮
-    // 刷新把同一个币安接口查两遍而触发 429。
-    const res = await Promise.allSettled([
-      api("/api/strategy/reading"),
-      api("/api/equity/curve"),
+  // ------------------------------------------------------------------ 事件流
+  function feedItem(a, compact) {
+    const lv = String(a.level || "INFO").toUpperCase();
+    const cls = lv === "CRITICAL" ? "is-critical" : "";
+    const t = Number(a.epoch || 0) * 1000;
+    return `<div class="feed-item ${cls}">
+      <span class="lv ${lv}">${lv === "CRITICAL" ? "CRIT" : lv}</span>
+      <span class="tx"><b>${esc(a.title || a.key || "事件")}</b>${a.detail ? `<span>${esc(String(a.detail).slice(0, compact ? 80 : 200))}</span>` : ""}</span>
+      <span class="ts">${esc(t ? fmtMDHM(t) : "—")}</span>
+    </div>`;
+  }
+
+  function renderFeed() {
+    const box = $("feedBox");
+    if (!box) return;
+    const list = alertsCache;
+    if (!list) { box.innerHTML = `<div class="empty"><b>读取中</b>—</div>`; return; }
+    if (!list.length) { box.innerHTML = `<div class="empty"><b>暂无事件</b>alerts.jsonl 为空</div>`; return; }
+    setText("feedMeta", `近 ${list.length} 条 · 最新 ${fmtHMS(Number(list[0].epoch || 0) * 1000)}`, "ph-meta mono");
+    box.innerHTML = list.slice(0, 9).map((a) => feedItem(a, true)).join("");
+  }
+
+  // ------------------------------------------------------------------ 监控视图
+  function kvRows(box, rows) {
+    if (!box) return;
+    box.innerHTML = rows.map((r) =>
+      `<div class="kv-row ${r.cls || ""}"><span class="k">${r.k}</span><span class="v">${r.v}</span>${r.x ? `<span class="x">${r.x}</span>` : ""}</div>`
+    ).join("");
+  }
+
+  function renderMonitorView() {
+    const st = statusCache || {};
+    const s = summaryCache || {};
+    const reading = readingCache || {};
+    const r = runnerInfo();
+    const rp = (r && r.params) || {};
+    const g = st.guardian || {};
+    const mk = marketCache || {};
+    const mon = monitorCache || {};
+    const sh = mon.stream_health || null;
+    const lock = mon.lock || null;
+    const risk = runnerRisk();
+    const nets = exchangeNets();
+
+    // ---- 运行器
+    const hb = heartbeatState();
+    setText("mrMeta", r && r.updated_ms ? `心跳 ${fmtTime(r.updated_ms)}` : "无心跳", "ph-meta mono");
+    const uptime = r && r.started_ms ? ((Date.now() - Number(r.started_ms)) / 3600000).toFixed(1) + " h" : "—";
+    kvRows($("mrKv"), [
+      { k: "状态", v: `<span class="${hb.level === "ok" ? "up" : hb.level === "warn" ? "warn" : "down"}">${esc(hb.text)}</span>`, x: r ? esc(r.status || "") : "" },
+      { k: "模式", v: esc(r && r.mode || "—"), x: "testnet_orders = 实盘下单" },
+      { k: "进程", v: r && r.pid ? `pid ${r.pid}` : "—", x: lock && lock.pid ? `锁文件 pid ${lock.pid}` : "无锁文件" },
+      { k: "启动时间", v: r && r.started_ms ? fmtTime(r.started_ms) : "—", x: `运行 ${uptime}` },
+      { k: "心跳时间", v: r && r.updated_ms ? fmtTime(r.updated_ms) : "—", x: hb.age == null ? "" : `${Math.round(hb.age)}s 前` },
+      { k: "轮询间隔", v: r && r.interval_sec ? `${r.interval_sec}s` : "—", x: "每轮检查信号与净仓" },
+      { k: "活跃策略", v: esc((r && r.strategies || []).join(" · ") || "—"), x: "5m 已停用" },
+      { k: "品种 / 市场", v: esc(((r && r.symbols) || []).join(" + ") || "—"), x: esc(r && r.market || "—") },
+      { k: "参数指纹", v: esc(r && r.params_fingerprint || "—"), x: "变更需重启生效" },
     ]);
-    swissReading = res[0].status === "fulfilled" ? res[0].value : null;
-    swissEquity = res[1].status === "fulfilled" ? res[1].value : null;
-    renderSwiss();
-  }
 
-  async function loadMarketHero() {
-    try {
-      const m = await api("/api/market");
-      if (m && m.ok) {
-        if ($("mktSource")) {
-          $("mktSource").textContent = (m.market_label || m.market || "Binance") + " · 标记价";
-        }
-        if ($("mktSpread")) {
-          $("mktSpread").textContent = `${num(m.best_bid, 2)} / ${num(m.best_ask, 2)}`;
-        }
-        if ($("mktFunding")) {
-          $("mktFunding").textContent =
-            m.funding_rate_annualized == null ? "—" : pct(m.funding_rate_annualized, 2);
-        }
-        if ($("mktStamp")) $("mktStamp").textContent = fmtTime(m.event_time_ms);
-      }
-    } catch (e) { /* 保持原样 */ }
-    // ETH 价格直接取运行器落盘的 ETH 读数，不再单独请求一次币安 K 线。
-    const eth = ((swissReading && swissReading.readings) || []).find(
-      (r) => r && r.symbol === "ETHUSDT"
-    );
-    if ($("ethMark")) {
-      $("ethMark").textContent =
-        eth && Number.isFinite(Number(eth.close)) ? num(eth.close, 2) : "—";
+    // ---- 行情链路
+    const kline = sh && sh.kline_age_sec || {};
+    const markAge = sh && sh.mark_age_sec || {};
+    setText("mfMeta", mk.event_time_ms ? `行情 ${fmtTime(mk.event_time_ms)}` : "—", "ph-meta mono");
+    const rd = (reading.readings || []).find((x) => x && x.symbol === "BTCUSDT" && x.interval === "15m") || reading;
+    kvRows($("mfKv"), [
+      { k: "市场", v: esc(mk.market_label || mk.market || "—"), x: esc(mk.source || "") },
+      { k: "标记价 BTC", v: mk.mark_price ? num(mk.mark_price, 2) : "—", x: mk.event_time_ms ? `${Math.round((Date.now() - mk.event_time_ms) / 1000)}s 前` : "" },
+      { k: "指数价", v: mk.index_price ? num(mk.index_price, 2) : "—" },
+      { k: "资金费年化", v: mk.funding_rate_annualized == null ? "—" : signedPct(mk.funding_rate_annualized) },
+      { k: "买一 / 卖一", v: mk.best_bid && mk.best_ask ? `${num(mk.best_bid, 1)} / ${num(mk.best_ask, 1)}` : "—" },
+      { k: "WS 流", v: sh ? (sh.state === "connected" ? `<span class="up">已连接</span>` : `<span class="warn">${esc(sh.state)}</span>`) : "无数据", x: sh ? `事件 ${sh.events ?? "—"} · ${sh.updated_ms ? ageText(sh.updated_ms) + " 前" : ""}` : "" },
+      { k: "K线年龄", v: `BTC 15m ${kline["BTCUSDT|15m"] ?? "—"}s · ETH 15m ${kline["ETHUSDT|15m"] ?? "—"}s`, x: `1h 线 BTC ${kline["BTCUSDT|1h"] ?? "—"}s` },
+      { k: "标记价年龄", v: `BTC ${markAge["BTCUSDT"] ?? "—"}s · ETH ${markAge["ETHUSDT"] ?? "—"}s` },
+      { k: "运行器K线", v: rd && rd.bar_utc ? `${rd.bar_utc} UTC` : "—", x: rd && rd.close ? `收 ${num(rd.close, 2)}` : "" },
+      { k: "错过 K 线", v: `${risk.ctx.missed_bars ?? 0} 根 / ${risk.ctx.missed_signals ?? 0} 信号`, x: "停机只记账不补单" },
+      { k: "行情通道", v: esc(String(rd && rd.kline_url || "—").replace("https://", "")), x: "测试网 K 线" },
+    ]);
+
+    // ---- 风控闸门
+    setText("mrkMeta", risk.ctx.halted ? "已熔断" : "未熔断", "ph-meta mono");
+    const dayGate = rp.block_on_daily_loss === false ? `<span class="warn">关闭</span>` : `<span class="up">启用</span>`;
+    const ddGate = rp.halt_on_max_drawdown === false ? `<span class="warn">关闭</span>` : `<span class="up">启用</span>`;
+    kvRows($("mrkKv"), [
+      { k: "日亏额度", v: `${pct(risk.dayLoss)} <span class="sub">/ 3%</span>`, x: risk.dayLoss != null && risk.dayLoss >= 0.02 ? "接近上限" : "未到上限", cls: risk.dayLoss != null && risk.dayLoss >= 0.03 ? "is-bad" : risk.dayLoss != null && risk.dayLoss >= 0.02 ? "is-warn" : "" },
+      { k: "当前回撤", v: `${pct(risk.dd)} <span class="sub">/ 10%</span>`, x: risk.dd != null && risk.dd >= 0.05 ? "已过 5%" : "未到 5%", cls: risk.dd != null && risk.dd >= 0.1 ? "is-bad" : risk.dd != null && risk.dd >= 0.05 ? "is-warn" : "" },
+      { k: "熔断状态", v: risk.ctx.halted ? `<span class="down">halted = true</span>` : "halted = false", x: risk.ctx.halted ? "等待人工解除" : "正常" },
+      { k: "日亏闸门", v: dayGate, x: "block_on_daily_loss" },
+      { k: "回撤熔断", v: ddGate, x: "halt_on_max_drawdown" },
+      { k: "开新仓", v: g.allow_new_entries ? `<span class="up">允许</span>` : `<span class="warn">禁止</span>`, x: "guardian.allow_new_entries" },
+      { k: "冷却", v: (Number((st.cooldown_until || {}).short_term || 0) || Number((st.cooldown_until || {}).long_term || 0)) ? `短期 ${num((st.cooldown_until || {}).short_term, 0)} · 长期 ${num((st.cooldown_until || {}).long_term, 0)}` : "无", x: "冷却期内不开新仓" },
+      { k: "日初权益", v: num(risk.dayStart, 2), x: "运行器记录" },
+      { k: "权益峰值", v: num(risk.peakEq, 2), x: `记录回撤 ${pct(s.quality && s.quality.recorded_max_drawdown)}` },
+      { k: "5m 策略", v: risk.ctx.five_minute_disabled ? "已停用" : "运行中", x: "避免无正常出口" },
+      { k: "记录起点", v: esc(s.record_start || "—"), x: "委托/成交/成本过滤线" },
+    ]);
+
+    // ---- 执行与保护
+    setText("mprMeta", g.protection_ok ? "保护正常" : "保护异常", "ph-meta mono");
+    const stops = g.stop_ids || {};
+    const stopTxt = Object.keys(stops).length
+      ? Object.entries(stops).map(([sym, id]) => `${coin(sym)} ${id}`).join(" · ")
+      : "无登记";
+    const allOpen = st.open_orders || [];
+    const openProt = allOpen.filter((o) => o.reduceOnly).length;
+    kvRows($("mprKv"), [
+      { k: "保护状态", v: g.protection_ok ? `<span class="up">正常</span>` : `<span class="down">异常</span>`, x: g.health || "" },
+      { k: "监护登记单", v: esc(stopTxt), x: `${Object.keys(stops).length} 张 · 运行器登记` },
+      { k: "净仓保护", v: g.net_protection_id ? String(g.net_protection_id) : "无", x: "reduceOnly 全仓保护" },
+      { k: "标记价监护", v: g.last_mark ? num(g.last_mark, 2) : "—", x: g.last_mark_age_sec != null ? `${Number(g.last_mark_age_sec).toFixed(1)}s 前` : "" },
+      { k: "评分失败连击", v: String(g.score_fail_streak ?? "—"), x: ">阈值 暂停保护收紧" },
+      { k: "最后错误", v: g.last_error ? `<span class="down">${esc(g.last_error)}</span>` : "无", x: "" },
+      { k: "交易所挂单", v: allOpen.length ? `${allOpen.length} 张` : "无", x: allOpen.length ? `保护 ${openProt} / 开仓 ${allOpen.length - openProt}` : "无挂单" },
+    ]);
+    const acts = [].concat(g.recent_actions || [], st.last_actions || []);
+    const actsBox = $("mprActions");
+    if (actsBox) {
+      actsBox.textContent = acts.length
+        ? acts.slice(-12).map((a) => typeof a === "string" ? a : JSON.stringify(a)).join("\n")
+        : "无最近动作";
     }
-    // 走势图来自 /api/chart（币安 K 线，后端有缓存）。60s 节流，
-    // 避免每轮刷新都新增交易所请求。
-    if (Date.now() - sparkFetchedAt < 60000) return;
-    sparkFetchedAt = Date.now();
-    try {
-      const c = await api("/api/chart?symbol=BTCUSDT&interval=15m&bars=96");
-      const bars = (c && c.bars) || [];
-      const closes = bars.map((b) => Number(b.c)).filter(Number.isFinite);
-      const drew = drawSpark($("mktSpark"), closes, "#4c8dff");
-      if ($("mktRange")) {
-        $("mktRange").textContent = drew
-          ? `区间 ${num(Math.min.apply(null, closes), 2)} — ${num(Math.max.apply(null, closes), 2)} · ${closes.length} 根 15m`
-          : "—";
-      }
-    } catch (e) { /* 保持原样 */ }
-  }
 
-  async function refreshTrading() {
-    await Promise.allSettled([
-      loadMarket(),
-      loadStatus(),
-      loadSummary(),
-      loadOpenOrders(),
-      loadStrategies(),
-      loadRunner(),
-      loadHistory(),
-      loadSwissPanels().then(() => loadMarketHero()),
+    // ---- 账本对账
+    const rc = reconState();
+    setText("mrcMeta", rc.ok ? "净仓一致" : "存在差异", "ph-meta mono");
+    const observe = (r && r.mode) === "observation_only" || (r && r.mode) === "observe";
+    const reconRows = [{
+      k: "联动", v: observe ? `<span class="warn">不联动（观察模式）</span>` : `<span class="up">自动同步</span>`,
+      x: `runner.mode = ${esc((r && r.mode) || "—")}`,
+      cls: observe ? "is-warn" : "",
+    }];
+    ["BTCUSDT", "ETHUSDT"].forEach((sym) => {
+      const want = Number((st.desired_nets || {})[sym] || 0);
+      const have = nets[sym] ? Number(nets[sym].signed || 0) : 0;
+      const gap = Math.abs(want - have);
+      const ok = gap < 5e-4;
+      reconRows.push({
+        k: `${coin(sym)} 净额`,
+        v: `期望 ${num(want, 4)} · 实际 ${num(have, 4)}`,
+        x: ok ? `<span class="up">一致</span>` : `<span class="down">差 ${num(gap, 4)}</span>`,
+        cls: ok ? "" : "is-bad",
+      });
+    });
+    reconRows.push({
+      k: "旧对账标记", v: st.reconciliation_needed ? "旧 V7 模块标记需对账（该模块不参与交易）" : "无", x: "仅附注", cls: "",
+    });
+    kvRows($("mrcKv"), reconRows);
+
+    const ext = st.external_interventions || {};
+    const extEntries = Object.entries(ext).filter(([, v]) => v);
+    if (!extEntries.length) {
+      kvRows($("mrcExt"), [{ k: "检测", v: "未检测到人工干预", x: "" }]);
+    } else {
+      kvRows($("mrcExt"), extEntries.map(([sym, v]) => ({
+        k: coin(sym),
+        v: `${v.last_kind === "increase" ? "人工加仓" : "人工减仓/平仓"} · ${fmtTime(v.detected_ms)}`,
+        x: `${num(v.ex_before, 4)} → ${num(v.ex_after, 4)}${v.paused ? " · 已暂停" : " · 已跟随"}`,
+        cls: v.paused ? "is-bad" : "is-warn",
+      })));
+    }
+
+    // ---- 数据覆盖与成本
+    const cov = s.coverage || {};
+    const costs = (s.quality && s.quality.costs) || {};
+    const effFills = (tradesCache || []).filter(isHistoryRow).length;
+    setText("mcvMeta", s.record_start ? `自 ${s.record_start}` : "—", "ph-meta mono");
+    kvRows($("mcvKv"), [
+      { k: "接口覆盖", v: `${cov.fills ?? "—"} 笔 <span class="sub">原始窗口</span>`, x: cov.first_fill_ms ? `${fmtMDHM(cov.first_fill_ms)} → ${fmtMDHM(cov.last_fill_ms)}` : "" },
+      { k: "统计窗口", v: `${effFills} 笔 <span class="sub">起点后有效成交</span>`, x: `自 ${esc(s.record_start || "—")}` },
+      { k: "起点裁剪", v: cov.clipped_at_start ? "已按记录起点裁剪" : "未裁剪", x: cov.truncated ? "接口截断" : "未截断" },
+      { k: "孤儿平仓", v: String(cov.orphan_closes ?? "—"), x: "起点前开仓的平仓腿" },
+      { k: "窗口净额", v: signed(s.net_pnl, 2), x: `已实现 ${signed(s.realized_pnl, 2)} − 费用`, cls: pnlCls(s.net_pnl) === "up" ? "is-good" : "" },
+      { k: "开仓名义", v: num(s.open_notional, 2), x: "不依赖复利" },
+      { k: "单笔边际", v: s.unit_edge_bps == null ? "—" : `${num(s.unit_edge_bps, 1)} bps`, x: "净额 ÷ 名义 × 10000" },
+      { k: "胜率 / 盈亏比", v: `${pct(s.win_rate, 1)} / ${s.profit_factor == null ? "—" : num(s.profit_factor, 2)}`, x: `盈 ${s.wins ?? 0} / 亏 ${s.losses ?? 0} 笔` },
+      { k: "平均盈亏", v: `+${num(s.avg_win, 2)} / -${num(Math.abs(Number(s.avg_loss || 0)), 2)}`, x: "USDT" },
+      { k: "费用 · Maker", v: num(costs.maker_fee, 4), x: "逐笔成交" },
+      { k: "费用 · Taker", v: num(costs.taker_fee, 4) },
+      { k: "资金费", v: num(costs.funding_fee, 4), x: costs.funding_orphan ? `未归属 ${num(costs.funding_orphan, 4)}` : "" },
+      { k: "滑点估算", v: costs.slippage_est == null ? "—" : num(costs.slippage_est, 2), x: "开仓价 − 参考价" },
+      { k: "权益记录点", v: String((risk.ctx.recorded_equity_points ?? "—")), x: "运行记录口径" },
     ]);
-    lastSyncAt = Date.now();
-    renderSyncStamp();
+
+    // ---- 巡检快照
+    const tail = mon.monitor_tail || [];
+    const snapBox = $("msnapBox");
+    if (snapBox) snapBox.textContent = tail.length ? tail.join("\n") : "无巡检记录";
+    setText("msnapMeta", tail.length ? `${tail.length} 行 · 每小时一行` : "—", "ph-meta mono");
+
+    // ---- 事件日志
+    const all = alertsCache || [];
+    const filtered = evtFilter === "all" ? all : all.filter((a) => String(a.level).toUpperCase() === evtFilter);
+    setText("evtMeta", `${filtered.length} / ${all.length} 条 · 最新 ${all[0] ? fmtHMS(Number(all[0].epoch || 0) * 1000) : "—"}`, "ph-meta mono");
+    const evtBox = $("evtBox");
+    if (evtBox) {
+      evtBox.innerHTML = filtered.length
+        ? filtered.slice(0, 60).map((a) => feedItem(a, false)).join("")
+        : `<div class="empty"><b>无匹配事件</b>—</div>`;
+    }
+    document.querySelectorAll("#evtFilters [data-evt]").forEach((b) =>
+      b.classList.toggle("on", b.dataset.evt === evtFilter));
   }
 
-  async function refreshAccount() {
-    await loadStatus();
+  // ------------------------------------------------------------------ 设置视图
+  function renderSettings() {
+    const st = statusCache || {};
+    const s = summaryCache || {};
+    const r = runnerInfo();
+    const rp = (r && r.params) || {};
+    const mk = marketCache || {};
+
+    // 连接状态
+    const ok = st.connected !== false;
+    const nets = exchangeNets();
+    const liveNets = ["BTCUSDT", "ETHUSDT"].filter((sym) => nets[sym] && Number(nets[sym].quantity || 0));
+    kvRows($("setConnKv"), [
+      { k: "接口连接", v: ok ? `<span class="up">已连接</span>` : `<span class="down">未配置/不可达</span>`, x: mk.market_label || "" },
+      { k: "账户余额", v: num(st.balance && st.balance.total_wallet_balance, 2), x: "USDT" },
+      { k: "可用余额", v: num(st.balance && st.balance.available_balance, 2), x: "USDT" },
+      { k: "交易所仓位", v: liveNets.length ? liveNets.map((sym) => `${coin(sym)} ${sideZh(nets[sym].side)} ${num(nets[sym].quantity, 4)}`).join(" · ") : "空仓" },
+      { k: "对账状态", v: reconState().ok ? `<span class="up">一致</span>` : `<span class="down">不一致</span>`, x: "策略账本 vs 交易所" },
+      { k: "交易所设置", v: st.exchange_settings ? `${st.exchange_settings.symbol || ""} · ${st.exchange_settings.leverage || "—"}x · ${st.exchange_settings.margin_type || ""}` : "—", x: "单向持仓 / 逐仓" },
+      { k: "账户通道", v: esc(String(mk.account_base_url || "—").replace("https://", "")) },
+      { k: "记录起点", v: esc(s.record_start || "—") },
+    ]);
+
+    // 运行参数
+    setText("setParamsMeta", r && r.params_fingerprint ? `指纹 ${r.params_fingerprint}` : "—", "ph-meta mono");
+    const layerR = rp.layer_risk_r || {};
+    const fmtR = (arr) => (arr || []).map((x) => `${parseFloat((Number(x) * 100).toFixed(3))}%`).join(" / ");
+    const lrKeys = Object.keys(layerR);
+    const lrSame = lrKeys.length === 2 && JSON.stringify(layerR[lrKeys[0]]) === JSON.stringify(layerR[lrKeys[1]]);
+    const layerText = !lrKeys.length ? "—"
+      : lrSame ? `两策略均 ${fmtR(layerR[lrKeys[0]])}`
+      : lrKeys.map((k2) => `${k2} ${fmtR(layerR[k2])}`).join(" · ");
+    kvRows($("setParamsKv"), [
+      { k: "首层风险 r", v: String(rp.risk_r ?? "—"), x: "权益 × r ÷ (k × ATR)" },
+      { k: "分层风险", v: esc(layerText), x: "首层 → 第 2/3 层" },
+      { k: "杠杆", v: rp.leverage ? `${rp.leverage}x` : "—", x: "逐仓" },
+      { k: "ATR 系数 k", v: String(rp.atr_mult_k ?? "—"), x: "仓位分母" },
+      { k: "灾难止损", v: rp.disaster_atr ? `${rp.disaster_atr} × ATR_1H` : "—", x: "穿盘口限价平仓" },
+      { k: "单标的保证金预算", v: rp.margin_budget_per_trade != null ? pct(rp.margin_budget_per_trade, 0) : "—" },
+      { k: "组合保证金预算", v: rp.portfolio_margin_budget != null ? pct(rp.portfolio_margin_budget, 0) : "—", x: "BTC+ETH 合计" },
+      { k: "最大层数", v: Object.entries(rp.max_layers || {}).map(([k2, v2]) => `${k2} ${v2}`).join(" · ") || "—", x: "同向回调加仓" },
+      { k: "日亏闸门", v: rp.block_on_daily_loss === false ? `<span class="warn">关闭</span>` : `<span class="up">启用</span>`, x: "block_on_daily_loss" },
+      { k: "回撤熔断", v: rp.halt_on_max_drawdown === false ? `<span class="warn">关闭</span>` : `<span class="up">启用</span>`, x: "halt_on_max_drawdown" },
+    ]);
+
+    // 恢复按钮状态
+    const ext = st.external_interventions || {};
+    const paused = Object.entries(ext).filter(([, v]) => v && v.paused);
+    const btn = $("externalResumeBtn");
+    if (btn) {
+      if (paused.length) {
+        btn.disabled = false;
+        btn.dataset.symbol = paused[0][0];
+        btn.textContent = `确认恢复 ${coin(paused[0][0])} 自动开仓`;
+        setText("dzResumeDesc", `已暂停：${paused.map(([sym]) => coin(sym)).join(" · ")}。确认后运行器下一轮恢复净仓同步。`);
+      } else {
+        btn.disabled = true;
+        btn.dataset.symbol = "";
+        btn.textContent = "确认恢复";
+        const holds = Object.entries(ext).filter(([, v]) => v && v.hold && !v.paused);
+        setText("dzResumeDesc", holds.length
+          ? `当前无暂停；已跟随人工操作：${holds.map(([sym]) => coin(sym)).join(" · ")}（无需确认）。`
+          : "未检测到需要确认的人工干预；出现时运行器会暂停该标的自动开仓并在此处提供确认。");
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------ 数据加载
+  async function loadStatus() { statusCache = await api("/api/trading/status"); }
+  async function loadSummary() { summaryCache = await api("/api/account/summary"); }
+  async function loadReading() { readingCache = await api("/api/strategy/reading"); }
+  async function loadEquity() { equityCache = await api("/api/equity/curve"); }
+  async function loadMonitor() { monitorCache = await api("/api/monitor"); }
+  async function loadAlerts() {
+    const d = await api("/api/alerts?limit=150");
+    alertsCache = (d && d.alerts) || [];
+  }
+  async function loadMarket() { marketCache = await api("/api/market"); }
+  async function loadHistoryData() {
+    const [o, t] = await Promise.allSettled([
+      api("/api/binance/orders?limit=200"),
+      api("/api/binance/trades?limit=200"),
+    ]);
+    ordersCache = o.status === "fulfilled" ? (o.value.orders || []) : [];
+    tradesCache = t.status === "fulfilled" ? (t.value.trades || []) : [];
+  }
+  async function loadSparks() {
+    if (Date.now() - sparkFetchedAt < 60000) return;
+    const [b, e] = await Promise.allSettled([
+      api("/api/chart?symbol=BTCUSDT&interval=15m&bars=96"),
+      api("/api/chart?symbol=ETHUSDT&interval=15m&bars=96"),
+    ]);
+    const take = (res) => {
+      if (res.status !== "fulfilled") return null;
+      const bars = (res.value && res.value.bars) || [];
+      const closes = bars.map((x) => Number(x.c)).filter(Number.isFinite);
+      return closes.length > 1 ? closes : null;
+    };
+    const nb = take(b), ne = take(e);
+    if (nb) sparks.BTCUSDT = nb;
+    if (ne) sparks.ETHUSDT = ne;
+    if (nb || ne) {
+      sparkFetchedAt = Date.now(); // 全部失败则下一轮重试
+      renderTicker(); // 拿到新序列后立即重绘，不等下一轮刷新
+    }
+  }
+
+  function renderAll() {
+    renderTopbar();
+    renderTicker();
+    renderBanner();
+    renderKpis();
+    renderPositions();
+    renderOpenOrders();
+    renderHistory();
+    renderHealth();
+    renderSignals();
+    renderFeed();
+    renderMonitorView();
+    renderSettings();
+  }
+
+  async function refreshAll() {
+    const res = await Promise.allSettled([
+      loadStatus(), loadSummary(), loadReading(), loadEquity(),
+      loadMonitor(), loadAlerts(), loadMarket(), loadHistoryData(),
+    ]);
+    const failed = res.filter((x) => x.status === "rejected").length;
+    apiFailStreak = failed >= 6 ? apiFailStreak + 1 : failed > 0 ? Math.max(apiFailStreak, 1) : 0;
+    if (failed >= 6) {
+      // 面板整体不可达：明确提示，不保留「正在更新」的假象
+      toast("面板接口不可达，页面数据已停止更新", "err");
+    }
+    loadSparks();
+    lastSyncAt = Date.now();
+    renderAll();
+  }
+
+  // ------------------------------------------------------------------ 动作
+  function bindNav() {
+    document.querySelectorAll(".nav-tab").forEach((b) =>
+      b.addEventListener("click", () => { switchView(b.dataset.view); location.hash = b.dataset.view; }));
+    document.querySelectorAll("[data-nav]").forEach((b) =>
+      b.addEventListener("click", () => { switchView(b.dataset.nav); location.hash = b.dataset.nav; }));
+  }
+
+  function switchView(name) {
+    if (!VIEWS.includes(name)) name = "desk";
+    currentView = name;
+    document.querySelectorAll(".view").forEach((v) =>
+      v.classList.toggle("active", v.id === "view-" + name));
+    document.querySelectorAll(".nav-tab").forEach((b) =>
+      b.classList.toggle("active", b.dataset.view === name));
+    if (name === "chart" && window.ChartModule && window.ChartModule.setActive) {
+      window.ChartModule.setActive(true);
+    } else if (window.ChartModule && window.ChartModule.setActive) {
+      window.ChartModule.setActive(false);
+    }
+    if (name === "chart" && window.ChartModule && window.ChartModule.refresh) {
+      window.ChartModule.refresh();
+    }
+    if (name === "settings") loadMainnetConfig();
+  }
+
+  async function postAction(path, body, label, btn) {
+    const old = btn ? btn.textContent : "";
+    if (btn) { btn.disabled = true; btn.textContent = "执行中…"; }
+    try {
+      const d = await api(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {}),
+      });
+      toast(d.ok ? `${label}完成：${JSON.stringify(d).slice(0, 260)}` : `${label}未成功：${d.error || JSON.stringify(d).slice(0, 260)}`, d.ok ? "ok" : "err");
+      await refreshAll();
+    } catch (e) {
+      toast(`${label}失败：${e.message || e}`, "err");
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = old; }
+    }
+  }
+
+  async function resumeSymbol(sym) {
+    if (!sym) return;
+    const ok = window.confirm(`确认恢复 ${coin(sym)} 的自动开仓？\n运行器下一轮会恢复净仓同步，可能按策略账本重新建仓。`);
+    if (!ok) return;
+    await postAction("/api/external/resume", { symbol: sym }, "人工确认恢复");
+  }
+
+  async function doReconcile() {
+    await postAction("/api/trading/reconcile", { reason: "frontend_manual" }, "对账");
   }
 
   // -------------------------------------------------------- 主网凭据（只读）
   //
   // 约束：保存/测试都不会启用主网交易。测试按钮只调用后端只读预检接口，
   // 后端只发 GET /fapi/v1/time 与签名 GET /fapi/v2/account。
+  let mnVerifyState = "—";
+
+  async function apiJson(path, opts) {
+    // 与 api() 的区别：4xx 也读取 JSON 正文里的 error 字段（api() 直接抛错会丢正文）
+    const res = await fetch(API + path, Object.assign({ cache: "no-store" }, opts || {}));
+    let data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!data) throw new Error(`HTTP ${res.status}`);
+    return data;
+  }
+
   function renderMainnetConfig(cfg) {
     const c = cfg || {};
-    if ($("mainnetConnection")) {
-      const ok = Boolean(c.mainnet_configured);
-      $("mainnetConnection").textContent = ok ? "已保存（执行仍禁用）" : "未配置";
-      $("mainnetConnection").className = "connection-big " + (ok ? "positive" : "blocked");
+    const ok = Boolean(c.mainnet_configured);
+    const conn = $("mainnetConnection");
+    if (conn) {
+      conn.textContent = ok ? "已保存（执行仍禁用）" : "未配置";
+      conn.className = "mn-big " + (ok ? "ok" : "blocked");
     }
-    if ($("mainnetKeyMasked"))
-      $("mainnetKeyMasked").textContent = c.mainnet_key_masked || "—";
-    // 地址一律由后端下发，前端不硬编码任何交易所域名：
-    // 硬编码会让「行情腿」与「下单腿」有机会分叉（2026-10-02 事故根因）。
-    if ($("mainnetBaseUrl"))
-      $("mainnetBaseUrl").textContent = c.mainnet_base_url || "—";
+    kvRows($("mnKv"), [
+      { k: "已保存 Key", v: esc(c.mainnet_key_masked || "—"), x: "掩码显示" },
+      // 地址一律由后端下发，前端不硬编码交易所域名（防止行情腿/下单腿分叉）。
+      { k: "目标地址", v: esc(c.mainnet_base_url || "—"), x: "由后端下发" },
+      { k: "只读预检", v: mnVerifyState, x: "GET /fapi/v1/time + /fapi/v2/account" },
+      { k: "主网执行", v: `<span class="down">已禁用</span>`, x: "runtime_mode 硬阻断" },
+    ]);
   }
 
   async function loadMainnetConfig() {
@@ -1401,34 +1388,34 @@
     const forgetBtn = $("mainnetForgetBtn");
     if (!saveBtn && !verifyBtn && !forgetBtn) return;
     const note = () => $("mainnetResult");
+    const setNote = (t) => { const n = note(); if (n) n.textContent = t; };
 
     if (saveBtn)
       saveBtn.addEventListener("click", async () => {
         const key = ($("mainnetKeyInput").value || "").trim();
         const secret = ($("mainnetSecretInput").value || "").trim();
         if (!key || !secret) {
-          note().textContent = "请先填写主网 API Key 与 Secret。";
+          setNote("请先填写主网 API Key 与 Secret。");
           return;
         }
         saveBtn.disabled = true;
-        note().textContent = "正在保存到本机…";
+        setNote("正在保存到本机…");
         try {
-          const d = await api("/api/mainnet/keys", {
+          const d = await apiJson("/api/mainnet/keys", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ api_key: key, api_secret: secret }),
           });
           if (d.ok) {
-            note().textContent =
-              `已保存（${d.mainnet_key_masked}）。密钥已就绪，实盘运行器启动后生效。`;
+            setNote(`已保存（${d.mainnet_key_masked || "已掩码"}）。密钥已就绪，实盘运行器启动后生效。`);
             $("mainnetKeyInput").value = "";
             $("mainnetSecretInput").value = "";
           } else {
-            note().textContent = "保存失败：" + (d.error || "未知错误");
+            setNote("保存失败：" + (d.error || "未知错误"));
           }
           await loadMainnetConfig();
         } catch (e) {
-          note().textContent = "保存失败：" + (e.message || e);
+          setNote("保存失败：" + (e.message || e));
         } finally {
           saveBtn.disabled = false;
         }
@@ -1437,40 +1424,33 @@
     if (verifyBtn)
       verifyBtn.addEventListener("click", async () => {
         verifyBtn.disabled = true;
-        note().textContent = "正在执行只读预检（GET /fapi/v1/time + /fapi/v2/account）…";
-        if ($("mainnetVerifyState")) $("mainnetVerifyState").textContent = "检测中…";
+        setNote("正在执行只读预检（GET /fapi/v1/time + /fapi/v2/account）…");
+        mnVerifyState = "检测中…";
         try {
           const typedKey = ($("mainnetKeyInput").value || "").trim();
           const typedSecret = ($("mainnetSecretInput").value || "").trim();
-          const d = await api("/api/mainnet/verify", {
+          const d = await apiJson("/api/mainnet/verify", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ api_key: typedKey, api_secret: typedSecret }),
           });
           if (d.ok) {
-            note().textContent =
+            mnVerifyState = `<span class="up">只读通过</span>`;
+            setNote(
               `只读预检通过 · 延迟 ${d.latency_ms}ms · 可用余额 ${num(d.available_balance_usdt, 2)} USDT · ` +
               `canTrade=${d.can_trade} · canWithdraw=${d.can_withdraw}。` +
-              `注意：这不代表可以安全启动真实交易。`;
-            if ($("mainnetVerifyState")) {
-              $("mainnetVerifyState").textContent = "只读通过";
-              $("mainnetVerifyState").className = "positive";
-            }
+              `注意：这不代表可以安全启动真实交易。`
+            );
           } else {
-            note().textContent = "只读预检失败：" + (d.error || "未知错误");
-            if ($("mainnetVerifyState")) {
-              $("mainnetVerifyState").textContent = "失败";
-              $("mainnetVerifyState").className = "blocked";
-            }
+            mnVerifyState = `<span class="down">失败</span>`;
+            setNote("只读预检失败：" + (d.error || "未知错误"));
           }
         } catch (e) {
-          note().textContent = "只读预检失败：" + (e.message || e);
-          if ($("mainnetVerifyState")) {
-            $("mainnetVerifyState").textContent = "失败";
-            $("mainnetVerifyState").className = "blocked";
-          }
+          mnVerifyState = `<span class="down">失败</span>`;
+          setNote("只读预检失败：" + (e.message || e));
         } finally {
           verifyBtn.disabled = false;
+          await loadMainnetConfig();
         }
       });
 
@@ -1479,235 +1459,219 @@
         if (!window.confirm("确认删除本机保存的主网凭据？测试网凭据与运行器不受影响。")) return;
         forgetBtn.disabled = true;
         try {
-          const d = await api("/api/mainnet/forget", {
+          const d = await apiJson("/api/mainnet/forget", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: "{}",
           });
-          note().textContent = d.ok ? "已删除本机保存的主网凭据。" : "删除失败。";
-          if ($("mainnetVerifyState")) {
-            $("mainnetVerifyState").textContent = "—";
-            $("mainnetVerifyState").className = "";
-          }
+          setNote(d.ok ? "已删除本机保存的主网凭据。" : "删除失败：" + (d.error || "未知错误"));
+          mnVerifyState = "—";
           await loadMainnetConfig();
         } catch (e) {
-          note().textContent = "删除失败：" + (e.message || e);
+          setNote("删除失败：" + (e.message || e));
         } finally {
           forgetBtn.disabled = false;
         }
       });
   }
 
-  // ------------------------------------------------------------------ 表单
-  function bindAccountForm() {
+  function bindTestnetForm() {
+    // 保存与通信测试分离：错误凭据不会覆盖已保存配置。
     const form = $("accountForm");
-    if (!form) return;
-    form.addEventListener("submit", async (ev) => {
+    const testnetTest = $("testnetTestBtn");
+    const accountNote = () => $("accountResult");
+    const accountPayload = (includeEmpty = false) => {
+      const key = $("apiKeyInput").value.trim();
+      const secret = $("apiSecretInput").value.trim();
+      const payload = { base_url: $("baseUrlInput").value.trim() };
+      if (includeEmpty || key) payload.api_key = key;
+      if (includeEmpty || secret) payload.api_secret = secret;
+      return payload;
+    };
+    if (form) form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
-      const note = $("accountResult");
-      note.textContent = "正在验证连接…";
+      const note = accountNote();
+      const payload = accountPayload(true);
+      if (!payload.api_key || !payload.api_secret || !payload.base_url) {
+        note.textContent = "请填写 API Key、API Secret 和 Base URL。";
+        note.className = "form-note err";
+        return;
+      }
+      const saveBtn = form.querySelector('button[type="submit"]');
+      if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = "保存中…"; }
+      note.textContent = "正在保存到本机…";
+      note.className = "form-note";
       try {
-        const d = await api("/api/trading/keys", {
+        const d = await apiJson("/api/trading/keys/save", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            api_key: $("apiKeyInput").value.trim(),
-            api_secret: $("apiSecretInput").value.trim(),
-            base_url: $("baseUrlInput").value.trim(),
-          }),
+          body: JSON.stringify(payload),
         });
-        if (d.ok) {
-          note.textContent = "连接成功，密钥已保存在本机。";
-          $("apiKeyInput").value = "";
-          $("apiSecretInput").value = "";
-        } else {
-          note.textContent = "失败：" + (d.error || JSON.stringify(d).slice(0, 200));
-        }
-        refreshTrading();
+        if (!d.ok) throw new Error(d.error || "保存失败");
+        note.textContent = `已保存 ${d.key_masked || "密钥"}；尚未测试通信，可点击“测试通信”。`;
+        note.className = "form-note ok";
+        $("apiKeyInput").value = "";
+        $("apiSecretInput").value = "";
+        refreshAll();
       } catch (e) {
-        note.textContent = "连接失败：" + (e.message || e);
+        note.textContent = "保存失败：" + (e.message || e);
+        note.className = "form-note err";
+      } finally {
+        if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = "保存到本机"; }
+      }
+    });
+    if (testnetTest) testnetTest.addEventListener("click", async () => {
+      const note = accountNote();
+      const payload = accountPayload(false);
+      testnetTest.disabled = true;
+      note.textContent = "正在测试币安测试网通信（只读）…";
+      note.className = "form-note";
+      try {
+        const d = await apiJson("/api/trading/keys/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!d.ok) throw new Error(d.error || "通信测试失败");
+        note.textContent = `通信正常 · 延迟 ${d.latency_ms ?? "—"}ms · 可用余额 ${num(d.available_balance, 2)} USDT；未下单。`;
+        note.className = "form-note ok";
+      } catch (e) {
+        note.textContent = "通信测试失败：" + (e.message || e);
+        note.className = "form-note err";
+      } finally {
+        testnetTest.disabled = false;
       }
     });
   }
 
-  async function postAction(btnId, path, label, body) {
-    const btn = $(btnId);
-    if (!btn) return;
-    const note = $("accountResult");
-    const old = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = "执行中…";
-    note.textContent = label + " 执行中…";
+  function bindActions() {
+    const r = $("refreshBtn");
+    if (r) r.addEventListener("click", () => refreshAll());
+    document.addEventListener("keydown", (e) => {
+      if (e.key.toLowerCase() === "r" && !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName)) {
+        refreshAll();
+      }
+    });
+
+    // 历史记录页签与条数
+    document.querySelectorAll("#histTabs [data-hist]").forEach((b) =>
+      b.addEventListener("click", () => {
+        histMode = b.dataset.hist;
+        document.querySelectorAll("#histTabs [data-hist]").forEach((x) =>
+          x.classList.toggle("active", x === b));
+        renderHistory();
+      }));
+    const syncLimits = () => document.querySelectorAll("#histLimits [data-limit]").forEach((x) =>
+      x.classList.toggle("active", Number(x.dataset.limit) === historyLimit));
+    document.querySelectorAll("#histLimits [data-limit]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const n = Number(b.dataset.limit);
+        if (HISTORY_LIMITS.includes(n)) {
+          historyLimit = n;
+          try { localStorage.setItem(historyLimitKey, String(n)); } catch (e2) { /* ignore */ }
+        }
+        syncLimits();
+        renderHistory();
+      }));
+    syncLimits();
+
+    // 事件过滤器
+    document.querySelectorAll("#evtFilters [data-evt]").forEach((b) =>
+      b.addEventListener("click", () => { evtFilter = b.dataset.evt; renderMonitorView(); }));
+
+    const smoke = $("testnetSmokeBtn");
+    if (smoke) smoke.addEventListener("click", () => {
+      const answer = window.prompt("非策略功能测试：将在币安测试网实际下单、立即平仓并留下多笔委托/成交，产生手续费。若仍要测试，请输入「测试单」：");
+      if (answer !== "测试单") return;
+      postAction("/api/testnet/smoke-limit-close", { quantity: 0.001 }, "非策略功能测试", smoke);
+    });
+    const flat = $("testnetFlattenBtn");
+    if (flat) flat.addEventListener("click", () => {
+      const ok = window.confirm("确认按交易所净额平掉当前 Testnet 仓位？\n属于运行器策略账本的仓位会被后端拒绝。");
+      if (!ok) return;
+      postAction("/api/testnet/flatten-now", {}, "平仓", flat);
+    });
+    const rec = $("reconcileBtn");
+    if (rec) rec.addEventListener("click", () => doReconcile());
+    const extResume = $("externalResumeBtn");
+    if (extResume) extResume.addEventListener("click", () => resumeSymbol(extResume.dataset.symbol));
+
+    // 时钟与相对时间
+    clockTimer = setInterval(() => { renderTopbar(); }, 1000);
+  }
+
+  // ------------------------------------------------------------------ 行情推送（WS）
+  let markSocket = null;
+  let marketWsUrl = "";
+  async function resolveMarketWs() {
     try {
-      const d = await api(path, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body || {}),
-      });
-      note.textContent = d.ok
-        ? `${label} 完成：${JSON.stringify(d).slice(0, 400)}`
-        : `${label} 未成功：${d.error || JSON.stringify(d).slice(0, 400)}`;
-      refreshTrading();
-    } catch (e) {
-      note.textContent = `${label} 失败：${e.message || e}`;
-    } finally {
-      btn.disabled = false;
-      btn.textContent = old;
-    }
+      const d = marketCache || (await api("/api/market"));
+      if (d && d.ok && d.market_ws) {
+        marketWsUrl = d.market_ws + "?streams=btcusdt@markPrice@1s/ethusdt@markPrice@1s";
+      }
+    } catch (_) { /* ignore */ }
+    return marketWsUrl;
+  }
+  function connectMarkPrice() {
+    const open = async () => {
+      try {
+        if (!marketWsUrl) await resolveMarketWs();
+        if (!marketWsUrl) { setTimeout(open, 3000); return; }
+        markSocket = new WebSocket(marketWsUrl);
+        markSocket.onmessage = (e) => {
+          wsAliveAt = Date.now();
+          try {
+            const packet = JSON.parse(e.data);
+            const d = packet.data || packet;
+            const sym = String(d.s || "").toUpperCase();
+            const px = Number(d.p);
+            if (!px) return;
+            if (sym.startsWith("BTC")) {
+              const el = $("tickBTCpx");
+              if (el) { el.textContent = num(px, 2); flash(el, px); }
+            } else if (sym.startsWith("ETH")) {
+              const el = $("tickETHpx");
+              if (el) { el.textContent = num(px, 2); flash(el, px); }
+            }
+          } catch (_) { /* ignore */ }
+        };
+        markSocket.onerror = () => { if (markSocket) markSocket.close(); };
+        markSocket.onclose = () => {
+          markSocket = null;
+          setTimeout(open, 3000);
+        };
+      } catch (_) {
+        setTimeout(open, 3000);
+      }
+    };
+    open();
   }
 
   // ------------------------------------------------------------------ 启动
-  let lastSyncAt = 0;
-  let clockTimer = null;
-
-  function renderSyncStamp() {
-    const el = $("liveStamp");
-    if (!el) return;
-    if (!lastSyncAt) {
-      el.textContent = "正在取数…";
-      el.className = "sync";
-      return;
-    }
-    const age = Math.floor((Date.now() - lastSyncAt) / 1000);
-    el.textContent = age <= 1 ? "刚刚更新" : `${age} 秒前更新`;
-    el.className = "sync" + (age > (REFRESH_MS / 1000) * 2 ? " is-stale" : "");
-  }
-
-  function startTimer() {
-    if (timer) clearInterval(timer);
-    timer = setInterval(() => {
-      if (currentView === "trading") refreshTrading();
-      else if (currentView === "account") refreshAccount();
-    }, REFRESH_MS);
-    if (clockTimer) clearInterval(clockTimer);
-    clockTimer = setInterval(renderSyncStamp, 1000);
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden && currentView === "trading") refreshTrading();
-    });
-  }
-
   function init() {
-    document.querySelectorAll(".nav-item").forEach((b) =>
-      b.addEventListener("click", () => {
-        switchView(b.dataset.view);
-        location.hash = b.dataset.view;
-      })
-    );
-    document.querySelectorAll("[data-nav]").forEach((b) =>
-      b.addEventListener("click", () => switchView(b.dataset.nav))
-    );
-
-    const r = $("refreshBtn");
-    if (r)
-      r.addEventListener("click", () => {
-        if (currentView === "trading") refreshTrading();
-        else if (currentView === "account") refreshAccount();
-        else if (window.ChartModule) window.ChartModule.refresh();
-      });
-
-    document.addEventListener("keydown", (e) => {
-      if (
-        e.key.toLowerCase() === "r" &&
-        !["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)
-      ) {
-        if (currentView === "trading") refreshTrading();
-        else if (currentView === "account") refreshAccount();
-        else if (window.ChartModule) window.ChartModule.refresh();
-      }
-    });
-
-    bindAccountForm();
-    document.querySelectorAll(".hist-limit-btn").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        setHistoryLimit(btn.dataset.limit);
-        loadHistory();
-      });
-    });
-    syncHistoryLimitButtons();
-
-    const smoke = $("testnetSmokeBtn");
-    if (smoke)
-      smoke.addEventListener("click", () => {
-        const answer = window.prompt("这是非策略功能测试：将在币安测试网实际下单、立即平仓并留下多笔委托/成交，产生手续费。若仍要测试，请输入「测试单」：");
-        if (answer !== "测试单") return;
-        postAction("testnetSmokeBtn", "/api/testnet/smoke-limit-close", "非策略功能测试", {
-          quantity: 0.001,
-        });
-      });
-    const flat = $("testnetFlattenBtn");
-    if (flat)
-      flat.addEventListener("click", () =>
-        postAction("testnetFlattenBtn", "/api/testnet/flatten-now", "平仓")
-      );
-    const rec = $("reconcileBtn");
-    if (rec)
-      rec.addEventListener("click", () =>
-        postAction("reconcileBtn", "/api/trading/reconcile", "对账", {
-          reason: "frontend_manual",
-        })
-      );
-    const extResume = $("externalResumeBtn");
-    if (extResume)
-      extResume.addEventListener("click", async () => {
-        const sym = extResume.dataset.symbol;
-        if (!sym) return;
-        const ok = window.confirm(
-          `确认恢复 ${coin(sym)} 的自动开仓？\n运行器下一轮会恢复净仓同步，可能按策略账本重新建仓。`
-        );
-        if (!ok) return;
-        await postAction("externalResumeBtn", "/api/external/resume",
-                         "人工确认恢复", { symbol: sym });
-        await loadStatus();
-      });
+    bindNav();
+    bindActions();
+    bindTestnetForm();
+    bindMainnetForm();
+    loadMainnetConfig();
 
     if (location.hash) {
       const v = location.hash.slice(1);
-      if (VIEW_TITLES[v]) currentView = v;
+      if (VIEWS.includes(v)) currentView = v;
     }
-    bindMainnetForm();
-    loadMainnetConfig();
     switchView(currentView);
+
     connectMarkPrice();
-    startTimer();
-  }
-
-  if (document.readyState === "loading")
-    document.addEventListener("DOMContentLoaded", init);
-  else init();
-
-  function renderExternal(map) {
-    const bar = $("externalBar");
-    if (!bar) return;
-    const entries = Object.entries(map || {});
-    if (!entries.length) {
-      bar.hidden = true;
-      return;
-    }
-    const paused = entries.filter(([, v]) => v && v.paused);
-    const holds = entries.filter(([, v]) => v && v.hold && !v.paused);
-    const lines = entries.map(([sym, v]) => {
-      const when = v.detected_ms ? fmtTime(v.detected_ms) : "—";
-      const what = v.last_kind === "increase" ? "人工加仓" : "人工减仓/平仓";
-      return `${coin(sym)} ${what} · ${when} · 交易所净额 ${num(v.ex_before, 4)} → ${num(v.ex_after, 4)}`;
+    refreshAll();
+    timer = setInterval(() => {
+      if (document.hidden) return;
+      refreshAll();
+    }, REFRESH_MS);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) refreshAll();
     });
-    if ($("externalTitle")) {
-      $("externalTitle").textContent = paused.length
-        ? `已暂停自动开仓：${paused.map(([s]) => coin(s)).join(" · ")}`
-        : `已跟随人工操作：${holds.map(([s]) => coin(s)).join(" · ")}`;
-    }
-    if ($("externalDetail")) {
-      $("externalDetail").textContent =
-        lines.join("；") +
-        (paused.length
-          ? "。确认后运行器会恢复该标的的自动开仓与净仓同步。"
-          : "。该标的策略账本已清零，等下一根信号再开仓。");
-    }
-    const btn = $("externalResumeBtn");
-    if (btn) {
-      btn.hidden = !paused.length;
-      btn.dataset.symbol = paused.length ? paused[0][0] : "";
-    }
-    bar.hidden = false;
   }
 
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+  else init();
 })();
